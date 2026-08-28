@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"workweave/router/internal/observability"
@@ -91,6 +92,9 @@ func detectToolCallLoop(ctx context.Context, env *translate.RequestEnvelope) (lo
 		start = len(sigs) - loopDetectionWindowSize
 	}
 	window := sigs[start:]
+	if isPollingLoop(env, start) {
+		return false, translate.ToolCallSig{}, 0
+	}
 	counts := make(map[string]int, len(window))
 	keys := make(map[string]translate.ToolCallSig, len(window))
 	for _, s := range window {
@@ -111,6 +115,22 @@ func detectToolCallLoop(ctx context.Context, env *translate.RequestEnvelope) (lo
 		}
 	}
 	return false, translate.ToolCallSig{}, 0
+}
+
+// isPollingLoop identifies Codex's legitimate pattern of repeatedly polling
+// a long-running shell command. The outer tool is exec, but its input contains
+// the nested write_stdin call with empty chars. These calls can have identical
+// arguments while the process state changes between polls, so treating them as
+// a model loop would interrupt healthy long-running work.
+func isPollingLoop(env *translate.RequestEnvelope, start int) bool {
+	for _, args := range env.AssistantToolCallArgsPreview(start, 200) {
+		if !strings.HasPrefix(args, "exec:") ||
+			!strings.Contains(args, "write_stdin") ||
+			!strings.Contains(args, `\"chars\":\"\"`) {
+			return false
+		}
+	}
+	return true
 }
 
 // Cyclic-loop-detection knobs. detectToolCallLoop catches a TIGHT loop (one

@@ -106,6 +106,42 @@ func TestDetectToolCallLoop_AlternatingPairStillTripsOnRepeats(t *testing.T) {
 	assert.GreaterOrEqual(t, count, loopDetectionMaxRepeats)
 }
 
+func TestDetectToolCallLoop_EmptyWriteStdinPollingDoesNotTrip(t *testing.T) {
+	// Codex polls long-running commands by repeating the same outer exec call.
+	// The process can make progress even though the polling arguments are
+	// identical, so this must not be treated as a model tool-call loop.
+	poll := `const r = await tools.write_stdin({"session_id":72385,"chars":"","yield_time_ms":1000,"max_output_tokens":12000});`
+	body := buildBodyWithToolCalls(t, []toolCall{
+		{name: "exec", input: map[string]any{"input": poll}},
+		{name: "exec", input: map[string]any{"input": poll}},
+		{name: "exec", input: map[string]any{"input": poll}},
+		{name: "exec", input: map[string]any{"input": poll}},
+		{name: "exec", input: map[string]any{"input": poll}},
+	})
+	env, err := translate.ParseAnthropic(body)
+	require.NoError(t, err)
+
+	loop, _, _ := detectToolCallLoop(context.Background(), env)
+	assert.False(t, loop, "empty write_stdin polling must not trip the detector")
+}
+
+func TestDetectToolCallLoop_NonPollingExecStillTrips(t *testing.T) {
+	body := buildBodyWithToolCalls(t, []toolCall{
+		{name: "exec", input: map[string]any{"input": "rg TODO"}},
+		{name: "exec", input: map[string]any{"input": "rg TODO"}},
+		{name: "exec", input: map[string]any{"input": "rg TODO"}},
+		{name: "exec", input: map[string]any{"input": "rg TODO"}},
+		{name: "exec", input: map[string]any{"input": "rg TODO"}},
+	})
+	env, err := translate.ParseAnthropic(body)
+	require.NoError(t, err)
+
+	loop, sig, count := detectToolCallLoop(context.Background(), env)
+	assert.True(t, loop)
+	assert.Equal(t, "exec", sig.Name)
+	assert.Equal(t, loopDetectionMaxRepeats, count)
+}
+
 // --- helpers ---
 
 type toolCall struct {
