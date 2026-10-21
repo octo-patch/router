@@ -1,17 +1,31 @@
 package postgres
 
 import (
+	"slices"
 	"time"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/flags"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/router"
-	"workweave/router/internal/sqlc"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/flags"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/sqlc"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+func parseUUID(value string) (uuid.UUID, error) {
+	return uuid.Parse(value)
+}
+
+// derefString returns the pointed-to string or "" for a nil pointer.
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
 
 func toAuthInstallation(row sqlc.RouterModelRouterInstallation) *auth.Installation {
 	excluded := row.ExcludedModels
@@ -30,13 +44,11 @@ func toAuthInstallation(row sqlc.RouterModelRouterInstallation) *auth.Installati
 	if allowed == nil {
 		allowed = []string{}
 	}
-	modelsWhenSubscriptionActive := row.ModelsWhenSubscriptionActive
-	if modelsWhenSubscriptionActive == nil {
-		modelsWhenSubscriptionActive = []string{}
-	}
-	modelsWhenSubscriptionInactive := row.ModelsWhenSubscriptionInactive
-	if modelsWhenSubscriptionInactive == nil {
-		modelsWhenSubscriptionInactive = []string{}
+	modelsWhenSubscriptionActive := []string{}
+	modelsWhenSubscriptionInactive := []string{}
+	if row.SubscriptionStateModelsEnabled {
+		modelsWhenSubscriptionActive = catalogModelsExcept(row.ModelsExcludedWhenSubscriptionActive)
+		modelsWhenSubscriptionInactive = catalogModelsExcept(row.ModelsExcludedWhenSubscriptionInactive)
 	}
 	fastModeModels := row.FastModeModels
 	if fastModeModels == nil {
@@ -67,6 +79,7 @@ func toAuthInstallation(row sqlc.RouterModelRouterInstallation) *auth.Installati
 		AllowedModels:                  allowed,
 		ModelsWhenSubscriptionActive:   modelsWhenSubscriptionActive,
 		ModelsWhenSubscriptionInactive: modelsWhenSubscriptionInactive,
+		SubscriptionStateModelsEnabled: row.SubscriptionStateModelsEnabled,
 		ExcludedProviders:              excludedProviders,
 		PreferredModels:                preferred,
 		FastModeModels:                 fastModeModels,
@@ -84,6 +97,9 @@ func toAuthInstallation(row sqlc.RouterModelRouterInstallation) *auth.Installati
 		ByokEnabled:                    row.ByokEnabled,
 		ContentCaptureMode:             row.ContentCaptureMode,
 		HideTerminalSurfaces:           row.HideTerminalSurfaces,
+		ShowModelSelectionReasoning:    row.ShowModelSelectionReasoning,
+		TrialCaptureEnabled:            row.TrialCaptureEnabled,
+		TrialEnrollmentID:              derefString(uuidStringPtr(row.TrialEnrollmentID)),
 		FirstRequestServedAt:           timestamptzPtr(row.FirstRequestServedAt),
 		FlagOverrides:                  overrides,
 	}
@@ -91,18 +107,21 @@ func toAuthInstallation(row sqlc.RouterModelRouterInstallation) *auth.Installati
 
 func toAuthAPIKey(row sqlc.RouterModelRouterAPIKey) *auth.APIKey {
 	return &auth.APIKey{
-		ID:             row.ID.String(),
-		InstallationID: row.InstallationID.String(),
-		ExternalID:     row.ExternalID,
-		Name:           row.Name,
-		KeyPrefix:      row.KeyPrefix,
-		KeyHash:        row.KeyHash,
-		KeySuffix:      row.KeySuffix,
-		Scope:          auth.APIKeyScope(row.Scope),
-		LastUsedAt:     timestampPtr(row.LastUsedAt),
-		CreatedAt:      timestampOrZero(row.CreatedAt),
-		DeletedAt:      timestampPtr(row.DeletedAt),
-		CreatedBy:      row.CreatedBy,
+		ID:                                row.ID.String(),
+		InstallationID:                    row.InstallationID.String(),
+		ExternalID:                        row.ExternalID,
+		Name:                              row.Name,
+		KeyPrefix:                         row.KeyPrefix,
+		KeyHash:                           row.KeyHash,
+		KeySuffix:                         row.KeySuffix,
+		Scope:                             auth.APIKeyScope(row.Scope),
+		CredentialSubjectID:               uuidString(row.CredentialSubjectID),
+		Harness:                           derefString(row.Harness),
+		LastUsedAt:                        timestampPtr(row.LastUsedAt),
+		CreatedAt:                         timestampOrZero(row.CreatedAt),
+		DeletedAt:                         timestampPtr(row.DeletedAt),
+		CreatedBy:                         row.CreatedBy,
+		PaidFallbackOnSubscriptionRefusal: row.PaidFallbackOnSubscriptionRefusal,
 	}
 }
 
@@ -156,4 +175,16 @@ func uuidString(u pgtype.UUID) string {
 		return ""
 	}
 	return uuid.UUID(u.Bytes).String()
+}
+
+// catalogModelsExcept resolves a subscription-state exclusion list against the
+// deployed catalog, so models added after the settings were saved are included.
+func catalogModelsExcept(excluded []string) []string {
+	models := make([]string, 0, len(catalog.Models))
+	for _, model := range catalog.Models {
+		if !slices.Contains(excluded, model.ID) {
+			models = append(models, model.ID)
+		}
+	}
+	return models
 }

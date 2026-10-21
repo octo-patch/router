@@ -20,9 +20,29 @@ strategy or an authorized `x-weave-router-strategy: hmm` override. To stop the
 sidecar and return to the normal stack, run `make down-hmm && make up`.
 
 The Compose configuration downloads the public
-[`hmm-model-v1`](https://github.com/workweave/router/releases/tag/hmm-model-v1)
+[`hmm-model-v1`](https://github.com/weave-os/router/releases/tag/hmm-model-v1)
 asset and verifies SHA-256 before extraction. Set `HMM_PACKAGE_PATH` instead
 when running the sidecar directly with a local package.
+
+### Serving more than one frozen package (policy pins)
+
+`HMM_PACKAGE_URL` / `HMM_PACKAGE_PATH` (+ `HMM_PACKAGE_SHA256`) name the
+**default** package. `HMM_PACKAGE_REGISTRY` optionally adds a bounded set of
+further packages as a JSON list of `{"sha256": ..., "url": ...}` entries
+(`path` may replace `url` for a pre-staged archive; at most 8 entries; https
+only). Every entry is downloaded, digest-checked, extracted, manifest-verified
+and loaded during startup — a failure in any entry fails readiness, and nothing
+is ever fetched on a live request.
+
+```bash
+HMM_PACKAGE_REGISTRY='[{"sha256":"<sha256>","url":"https://.../hmm-model-v0.tar.gz"}]'
+```
+
+`/route`, `/preview` (request field `artifact_sha256`) and `/roster` (query
+`?artifact_sha256=`) select a loaded package by its outer digest; omitting it
+serves the default. An unknown digest answers **404** rather than the default
+package, so a router honouring an `x-weave-policy-pin` header fails closed.
+`/readyz` lists every loaded digest under `policy_artifact_sha256s`.
 
 ## Embedding compatibility
 

@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/providers/httputil"
-	"workweave/router/internal/providers/openaicompat"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/providers/httputil"
+	"weave-os/router/internal/providers/openaicompat"
+	"weave-os/router/internal/router"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -79,11 +79,11 @@ func TestPassthrough_RefusedRedirectRelaysNothing(t *testing.T) {
 func TestListModels_RedirectRefused(t *testing.T) {
 	upstream, targetHit := redirectFixture(t)
 
-	c := openaicompat.NewClient("test-key", upstream.URL+"/v1")
+	c := openaicompat.NewClient("test-key", upstream.URL+"/v1", openaicompat.WithModelListHTTPClient(openAICompatibleDiscoveryClient(t, upstream.URL)))
 	ids, err := c.ListModels(context.Background())
 
 	require.Error(t, err)
-	assert.ErrorIs(t, err, httputil.ErrRefusedRedirect)
+	assert.ErrorIs(t, err, providers.ErrModelDiscoveryTransport)
 	assert.Empty(t, ids)
 	assert.False(t, targetHit.Load(), "the redirect target must never be contacted")
 }

@@ -9,20 +9,25 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/providers/httputil"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/timing"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/providers/httputil"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/sse"
+	"weave-os/router/internal/timing"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/net/http/httpguts"
 )
 
 const DefaultBaseURL = "https://api.openai.com"
+
+const responsesContextOverflowCode = "context_length_exceeded"
 
 // Codex (ChatGPT) subscription backend. A ChatGPT plan authenticates only
 // against this base URL over the Responses API — never api.openai.com — and
@@ -36,15 +41,18 @@ const (
 	codexOpenAIBetaValue  = "responses=experimental"
 	codexOriginatorHeader = "originator"
 	codexOriginatorValue  = "codex_cli_rs"
+	codexSessionIDHeader  = "Session-Id"
 	codexUserAgentHeader  = "User-Agent"
 	codexUserAgentValue   = "codex_cli_rs"
 )
 
-// maxEffortToXhigh clamps reasoning.effort from "max" to "xhigh" in a
-// Responses-API body. "max" is valid only on the Codex backend; the public
-// api.openai.com Responses API tops out at "xhigh" and 400s on "max".
-func maxEffortToXhigh(body []byte) []byte {
+// maxEffortToXhigh clamps max for public-API models whose declared reasoning
+// menu tops out at xhigh. Models such as GPT-6 Astra accept max directly.
+func maxEffortToXhigh(body []byte, model string) []byte {
 	if gjson.GetBytes(body, "reasoning.effort").String() != "max" {
+		return body
+	}
+	if slices.Contains(router.Lookup(model).Reasoning().Levels, "max") {
 		return body
 	}
 	out, err := sjson.SetBytes(body, "reasoning.effort", "xhigh")
@@ -81,8 +89,8 @@ func stripCodexUnsupportedParams(body []byte) []byte {
 // codexSubscriptionCreds returns the resolved credential when it's a Codex
 // (ChatGPT) subscription bearer (OAuth token with a paired account id), else
 // nil. Such a turn must dispatch to the Codex backend, not api.openai.com.
-func codexSubscriptionCreds(ctx context.Context) *proxy.Credentials {
-	creds := proxy.CredentialsFromContext(ctx)
+func codexSubscriptionCreds(ctx context.Context) *requestcontext.Credentials {
+	creds := requestcontext.CredentialsFromContext(ctx)
 	if creds != nil && creds.OAuth && len(creds.AccountID) > 0 {
 		return creds
 	}
@@ -97,9 +105,10 @@ func codexSubscriptionCreds(ctx context.Context) *proxy.Credentials {
 const responseHeaderTimeout = 120 * time.Second
 
 type Client struct {
-	apiKey  string
-	baseURL string
-	http    *http.Client
+	allowCodexExtraCredits bool
+	apiKey                 string
+	baseURL                string
+	http                   *http.Client
 	// modelIDMap rewrites routed catalog IDs to the upstream model IDs.
 	modelIDMap map[string]string
 	// sseIdleTimeout, when > 0, overrides the per-endpoint idle-progress
@@ -123,6 +132,10 @@ func NewClient(apiKey, baseURL string) *Client {
 func NewClientWithModelIDMap(apiKey, baseURL string, modelIDMap map[string]string) *Client {
 	return newClientWithModelIDMap(apiKey, baseURL, responseHeaderTimeout, modelIDMap)
 }
+
+// SetCodexExtraCreditsAllowed enables use of available ChatGPT subscription credits.
+// Configure before serving requests; it does not enable OpenAI API fallback.
+func (c *Client) SetCodexExtraCreditsAllowed(allowed bool) { c.allowCodexExtraCredits = allowed }
 
 // SetCodexBaseURL overrides the Codex subscription endpoint for local testing.
 func (c *Client) SetCodexBaseURL(baseURL string) {
@@ -165,6 +178,15 @@ func NewClientWithStallTimeouts(apiKey, baseURL string, headerTimeout, sseIdleTi
 	c := NewClientWithTimeouts(apiKey, baseURL, headerTimeout, sseIdleTimeout)
 	c.outputStall = outputStall
 	return c
+}
+
+// SupportsSubscriptions reports support for the native Codex OAuth transport.
+func (c *Client) SupportsSubscriptions() bool { return true }
+
+// DeploymentPrincipal fingerprints the account this client's own key
+// authenticates as; see providers.DeploymentPrincipal.
+func (c *Client) DeploymentPrincipal() string {
+	return providers.CredentialPrincipal(c.baseURL, c.apiKey)
 }
 
 // idleTimeoutFor picks the idle-progress threshold; /v1/responses gets the
@@ -221,10 +243,10 @@ func (c *Client) stallBudgetFor(endpoint providers.Endpoint, cause error) time.D
 //
 // The passthrough tier strips `Authorization: Bearer rk_...` — the router
 // auth middleware accepts the same header for router-key auth, so we must not
-// relay a router credential to OpenAI. Mirrors proxy.ExtractClientCredentials's
+// relay a router credential to OpenAI. Mirrors requestcontext.ExtractClientCredentials's
 // !HasAPIKeyPrefix guard.
 func (c *Client) setAuth(ctx context.Context, upstream *http.Request, inbound *http.Request) {
-	if creds := proxy.CredentialsFromContext(ctx); creds != nil {
+	if creds := requestcontext.CredentialsFromContext(ctx); creds != nil {
 		upstream.Header.Set("Authorization", "Bearer "+string(creds.APIKey))
 		return
 	}
@@ -238,7 +260,7 @@ func (c *Client) setAuth(ctx context.Context, upstream *http.Request, inbound *h
 	// tier relay the same bearer to api.openai.com. Inspect the complete
 	// credential shape: an ordinary sk- API key remains a client credential
 	// even if a caller also supplied a stray ChatGPT-Account-ID header.
-	if creds := proxy.ExtractClientCredentials(providers.ProviderOpenAI, inbound.Header); creds != nil && creds.OAuth {
+	if creds := requestcontext.ExtractClientCredentials(providers.ProviderOpenAI, inbound.Header); creds != nil && creds.OAuth {
 		return
 	}
 	v := inbound.Header.Get("authorization")
@@ -262,14 +284,17 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 	// that happens to resolve a Codex credential never hits the Codex
 	// /responses endpoint (Responses schema only).
 	codexCreds := codexSubscriptionCreds(ctx)
-	if codexCreds != nil && !proxy.CodexSubscriptionCoversModel(decision.Model) {
-		return fmt.Errorf("refusing Codex subscription credential for infrastructure model %q", decision.Model)
+	if codexCreds != nil && prep.Endpoint != providers.EndpointResponses {
+		return fmt.Errorf("Codex subscription credentials require a Responses endpoint")
+	}
+	if codexCreds != nil && !requestcontext.CodexSubscriptionCanAttemptModel(decision.Model) {
+		return fmt.Errorf("refusing Codex subscription credential for model without approved Codex funding eligibility %q", decision.Model)
 	}
 	useCodex := codexCreds != nil && prep.Endpoint == providers.EndpointResponses
 	// A BYOK key may point at a customer-hosted OpenAI-compatible endpoint; the
 	// Codex branch below still wins, since a Codex subscription bearer only
 	// authenticates against the Codex backend.
-	baseURL := proxy.EffectiveBaseURL(ctx, c.baseURL)
+	baseURL := requestcontext.EffectiveBaseURL(ctx, c.baseURL)
 	path := "/v1/chat/completions"
 	if prep.Endpoint == providers.EndpointResponses {
 		path = "/v1/responses"
@@ -282,10 +307,15 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 	} else if prep.Endpoint == providers.EndpointResponses {
 		// Only the direct api.openai.com Responses path needs the clamp; the
 		// Codex backend branch above understands "max" natively.
-		reqBody = maxEffortToXhigh(reqBody)
+		reqBody = maxEffortToXhigh(reqBody, decision.Model)
 	}
 	// Applied after the catalog map so a BYOK endpoint's own naming wins.
-	reqBody = proxy.ApplyModelAlias(ctx, reqBody, decision.Model)
+	reqBody = requestcontext.ApplyModelAlias(ctx, reqBody, decision.Model)
+	if useCodex {
+		if err := c.checkCodexIncludedQuota(ctx, gjson.GetBytes(reqBody, "model").String()); err != nil {
+			return err
+		}
+	}
 	upstream, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("build upstream request: %w", err)
@@ -295,8 +325,8 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 	for k, vs := range prep.Headers {
 		upstream.Header[http.CanonicalHeaderKey(k)] = vs
 	}
-	proxy.ApplyIdentityHeader(ctx, upstream)
-	proxy.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
+	requestcontext.ApplyIdentityHeader(ctx, upstream)
+	requestcontext.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
 	if v := r.Header.Get("Accept"); v != "" {
 		upstream.Header.Set("Accept", v)
 	}
@@ -306,6 +336,11 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 		upstream.Header.Set(codexOpenAIBetaHeader, codexOpenAIBetaValue)
 		upstream.Header.Set(codexOriginatorHeader, codexOriginatorValue)
 		upstream.Header.Set(codexUserAgentHeader, codexUserAgentValue)
+		// Codex uses session-id for cache affinity; the API body hint alone is insufficient.
+		affinity := requestcontext.NormalizeClientIdentifier(gjson.GetBytes(reqBody, "prompt_cache_key").String())
+		if affinity != "" && httpguts.ValidHeaderFieldValue(affinity) {
+			upstream.Header.Set(codexSessionIDHeader, affinity)
+		}
 	}
 
 	t := timing.TimingFrom(ctx)
@@ -355,6 +390,8 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 			"Upstream OpenAI returned error status",
 			resp.StatusCode,
 			"base_url", c.baseURL,
+			"upstream_host", upstream.URL.Host,
+			"upstream_path", path,
 			"routed_model", decision.Model,
 			"body_preview", httputil.PreviewBytes(bufBody),
 			"body_total_bytes", totalRead,
@@ -362,9 +399,11 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 		errHeaders := http.Header{}
 		providers.CopyUpstreamHeaders(httputil.HeaderCapture{H: errHeaders}, resp)
 		return &providers.UpstreamErrorResponse{
-			Status:  resp.StatusCode,
-			Headers: errHeaders,
-			Body:    bufBody,
+			Status:     resp.StatusCode,
+			Headers:    errHeaders,
+			Body:       bufBody,
+			BodyBytes:  totalRead,
+			BodyCapped: totalRead > int64(len(bufBody)),
 		}
 	}
 
@@ -372,18 +411,16 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 	w.WriteHeader(resp.StatusCode)
 	status := resp.StatusCode
 
-	// Output-progress watchdog (Responses only): the byte-idle watchdog below
-	// resets on ANY byte, so a stream alive on reasoning/keepalive frames but
-	// producing zero output rides to the 600s cap (2026-06-16 incident). This
-	// one measures time-since-last-OUTPUT, fed by the translator only on
-	// output-bearing events, and trips ErrUpstreamOutputStall (retryable).
-	// Wired via ArmOutputProgress since only the translator can tell output
-	// frames from reasoning/keepalive frames.
+	// Translators distinguish advancing reasoning/output from keepalives.
+	// Reasoning feeds only the stall clock, preserving first-output latency.
 	if prep.Endpoint == providers.EndpointResponses {
 		if arm, ok := w.(providers.OutputProgressArmer); ok {
 			outMark, outStop := httputil.StartIdleWatchdogCause(ctx, cancel, c.outputStallTimeout(), httputil.ErrUpstreamOutputStall)
 			if arm.ArmOutputProgress(timing.FirstOutputMark(ctx, outMark)) {
 				defer outStop()
+				if reasoningArmer, ok := w.(providers.ReasoningProgressArmer); ok {
+					reasoningArmer.ArmReasoningProgress(outMark)
+				}
 			} else {
 				outStop()
 			}
@@ -397,17 +434,53 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 	body := &progressReader{r: resp.Body}
 	debug := log.Enabled(ctx, slog.LevelDebug)
 	var opts []httputil.StreamOption
-	if debug {
+	var responseFrames []byte
+	var terminalResponseError error
+	if prep.Endpoint == providers.EndpointResponses {
+		opts = append(opts, httputil.WithOnChunk(func(chunk []byte, first bool) {
+			if debug && first {
+				log.Debug("OpenAI upstream first chunk", "bytes", len(chunk))
+			}
+			if terminalResponseError != nil {
+				return
+			}
+			responseFrames = append(responseFrames, chunk...)
+			for {
+				event, eventByteCount := sse.SplitNext(responseFrames)
+				if eventByteCount == 0 {
+					break
+				}
+				responseFrames = responseFrames[eventByteCount:]
+				_, payload := sse.ParseEvent(event)
+				if eventType := gjson.GetBytes(payload, "type").String(); eventType == "response.failed" || eventType == "error" {
+					terminalResponseError = &providers.UpstreamErrorResponse{Status: responsesFailureStatus(payload), Body: bytes.Clone(payload)}
+				}
+			}
+			if len(responseFrames) > 1024*1024 {
+				responseFrames = nil
+			}
+		}))
+	}
+
+	if debug && prep.Endpoint != providers.EndpointResponses {
 		opts = append(opts, httputil.WithOnChunk(func(chunk []byte, first bool) {
 			if first {
 				log.Debug("OpenAI upstream first chunk",
 					"bytes", len(chunk),
-					"preview", observability.Preview(string(chunk), 320),
 				)
 			}
 		}))
 	}
 	streamErr := httputil.StreamBody(ctx, cancel, idleTimeout, body, status, w, t, opts...)
+	// A non-streaming Responses body has no SSE frame separators, so a
+	// terminal failure arrives as one JSON object with status "failed".
+	if trailing := bytes.TrimSpace(responseFrames); terminalResponseError == nil && len(trailing) > 0 && trailing[0] == '{' &&
+		gjson.GetBytes(trailing, "status").String() == "failed" {
+		terminalResponseError = &providers.UpstreamErrorResponse{Status: responsesFailureStatus(trailing), Body: append([]byte(nil), trailing...)}
+	}
+	if streamErr == nil && terminalResponseError != nil {
+		streamErr = terminalResponseError
+	}
 	switch {
 	case errors.Is(streamErr, httputil.ErrUpstreamIdleTimeout), errors.Is(streamErr, httputil.ErrUpstreamOutputStall):
 		logStreamStall(ctx, decision.Model, path, c.stallBudgetFor(prep.Endpoint, streamErr), body.n, streamErr)
@@ -419,6 +492,17 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 		log.Debug("OpenAI upstream stream complete", "bytes_total", body.n)
 	}
 	return streamErr
+}
+
+// responsesFailureStatus reports a context overflow as a terminal 400, matching
+// the non-streaming path; every other Responses failure is an upstream fault.
+func responsesFailureStatus(failureBody []byte) int {
+	for _, path := range []string{"error.code", "response.error.code", "code"} {
+		if gjson.GetBytes(failureBody, path).String() == responsesContextOverflowCode {
+			return http.StatusBadRequest
+		}
+	}
+	return http.StatusBadGateway
 }
 
 // progressReader counts upstream bytes for the stall log's bytes_received
@@ -441,17 +525,14 @@ func (p *progressReader) Read(buf []byte) (n int, err error) {
 	return n, err
 }
 
-// logStreamStall reports a watchdog trip at ERROR, distinguishing two modes
-// via stall_kind: byte_idle (ErrUpstreamIdleTimeout, zero bytes — 2026-06-09
-// incident) vs output_idle (ErrUpstreamOutputStall, bytes flowing but zero
-// output — 2026-06-16 incident). Both are retryable; this is the per-model
-// paper trail for how often each happens.
+// logStreamStall reports the watchdog cause; dispatch decides whether the
+// response is still uncommitted and therefore eligible for retry.
 func logStreamStall(ctx context.Context, model, path string, budget time.Duration, bytesReceived int64, cause error) {
 	stallKind := "byte_idle"
 	if errors.Is(cause, httputil.ErrUpstreamOutputStall) {
 		stallKind = "output_idle"
 	}
-	observability.FromContext(ctx).Error("OpenAI upstream stream stalled mid-response; aborting for retry",
+	observability.FromContext(ctx).Error("OpenAI upstream stream stalled mid-response; aborting stream",
 		"model", model,
 		"provider", providers.ProviderOpenAI,
 		"upstream_path", path,
@@ -464,7 +545,7 @@ func logStreamStall(ctx context.Context, model, path string, budget time.Duratio
 func (c *Client) Passthrough(ctx context.Context, prep providers.PreparedRequest, w http.ResponseWriter, r *http.Request) error {
 	// Codex subscriptions are served only via the routed Responses dispatch
 	// (Proxy), never here — no Codex backend switch needed.
-	url := proxy.EffectiveBaseURL(ctx, c.baseURL) + r.URL.Path
+	url := requestcontext.EffectiveBaseURL(ctx, c.baseURL) + r.URL.Path
 	if r.URL.RawQuery != "" {
 		url += "?" + r.URL.RawQuery
 	}
@@ -480,7 +561,7 @@ func (c *Client) Passthrough(ctx context.Context, prep providers.PreparedRequest
 	for k, vs := range prep.Headers {
 		upstream.Header[http.CanonicalHeaderKey(k)] = vs
 	}
-	proxy.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
+	requestcontext.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
 	if v := r.Header.Get("Accept"); v != "" {
 		upstream.Header.Set("Accept", v)
 	}

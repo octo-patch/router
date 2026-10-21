@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -254,10 +254,11 @@ func TestService_RouterFeedbackCommand_DoesNotContinueMaxedPin(t *testing.T) {
 		Model:           "claude-haiku-4-5",
 		Reason:          "hmm_policy(label=balanced)",
 		LastServedModel: "claude-haiku-4-5",
-		// Keep this in sync with prevTurnMaxedOutThreshold. A saturated source
-		// pin must not be copied into a one-shot post-command continuation.
-		LastOutputTokens: 8000,
-		PinnedUntil:      time.Now().Add(time.Minute),
+		// A confirmed capped source must not become a post-command continuation.
+		LastOutputTokens:  8000,
+		LastTurnEndedAt:   time.Unix(100, 0),
+		LastOutputLimitAt: time.Unix(100, 0),
+		PinnedUntil:       time.Now().Add(time.Minute),
 	}
 	policyRouter := &fakePolicyFeedbackRouter{decision: router.Decision{
 		Provider: providers.ProviderAnthropic,
@@ -516,8 +517,7 @@ func TestService_RouterFeedbackCommand_CorrelatesCompactedHMMEmbeddingRoute(t *t
 			Router:      policyFeedback,
 			Unavailable: router.ErrStrategyUnavailable,
 		}).
-		WithAvailableModels(map[string]struct{}{"claude-haiku-4-5": {}}).
-		WithCompaction(nil, proxy.DefaultCompactionTriggerPct)
+		WithAvailableModels(map[string]struct{}{"claude-haiku-4-5": {}})
 	installationID := uuid.NewString()
 	ctx := router.WithStrategy(authedCtx(installationID), router.StrategyHMMEmbedding)
 	ctx = context.WithValue(ctx, proxy.ExternalIDContextKey{}, "org-test")
@@ -990,8 +990,7 @@ func TestService_RouterFeedbackCommand_SequenceRejectsHMMDeltaWithResolvedStrate
 			Router:      hmmReporter,
 			Unavailable: router.ErrStrategyUnavailable,
 		}).
-		WithAvailableModels(map[string]struct{}{"claude-opus-4-7": {}}).
-		WithCompaction(nil, proxy.DefaultCompactionTriggerPct)
+		WithAvailableModels(map[string]struct{}{"claude-opus-4-7": {}})
 	ctx = context.WithValue(ctx, proxy.PolicyTrainingAllowedContextKey{}, true)
 	require.NoError(t, svc.ProxyMessages(ctx, []byte(body), httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(""))))
 
@@ -1027,8 +1026,7 @@ func TestService_RouterFeedbackCommand_NegativeOnePreservesTrainingDelta(t *test
 			Router:      hmmReporter,
 			Unavailable: router.ErrStrategyUnavailable,
 		}).
-		WithAvailableModels(map[string]struct{}{"claude-haiku-4-5": {}}).
-		WithCompaction(nil, proxy.DefaultCompactionTriggerPct)
+		WithAvailableModels(map[string]struct{}{"claude-haiku-4-5": {}})
 	ctx := router.WithStrategy(authedCtx(uuid.NewString()), router.StrategyHMMEmbedding)
 	ctx = context.WithValue(ctx, proxy.PolicyTrainingAllowedContextKey{}, true)
 	require.NoError(t, svc.ProxyMessages(ctx, body, httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(""))))

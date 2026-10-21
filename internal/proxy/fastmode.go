@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"slices"
 
-	"workweave/router/internal/observability/otel"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability/otel"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/translate"
 )
 
 // anthropicTierAttempt dispatches a prepared Anthropic-native body, re-emitting
@@ -27,9 +27,11 @@ type anthropicTierAttempt struct {
 	native        dispatchAttempt
 	sink          http.ResponseWriter
 	preludeBuf    *preludeBuffer
-	marker        string
+	preludeState  *requestNoticeStream
+	streamCut     *streamCutObserver
+	notice        translate.RouterNotice
 	setExtractor  func(*otel.UsageExtractor)
-	setStreamCost func(router.Decision, bool)
+	setStreamCost func(router.Decision, bool, func() bool)
 	logBody       func(router.Decision, []byte)
 }
 
@@ -49,7 +51,7 @@ func (a *anthropicTierAttempt) forBinding(actx context.Context, d router.Decisio
 		return attemptOpts, nil, fast, fmt.Errorf("emit body: %w", err)
 	}
 	a.logBody(d, prep.Body)
-	native := a.s.anthropicNativeAttempt(a.env, a.r, prep, a.sink, a.preludeBuf, a.marker, a.setExtractor, a.setStreamCost)
+	native := a.s.anthropicNativeAttempt(a.env, a.r, prep, a.sink, a.preludeBuf, a.preludeState, a.streamCut, a.notice, a.setExtractor, a.setStreamCost)
 	return attemptOpts, native, fast, nil
 }
 
@@ -84,7 +86,7 @@ func (a *anthropicTierAttempt) dispatch(actx context.Context, d router.Decision,
 	}
 	a.logBody(d, prep.Body)
 	recordFast(false)
-	standard := a.s.anthropicNativeAttempt(a.env, a.r, prep, a.sink, a.preludeBuf, a.marker, a.setExtractor, a.setStreamCost)
+	standard := a.s.anthropicNativeAttempt(a.env, a.r, prep, a.sink, a.preludeBuf, a.preludeState, a.streamCut, a.notice, a.setExtractor, a.setStreamCost)
 	return standardOpts, standard(actx, d, p)
 }
 
@@ -115,7 +117,7 @@ func fastModeForAttempt(ctx context.Context, model, provider string) bool {
 
 // servedPricing returns the rate the winning attempt is billed at: the fast
 // rate when it was dispatched fast, else the binding's list price, else the
-// primary binding's list price.
+// primary binding's list price without its first-party geography premium.
 func servedPricing(provider, model string, fast bool) (catalog.Pricing, bool) {
 	if fast {
 		if fastPrice, ok := catalog.FastPriceFor(provider, model); ok {
@@ -125,5 +127,6 @@ func servedPricing(provider, model string, fast bool) (catalog.Pricing, bool) {
 	if price, ok := catalog.PriceFor(provider, model); ok {
 		return price, true
 	}
-	return catalog.PrimaryPriceFor(model)
+	price, ok := catalog.PrimaryPriceFor(model)
+	return price.WithoutInferenceGeoPremium(), ok
 }

@@ -12,15 +12,15 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/providers/cortexagents"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/websearch"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/providers/cortexagents"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/websearch"
 )
 
 // wifContext mirrors what the proxy injects for a WIF-authenticated gateway key.
 func wifContext(baseURL string) context.Context {
-	return context.WithValue(context.Background(), proxy.CredentialsContextKey{}, &proxy.Credentials{
+	return context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, &requestcontext.Credentials{
 		APIKey:   []byte("WIF.GCP.attestation-token"),
 		BaseURL:  baseURL,
 		AuthType: auth.AuthTypeWIF,
@@ -118,6 +118,26 @@ func TestSearchDropsInferenceVersionSegmentFromBaseURL(t *testing.T) {
 	}
 	if gotPath != "/api/v2/cortex/agent:run" {
 		t.Fatalf("path = %q", gotPath)
+	}
+}
+
+func TestSearchRunsAgentOnCortexRootForAIGatewayBaseURL(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		io.WriteString(w, `{"content":[]}`)
+	}))
+	defer srv.Close()
+
+	// The AI Gateway serves inference only; agent:run stays on the account's Cortex REST root.
+	for _, base := range []string{"/api/v2/aigateways/ENG", "/api/v2/aigateways/ENG/v1/"} {
+		gotPath = ""
+		if _, err := cortexagents.NewClient("", cortexagents.WithHostSuffix("127.0.0.1")).Search(wifContext(srv.URL+base), websearch.Query{Text: "q"}); err != nil {
+			t.Fatalf("Search(%s): %v", base, err)
+		}
+		if gotPath != "/api/v2/cortex/agent:run" {
+			t.Fatalf("Search(%s) path = %q", base, gotPath)
+		}
 	}
 }
 
@@ -241,7 +261,7 @@ func TestSearchOmitsRoleHeaderAndTokenTypeWhenNotApplicable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx := context.WithValue(context.Background(), proxy.CredentialsContextKey{}, &proxy.Credentials{
+	ctx := context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, &requestcontext.Credentials{
 		APIKey:   []byte("static-pat"),
 		BaseURL:  srv.URL,
 		AuthType: auth.AuthTypeBearer,
@@ -266,17 +286,17 @@ func TestSearchForwardsClientCorrelationHeaders(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx := context.WithValue(context.Background(), proxy.CredentialsContextKey{}, &proxy.Credentials{
+	ctx := context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, &requestcontext.Credentials{
 		APIKey:                 []byte("static-pat"),
 		BaseURL:                srv.URL,
 		AuthType:               auth.AuthTypeBearer,
 		ForwardedClientHeaders: []string{"X-SNOWFLAKE-APPLICATION"},
 		BaggageHeader:          "X-SNOWFLAKE-BAGGAGE",
 	})
-	ctx = context.WithValue(ctx, proxy.ClientIdentityContextKey{}, proxy.ClientIdentity{Email: "engineer@example.com"})
+	ctx = context.WithValue(ctx, requestcontext.ClientIdentityContextKey{}, requestcontext.ClientIdentity{Email: "engineer@example.com"})
 	inbound := http.Header{}
 	inbound.Set("X-SNOWFLAKE-APPLICATION", "cortex-cli/1.2.3")
-	ctx = proxy.WithForwardedHeaderSnapshot(ctx, []*auth.ExternalAPIKey{{
+	ctx = requestcontext.WithForwardedHeaderSnapshot(ctx, []*auth.ExternalAPIKey{{
 		ForwardedClientHeaders: []string{"X-SNOWFLAKE-APPLICATION"},
 	}}, inbound)
 
@@ -286,7 +306,7 @@ func TestSearchForwardsClientCorrelationHeaders(t *testing.T) {
 	if gotApp != "cortex-cli/1.2.3" {
 		t.Fatalf("agent:run runs on the tenant's endpoint and must carry the caller's application: %q", gotApp)
 	}
-	if gotBaggage != `{"on-behalf-of":"engineer@example.com"}` {
+	if gotBaggage != `{"on-behalf-of":"engineer@example.com","passthrough":false}` {
 		t.Fatalf("unexpected baggage: %q", gotBaggage)
 	}
 }

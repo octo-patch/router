@@ -3,8 +3,9 @@ package middleware
 import (
 	"strings"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/router/cluster"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router/cluster"
 
 	"github.com/gin-gonic/gin"
 )
@@ -15,6 +16,10 @@ const ClusterVersionOverrideHeader = "x-weave-cluster-version"
 // WithClusterVersionOverride stashes the requested cluster version on the request context when the header is set.
 func WithClusterVersionOverride() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if identity, managed := requestcontext.ServingIdentityFromContext(c.Request.Context()); managed && identity.Plan != "" {
+			c.Next()
+			return
+		}
 		raw := strings.TrimSpace(c.GetHeader(ClusterVersionOverrideHeader))
 		if raw == "" {
 			c.Next()

@@ -3,7 +3,8 @@ package translate_test
 import (
 	"testing"
 
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -59,6 +60,17 @@ func TestExtractBetaCommandOpenAI(t *testing.T) {
 	require.True(t, found)
 	assert.False(t, result.Invalid)
 	assert.Empty(t, lastOpenAIUserMessageText(t, env))
+}
+
+func TestExtractBetaLLMCommandSelectsQwenAndStripsTheDirective(t *testing.T) {
+	env, err := translate.ParseAnthropic(buildAnthropicBody(t, "/beta-llm"))
+	require.NoError(t, err)
+
+	command, found := env.ExtractBetaCommand()
+	require.True(t, found)
+	assert.False(t, command.Invalid)
+	assert.Equal(t, router.StrategyHMMQwen, command.Strategy)
+	assert.Empty(t, lastUserMessageText(t, env))
 }
 
 func TestStripBetaArtifactsAnthropicPreservesCurrentToggle(t *testing.T) {

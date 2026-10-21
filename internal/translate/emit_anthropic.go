@@ -1,17 +1,41 @@
 package translate
 
 import (
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// Anthropic content-block types that 400 unless they live on role:"system"
+// (the top-level system field, or a system message). Codex/Conductor emit them
+// on later messages; Anthropic then rejects the request with
+// messages.N.content: 'tool_addition'/'tool_removal' blocks are only permitted
+// within role: "system" messages.
+type anthropicSystemOnlyContentBlock string
+
+const (
+	anthropicSystemOnlyContentToolAddition anthropicSystemOnlyContentBlock = "tool_addition"
+	anthropicSystemOnlyContentToolRemoval  anthropicSystemOnlyContentBlock = "tool_removal"
+)
+
+func isAnthropicSystemOnlyContentBlock(blockType string) bool {
+	switch anthropicSystemOnlyContentBlock(blockType) {
+	case anthropicSystemOnlyContentToolAddition, anthropicSystemOnlyContentToolRemoval:
+		return true
+	default:
+		return false
+	}
+}
 
 // PrepareAnthropic builds an Anthropic Messages request body.
 func (e *RequestEnvelope) PrepareAnthropic(in http.Header, opts EmitOptions) (providers.PreparedRequest, error) {
@@ -31,9 +55,34 @@ func (e *RequestEnvelope) PrepareAnthropic(in http.Header, opts EmitOptions) (pr
 	default:
 		return providers.PreparedRequest{}, fmt.Errorf("unsupported source format for Anthropic emit: %d", e.format)
 	}
+	body, toolAliases, err := sanitizeAnthropicToolNamesBytes(body)
+	if err != nil {
+		return providers.PreparedRequest{}, fmt.Errorf("sanitize anthropic tool names: %w", err)
+	}
+	// Validate explicit breakpoints before normalization can remove empty blocks.
+	body, err = applyAnthropicCachePolicy(body, false)
+	if err != nil {
+		return providers.PreparedRequest{}, err
+	}
+	body, err = normalizeAnthropicFinalAssistant(body)
+	if err != nil {
+		return providers.PreparedRequest{}, fmt.Errorf("normalize anthropic final assistant: %w", err)
+	}
+	if opts.Capabilities.Supports(router.CapAssistantPrefillUnsupported) {
+		body, err = dropAnthropicFinalAssistant(body)
+		if err != nil {
+			return providers.PreparedRequest{}, fmt.Errorf("drop anthropic final assistant: %w", err)
+		}
+	}
 	body, err = applyAnthropicCachePolicy(body, true)
 	if err != nil {
 		return providers.PreparedRequest{}, err
+	}
+	if opts.AppendAutonomySystem {
+		body, err = appendAutonomySystem(body)
+		if err != nil {
+			return providers.PreparedRequest{}, err
+		}
 	}
 	body, err = applyServerSideFallback(body, opts)
 	if err != nil {
@@ -47,7 +96,10 @@ func (e *RequestEnvelope) PrepareAnthropic(in http.Header, opts EmitOptions) (pr
 	if err != nil {
 		return providers.PreparedRequest{}, err
 	}
-	return providers.PreparedRequest{Body: body, Headers: deriveAnthropicHeaders(in, opts, body)}, nil
+	if maxOutputTokens := modelMaxOutputTokens[router.StripDateSuffix(opts.TargetModel)]; maxOutputTokens > 0 {
+		body = clampFieldBytes(body, "max_tokens", int64(maxOutputTokens))
+	}
+	return providers.PreparedRequest{Body: body, Headers: deriveAnthropicHeaders(in, opts, body), ResponseToolNames: toolAliases}, nil
 }
 
 // applyAnthropicSessionAffinity sets metadata.user_id to the session-affinity
@@ -88,6 +140,9 @@ func deriveAnthropicHeaders(in http.Header, opts EmitOptions, body []byte) http.
 	if gjson.GetBytes(body, "speed").Exists() {
 		beta = ensureBetaToken(beta, fastModeBeta)
 	}
+	if opts.TargetProvider == providers.ProviderAnthropic && containsAnthropicSystemOnlyContentBlocks(body) {
+		beta = ensureBetaToken(beta, anthropicMidConversationToolChangesBeta)
+	}
 	if beta != "" {
 		h.Set("anthropic-beta", beta)
 	}
@@ -98,11 +153,25 @@ func deriveAnthropicHeaders(in http.Header, opts EmitOptions, body []byte) http.
 // models; native-1M models (Fable 5) accept it as a no-op.
 const context1MBeta = "context-1m-2025-08-07"
 
+// HasContext1MBeta checks inbound capabilities without adding upstream-only betas.
+func HasContext1MBeta(headers http.Header) bool {
+	for _, value := range headers.Values("Anthropic-Beta") {
+		if joinKept(value, func(token string) bool { return token == context1MBeta }) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 const contextManagementBeta = "context-management-2025-06-27"
 
 // serverSideFallbackBeta is the first-party Anthropic beta for server-side
 // fallback; gateways reject the unknown top-level key with a 400.
 const serverSideFallbackBeta = "server-side-fallback-2026-07-01"
+
+// anthropicMidConversationToolChangesBeta enables tool_addition/tool_removal
+// content blocks on role:"system" messages in Anthropic's Messages API.
+const anthropicMidConversationToolChangesBeta = "mid-conversation-tool-changes-2026-07-01"
 
 // applyServerSideFallback injects fallbacks:"default" so Anthropic re-serves
 // a safety-refused turn instead of returning stop_reason:"refusal" (HTTP 200).
@@ -192,8 +261,9 @@ func (e *RequestEnvelope) buildAnthropicFromOpenAI(opts EmitOptions) ([]byte, er
 	}
 
 	writeAnthropicSystemAndMessages(jw, e.body)
-	writeAnthropicMaxTokens(jw, e.body, opts.TargetModel)
+	writeAnthropicMaxTokens(jw, e.body, opts.TargetModel, opts.Capabilities)
 	writeAnthropicStopSequences(jw, e.body)
+	writeAnthropicSamplingParams(jw, e.body, opts.Capabilities)
 
 	// tool_choice "none" suppresses tools entirely — Anthropic has no direct
 	// equivalent, so omitting tools is the only way to prevent tool calls.
@@ -201,10 +271,8 @@ func (e *RequestEnvelope) buildAnthropicFromOpenAI(opts EmitOptions) ([]byte, er
 	suppressTools := kind == toolChoiceNone
 	if !suppressTools {
 		writeAnthropicTools(jw, e.body)
-		writeAnthropicToolChoice(jw, e.body)
+		writeAnthropicToolChoice(jw, e.body, opts.Capabilities.Supports(router.CapAutoToolChoiceOnly))
 	}
-	writeAnthropicSharedParams(jw, e.body)
-
 	jw.EndObj()
 	return jw.Bytes(), nil
 }
@@ -619,7 +687,7 @@ func buildAnthropicImageBlock(urlStr string) string {
 	return string(jw.Bytes())
 }
 
-func writeAnthropicMaxTokens(jw *jsonWriter, body []byte, targetModel string) {
+func writeAnthropicMaxTokens(jw *jsonWriter, body []byte, targetModel string, capabilities router.ModelSpec) {
 	if r := gjson.GetBytes(body, "max_tokens"); r.Exists() {
 		jw.Key("max_tokens")
 		jw.Raw(r.Raw)
@@ -631,7 +699,7 @@ func writeAnthropicMaxTokens(jw *jsonWriter, body []byte, targetModel string) {
 		return
 	}
 	jw.Key("max_tokens")
-	jw.Int(defaultOutputTokens(targetModel))
+	jw.Int(defaultAnthropicOutputTokens(targetModel, capabilities))
 }
 
 func writeAnthropicStopSequences(jw *jsonWriter, body []byte) {
@@ -681,41 +749,82 @@ func writeAnthropicTools(jw *jsonWriter, body []byte) {
 	jw.EndArr()
 }
 
-func writeAnthropicToolChoice(jw *jsonWriter, body []byte) {
-	kind, name := openAIToolChoice(body)
-	switch kind {
-	case toolChoiceAuto:
-		jw.Key("tool_choice")
-		jw.Raw(`{"type":"auto"}`)
-	case toolChoiceRequired:
-		jw.Key("tool_choice")
-		jw.Raw(`{"type":"any"}`)
-	case toolChoiceNone:
-		// Handled upstream — tools and tool_choice both suppressed.
-	case toolChoiceNamed:
-		tw := newJSONWriter()
-		tw.Obj()
-		tw.Key("type")
-		tw.Str("tool")
-		tw.Key("name")
-		tw.Str(name)
-		tw.EndObj()
-		jw.Key("tool_choice")
-		jw.Raw(string(tw.Bytes()))
-	}
+// hasAnthropicFunctionTools reports whether writeAnthropicTools emits at least
+// one tool; entries without a function member are skipped there.
+func hasAnthropicFunctionTools(body []byte) bool {
+	found := false
+	gjson.GetBytes(body, "tools").ForEach(func(_, tool gjson.Result) bool {
+		found = tool.Get("function").Exists()
+		return !found
+	})
+	return found
 }
 
-func writeAnthropicSharedParams(jw *jsonWriter, body []byte) {
-	for _, key := range []string{"temperature", "top_p", "top_k"} {
-		if r := gjson.GetBytes(body, key); r.Exists() {
-			jw.Key(key)
-			jw.Raw(r.Raw)
+func writeAnthropicToolChoice(jw *jsonWriter, body []byte, autoOnly bool) {
+	kind, name := openAIToolChoice(body)
+	if autoOnly && (kind == toolChoiceRequired || kind == toolChoiceNamed) {
+		kind = toolChoiceAuto
+	}
+	// Anthropic carries the parallel limit on tool_choice, so a bare
+	// parallel_tool_calls:false still needs an explicit auto choice to ride on.
+	parallel := gjson.GetBytes(body, "parallel_tool_calls")
+	disableParallel := isJSONBool(parallel) && !parallel.Bool() && hasAnthropicFunctionTools(body)
+	if disableParallel && kind == toolChoiceAbsent {
+		kind = toolChoiceAuto
+	}
+	var choiceType string
+	switch kind {
+	case toolChoiceAuto:
+		choiceType = "auto"
+	case toolChoiceRequired:
+		choiceType = "any"
+	case toolChoiceNamed:
+		choiceType = "tool"
+	default:
+		// none is handled upstream (tools and tool_choice both suppressed);
+		// absent and unrecognized write nothing.
+		return
+	}
+	tw := newJSONWriter()
+	tw.Obj()
+	tw.Key("type")
+	tw.Str(choiceType)
+	if kind == toolChoiceNamed {
+		tw.Key("name")
+		tw.Str(name)
+	}
+	if disableParallel {
+		tw.Key("disable_parallel_tool_use")
+		tw.Bool(true)
+	}
+	tw.EndObj()
+	jw.Key("tool_choice")
+	jw.Raw(string(tw.Bytes()))
+}
+
+func writeAnthropicSamplingParams(jw *jsonWriter, body []byte, capabilities router.ModelSpec) {
+	if !capabilities.Supports(router.CapTemperatureUnsupported) {
+		if value := gjson.GetBytes(body, "temperature"); value.Exists() {
+			jw.Key("temperature")
+			jw.Raw(value.Raw)
 		}
+	}
+	if value := gjson.GetBytes(body, "top_p"); value.Exists() {
+		jw.Key("top_p")
+		jw.Raw(value.Raw)
+	}
+	if value := gjson.GetBytes(body, "top_k"); value.Exists() {
+		jw.Key("top_k")
+		jw.Raw(value.Raw)
 	}
 }
 
 func (e *RequestEnvelope) buildAnthropicFromAnthropic(opts EmitOptions) ([]byte, error) {
-	body, err := hoistAnthropicSystemMessages(e.body)
+	body, err := normalizeAnthropicSystemOnlyContentBlocks(e.body)
+	if err != nil {
+		return nil, fmt.Errorf("normalize system-only content blocks: %w", err)
+	}
+	body, err = hoistAnthropicSystemMessages(body)
 	if err != nil {
 		return nil, fmt.Errorf("hoist system messages: %w", err)
 	}
@@ -723,10 +832,114 @@ func (e *RequestEnvelope) buildAnthropicFromAnthropic(opts EmitOptions) ([]byte,
 	return applyOverrides(body, ov)
 }
 
+// normalizeAnthropicSystemOnlyContentBlocks places tool_addition/tool_removal
+// blocks in role:"system" messages, where Anthropic permits them. A client may
+// attach them to a user or assistant message; split those blocks into a system
+// message at the same point in the history and leave the remaining content in
+// its original message.
+func normalizeAnthropicSystemOnlyContentBlocks(body []byte) ([]byte, error) {
+	msgs := gjson.GetBytes(body, "messages")
+	if !msgs.IsArray() {
+		return body, nil
+	}
+	var kept []string
+	changed := false
+	for _, msg := range msgs.Array() {
+		if msg.Get("role").String() == "system" {
+			kept = append(kept, msg.Raw)
+			continue
+		}
+		content := msg.Get("content")
+		if !content.IsArray() {
+			kept = append(kept, msg.Raw)
+			continue
+		}
+		var remaining []string
+		var systemOnly []string
+		msgChanged := false
+		for _, part := range content.Array() {
+			if isAnthropicSystemOnlyContentBlock(part.Get("type").String()) {
+				systemOnly = append(systemOnly, part.Raw)
+				msgChanged = true
+				continue
+			}
+			remaining = append(remaining, part.Raw)
+		}
+		if !msgChanged {
+			kept = append(kept, msg.Raw)
+			continue
+		}
+		changed = true
+		role := msg.Get("role").String()
+		systemMessage := newJSONWriter()
+		systemMessage.Obj()
+		systemMessage.Key("role")
+		systemMessage.Str("system")
+		systemMessage.Key("content")
+		systemMessage.Arr()
+		for _, block := range systemOnly {
+			systemMessage.Raw(block)
+		}
+		systemMessage.EndArr()
+		systemMessage.EndObj()
+		if role == "assistant" {
+			// A system tool-change directive must follow a user turn (or an
+			// assistant turn ending in a server-tool result). Place it before
+			// the rewritten assistant turn so it cannot split tool_use from its
+			// following tool_result user turn.
+			kept = append(kept, string(systemMessage.Bytes()))
+		}
+		if len(remaining) > 0 {
+			rewritten, err := sjson.SetRawBytes([]byte(msg.Raw), "content", []byte("["+strings.Join(remaining, ",")+"]"))
+			if err != nil {
+				return nil, fmt.Errorf("strip system-only content blocks: %w", err)
+			}
+			kept = append(kept, string(rewritten))
+		}
+		if role != "assistant" {
+			// Anthropic requires a non-directive system message to follow a
+			// user message, so keep the rewritten user turn before its tool
+			// change directive. The directive then applies to the next turn.
+			kept = append(kept, string(systemMessage.Bytes()))
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	out, err := sjson.SetRawBytes(body, "messages", []byte("["+strings.Join(kept, ",")+"]"))
+	if err != nil {
+		return nil, fmt.Errorf("rebuild messages after system-only normalization: %w", err)
+	}
+	return out, nil
+}
+
+func containsAnthropicSystemOnlyContentBlock(content gjson.Result) bool {
+	if !content.IsArray() {
+		return false
+	}
+	for _, part := range content.Array() {
+		if isAnthropicSystemOnlyContentBlock(part.Get("type").String()) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnthropicSystemOnlyContentBlocks(body []byte) bool {
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		if containsAnthropicSystemOnlyContentBlock(msg.Get("content")) {
+			return true
+		}
+	}
+	return false
+}
+
 // hoistAnthropicSystemMessages clears role:"system" entries from "messages"
 // (Anthropic's API 400s on them after a mid-session model switch). Only the
 // leading run is hoisted; mid-conversation ones are rewritten as user messages
-// in place to keep the cached prefix stable. No-op if none present.
+// in place to keep the cached prefix stable. Message-scoped output_config is
+// moved to the request-level field before demotion so role-specific options are
+// not left on a user message.
 func hoistAnthropicSystemMessages(body []byte) ([]byte, error) {
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
@@ -735,26 +948,56 @@ func hoistAnthropicSystemMessages(body []byte) ([]byte, error) {
 
 	var hoisted []string // text from the leading system run, in order
 	var kept []string    // raw message objects, system entries demoted to user
+	var hoistedOutputConfig string
 	leading := true
+	leadingSystemFound := false
 	rewritten := false
 	for _, msg := range msgs.Array() {
 		isSystem := msg.Get("role").String() == "system"
+		preserveSystem := isSystem && containsAnthropicSystemOnlyContentBlock(msg.Get("content"))
 		switch {
+		case preserveSystem:
+			// Anthropic beta tool-change blocks are valid only in a system-role
+			// message. Keep this message in place instead of demoting it.
+			kept = append(kept, msg.Raw)
 		case isSystem && leading:
+			leadingSystemFound = true
 			hoisted = append(hoisted, anthropicSystemTexts(msg.Get("content"))...)
+			if config := msg.Get("output_config"); config.Exists() && config.Type != gjson.Null && hoistedOutputConfig == "" {
+				hoistedOutputConfig = config.Raw
+			}
 		case isSystem:
-			demoted, err := sjson.Set(msg.Raw, "role", "user")
+			demoted := []byte(msg.Raw)
+			if config := msg.Get("output_config"); config.Exists() {
+				var err error
+				demoted, err = sjson.DeleteBytes(demoted, "output_config")
+				if err != nil {
+					return nil, fmt.Errorf("remove demoted system output config: %w", err)
+				}
+				if config.Type != gjson.Null && hoistedOutputConfig == "" {
+					hoistedOutputConfig = config.Raw
+				}
+			}
+			demoted, err := sjson.SetBytes(demoted, "role", "user")
 			if err != nil {
 				return nil, fmt.Errorf("demote system message: %w", err)
 			}
-			kept = append(kept, demoted)
+			kept = append(kept, string(demoted))
 			rewritten = true
 		default:
 			leading = false
 			kept = append(kept, msg.Raw)
 		}
 	}
-	if len(hoisted) == 0 && !rewritten {
+	requestOutputConfig := gjson.GetBytes(body, "output_config")
+	if hoistedOutputConfig != "" && (!requestOutputConfig.Exists() || requestOutputConfig.Type == gjson.Null) {
+		var err error
+		body, err = sjson.SetRawBytes(body, "output_config", []byte(hoistedOutputConfig))
+		if err != nil {
+			return nil, fmt.Errorf("hoist system output config: %w", err)
+		}
+	}
+	if !leadingSystemFound && !rewritten {
 		return body, nil
 	}
 	if len(hoisted) == 0 {
@@ -805,6 +1048,115 @@ func sanitizeAnthropicToolSchemasBytes(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return sjson.SetRawBytes(body, "tools", raw)
+}
+
+// Anthropic permits longer historical tool_use names than declared tool names.
+const maxAnthropicHistoricalToolNameChars = 200
+
+// Anthropic rejects declared tool names over 128 characters.
+var anthropicDeclaredToolNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+
+func sanitizeAnthropicToolNamesBytes(body []byte) ([]byte, map[string]string, error) {
+	tools := gjson.GetBytes(body, "tools").Array()
+	reservedNames := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		name := tool.Get("name").String()
+		if anthropicDeclaredToolNamePattern.MatchString(name) {
+			reservedNames[name] = struct{}{}
+		}
+	}
+
+	aliases := make(map[string]string)
+	for _, tool := range tools {
+		name := tool.Get("name").String()
+		if !anthropicDeclaredToolNamePattern.MatchString(name) {
+			if _, exists := aliases[name]; !exists {
+				aliases[name] = uniqueSanitizedAnthropicToolName(name, reservedNames)
+			}
+		}
+	}
+	choice := gjson.GetBytes(body, "tool_choice")
+	choiceName := choice.Get("name").String()
+	if choice.Get("type").String() == "tool" && !anthropicDeclaredToolNamePattern.MatchString(choiceName) {
+		if _, exists := aliases[choiceName]; !exists {
+			aliases[choiceName] = uniqueSanitizedAnthropicToolName(choiceName, reservedNames)
+		}
+	}
+
+	out, err := rewriteMessageBlocks(
+		body,
+		func(block gjson.Result) bool {
+			if block.Get("type").String() != "tool_use" {
+				return false
+			}
+			name := block.Get("name").String()
+			_, hasAlias := aliases[name]
+			return hasAlias || utf8.RuneCountInString(name) > maxAnthropicHistoricalToolNameChars
+		},
+		func(raw string) (string, error) {
+			name := gjson.Get(raw, "name").String()
+			alias, ok := aliases[name]
+			if !ok {
+				alias = sanitizedAnthropicToolName(name)
+			}
+			rewritten, rewriteErr := sjson.Set(raw, "name", alias)
+			if rewriteErr != nil {
+				return "", fmt.Errorf("rewrite tool_use name: %w", rewriteErr)
+			}
+			return rewritten, nil
+		},
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	for index, tool := range gjson.GetBytes(out, "tools").Array() {
+		name := tool.Get("name").String()
+		alias, ok := aliases[name]
+		if !ok {
+			continue
+		}
+		out, err = sjson.SetBytes(out, fmt.Sprintf("tools.%d.name", index), alias)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rewrite declared tool name: %w", err)
+		}
+	}
+	if choice.Get("type").String() == "tool" {
+		if alias, ok := aliases[choiceName]; ok {
+			out, err = sjson.SetBytes(out, "tool_choice.name", alias)
+			if err != nil {
+				return nil, nil, fmt.Errorf("rewrite tool_choice name: %w", err)
+			}
+		}
+	}
+	out, err = rewriteAnthropicToolReferences(out, aliases)
+	if err != nil {
+		return nil, nil, err
+	}
+	clientNames := make(map[string]string, len(aliases))
+	for name, alias := range aliases {
+		clientNames[alias] = name
+	}
+	return out, clientNames, nil
+}
+
+func sanitizedAnthropicToolName(name string) string {
+	nameHash := sha1.Sum([]byte(name))
+	return fmt.Sprintf("invalid_tool_%x", nameHash)
+}
+
+func uniqueSanitizedAnthropicToolName(name string, reservedNames map[string]struct{}) string {
+	for attempt := 0; ; attempt++ {
+		hashInput := name
+		if attempt > 0 {
+			hashInput = fmt.Sprintf("%s_%d", name, attempt)
+		}
+		alias := sanitizedAnthropicToolName(hashInput)
+		if _, exists := reservedNames[alias]; exists {
+			continue
+		}
+		reservedNames[alias] = struct{}{}
+		return alias
+	}
 }
 
 func anthropicToolSchemaRaw(schema gjson.Result) string {

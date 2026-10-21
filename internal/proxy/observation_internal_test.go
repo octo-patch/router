@@ -5,12 +5,37 @@ import (
 	"encoding/json"
 	"testing"
 
-	"workweave/router/internal/observability/otel"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/observability/otel"
+	"weave-os/router/internal/policyregistry"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestServingSpanAttributesAreIndependentOfRoutingDecision(t *testing.T) {
+	ctx := requestcontext.WithServingIdentity(context.Background(), requestcontext.ServingIdentity{Target: string(policyregistry.TargetStable), ReleaseID: "release", BindingID: "binding", ActivationID: "activation", ProfileKey: "profile", ProfileName: "boost-default", ProfileRevision: "version", Plan: "boost", EntitlementVersion: 9, BindingGeneration: 3})
+	attributes := otel.NewAttrBuilder(10)
+	applyServingSpanAttrs(ctx, attributes)
+	attributeValues := make(map[string]string)
+	integerValues := make(map[string]int64)
+	for _, attribute := range attributes.Build() {
+		attributeValues[attribute.Key] = attribute.Value.GetStringValue()
+		integerValues[attribute.Key] = attribute.Value.GetIntValue()
+	}
+	require.Equal(t, "release", attributeValues["serving.release_id"])
+	require.Equal(t, "activation", attributeValues["serving.activation_id"])
+	require.Equal(t, "profile", attributeValues["serving.profile_key"])
+	require.Equal(t, "boost-default", attributeValues["serving.profile_name"])
+	require.Equal(t, "version", attributeValues["serving.profile_revision"])
+	require.Equal(t, "boost", attributeValues["routing.plan"])
+	require.Equal(t, int64(9), integerValues["routing.entitlement_version"])
+	require.Equal(t, int64(3), integerValues["serving.binding_generation"])
+	legacy := otel.NewAttrBuilder(0)
+	applyServingSpanAttrs(context.Background(), legacy)
+	require.Empty(t, legacy.Build())
+}
 
 // TestBuildObservationContext_CapturesFreshOnStay is the load-bearing assertion
 // for the hysteresis shadow instrumentation: on a STAY the final decision

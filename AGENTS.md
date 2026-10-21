@@ -1,8 +1,29 @@
 # router — AGENTS
 
-> **Mirror notice.** Verbatim sync with [CLAUDE.md](CLAUDE.md). Claude Code reads `CLAUDE.md`; Cursor + generic agents read `AGENTS.md`. **Update both together** — divergence = bug.
+> **Mirror notice.** Generated from [CLAUDE.md](CLAUDE.md). Edit CLAUDE.md, then run `make generate-agent-guides`; CI rejects drift.
 
-Root guide for AI agents in the `router/` subproject. Covers cross-cutting design + the layer model. **First read for any task:** [README](README.md), then this file. Then read the `CLAUDE.md` inside the package you're editing — each subpackage has its own with focused recipes + invariants.
+Root guide for AI agents in the `router/` subproject. Start here, then read the guide for the affected package. The [README](README.md) covers product setup, not required incident context.
+
+## Production incident entrypoint
+
+For a router repair, establish a synthetic failing regression before changing behavior
+and run it unchanged against the fix. For diagnosis-only requests, investigate without editing. Identify the incident-time
+serving revision and configuration before applying current source assumptions. A local
+repair does not authorize production mutation or establish production recovery.
+
+| Symptom | Owning code and context | Initial regression boundary |
+| --- | --- | --- |
+| Tool/schema rejection | [translation](internal/translate/CLAUDE.md), [providers](internal/providers/CLAUDE.md), `internal/proxy/dispatch_error.go` | Translation unit test, then provider conformance |
+| Retry, fallback, truncated stream | [proxy](internal/proxy/CLAUDE.md), `internal/dispatch`, `internal/sse`, [inference boundary](docs/INFERENCE_BOUNDARY.md) | Dispatch/SSE behavior, stream-commit and cancellation invariants |
+| Wrong model or session pin | [routing](internal/router/CLAUDE.md), [Go HMM selection](docs/HMM_GO_SELECTION.md), [session pins](internal/router/sessionpin/CLAUDE.md) | Eligibility, policy selection and pin transitions |
+| Authentication or charges | [auth](internal/auth/CLAUDE.md), `internal/billing`, [composition](cmd/CLAUDE.md) | Credential isolation, entitlement and exactly-once accounting |
+| Admission or release | `internal/server/middleware`, `internal/policyregistry`, [serving control](docs/SERVING_CONTROL.md) | Admission and immutable identity checks |
+| Client setup or UI | `install/`, `frontend/`, [contributing](CONTRIBUTING.md) | Offline installer tests or frontend checks |
+
+Run `python3 scripts/agent_checks.py doctor` and `plan --base origin/main` from this
+root for read-only prerequisite and suite discovery. Missing required checks remain
+blocked; do not report local checks as complete CI. Keep private incident notes in
+ignored `.context/`; only authored, synthetic reproductions belong in public fixtures.
 
 ## Engineering principles
 
@@ -111,6 +132,13 @@ Three concentric layers. Imports flow inward only.
 |  |  |                      synthesis, Executor iface; pure) |  |  |
 |  |  |  internal/timing    (Timing value type: per-request   |  |  |
 |  |  |                      latency stamps, no otel dep)     |  |  |
+|  |  |  internal/requestcontext (request-scoped creds,     |  |  |
+|  |  |                      identity, forwarded headers;    |  |  |
+|  |  |                      read by provider adapters)      |  |  |
+|  |  |  internal/dispatch  (inference execution boundary:   |  |  |
+|  |  |                      provider-client registry, plan   |  |  |
+|  |  |                      walk with retry/failover, wire-  |  |  |
+|  |  |                      target check, attempt events)    |  |  |
 |  |  +-------------------------------------------------------+  |  |
 |  +-------------------------------------------------------------+  |
 |                                                                   |
@@ -122,14 +150,24 @@ Three concentric layers. Imports flow inward only.
 ### Hard rules
 
 - **Layering is load-bearing.** Imports flow inward only. Inner-ring packages must not import adapter or presentation packages; adapters never import each other; only `cmd/router/main.go` constructs concrete things. Inner-ring packages may import each other (e.g. `proxy.Service.Route` returns `router.Decision`; `proxy.Service` calls `translate`, `sessionpin`, `planner`, `handover`, `cache`, `catalog`, `turntype`, `usage`, `billing` to compose an action).
+- **Request compatibility is Go-owned.** Policy sidecars may extract generic features, classify complexity, and publish their configured roster/group ranking. They must never recognize native-tool request shapes or use provider/model identity to enforce request-level compatibility, eligibility, pass-through, session pins, fallbacks, or dispatch. Put native search detection in `internal/websearch`, semantic requirements in `internal/translate`, and routing enforcement in `internal/proxy` / `internal/router`. The Go router must filter candidates before a sidecar call or bypass the sidecar entirely.
 - **Small utility third-party libs allowed at every layer.** Layering = about *where I/O and behavior live*, not banning go.mod entries. Reach for vetted small lib (`golang-lru`, `uuid`, error helpers) before rolling own. Reject heavyweight frameworks (DI containers, ORMs, metaprogramming kits).
-- **Inner-ring packages are I/O-free.** `internal/router`, `internal/providers`, `internal/translate`, `internal/sse`, `internal/timing`, `internal/feedback`, `internal/router/{cache,catalog,handover,planner,sessionpin,turntype,banditexplore}`, `internal/proxy/usage` define interfaces, value types, pure functions only. Adding I/O method (HTTP, DB, queue, FS) = layering violation; put on `auth.Service` / `proxy.Service` / `billing.Service` or adapter subpackage. Pure-Go utility libs fine.
-- **Adapters depend only on inner ring.** `internal/postgres` may also import `internal/sqlc`. Adapters never import each other — `internal/postgres` doesn't know `internal/api/admin` etc. Note: provider adapters (`internal/providers/<name>/`) import `internal/proxy` for `OnUpstreamMeta` callback so streaming responses record usage/headers back to proxy — one of few inward-pointing adapter→inner-ring imports, intentional. `internal/server/middleware` and `internal/providers/httputil` (both adapters) stamp/read request latency via `internal/timing`'s `Timing` value type instead of importing `internal/observability/otel` directly — `Timing` used to live in `otel` and was pulled out specifically so these adapters (and `internal/providers/{anthropic,openai,google,openaicompat}`) don't need a concrete dependency on the OTel exporter adapter just to stamp a timestamp. `internal/proxy` also imports `internal/timing` (an inner-ring package importing another inner-ring package, which is allowed) to read timing back into span attributes.
+- **Inner-ring packages are I/O-free.** `internal/inference`, `internal/router`, `internal/providers`, `internal/translate`, `internal/sse`, `internal/timing`, `internal/requestcontext`, `internal/feedback`, `internal/router/{cache,catalog,handover,planner,policy,sessionpin,turntype,banditexplore}`, `internal/proxy/usage` define interfaces, value types, pure functions only. Adding I/O method (HTTP, DB, queue, FS) = layering violation; put on `auth.Service` / `proxy.Service` / `billing.Service` or adapter subpackage. Pure-Go utility libs fine.
+- **Adapters depend only on inner ring.** `internal/postgres` may also import `internal/sqlc`. Adapters never import each other — `internal/postgres` doesn't know `internal/api/admin` etc. Provider adapters (`internal/providers/<name>/`) read request-scoped credentials, effective base URL / model alias, caller identity, and forwarded headers from the inner-ring `internal/requestcontext` package — never from `internal/proxy` (enforced by `internal/architecture`). `internal/dispatch` is the only inner-ring package that dereferences `providers.Client`: `proxy.Service` holds a `dispatch.Clients` registry and runs policy-resolved operations through `dispatch.Executor` (wired in `cmd/router/main.go`), which validates the prepared wire model against the plan target before any upstream I/O and emits ordered attempt events. Upstream response headers are reported through `providers.ObserveUpstreamHeaders`, whose observer is attached by proxy. `internal/server/middleware` and `internal/providers/httputil` (both adapters) stamp/read request latency via `internal/timing`'s `Timing` value type instead of importing `internal/observability/otel` directly — `Timing` used to live in `otel` and was pulled out specifically so these adapters (and `internal/providers/{anthropic,openai,google,openaicompat}`) don't need a concrete dependency on the OTel exporter adapter just to stamp a timestamp. `internal/proxy` also imports `internal/timing` (an inner-ring package importing another inner-ring package, which is allowed) to read timing back into span attributes.
 - **`internal/api/*` and `internal/server`** depend on `internal/auth` (Service handle + middleware-context types), `internal/proxy` (routing/dispatch service handle), and `internal/router` (`Router` interface + `Request`/`Decision` types — `internal/server/middleware/auth.go` and `routing_knobs_override.go` construct/read `router.Request`/`router.Decision` for header-driven overrides). May import `internal/observability` for logging, `internal/providers` for shared sentinel errors, `internal/router/cluster` for `ErrClusterUnavailable` sentinel + `DeployedModelsSource` interface (API handlers map sentinel → HTTP 503). Must not import `internal/postgres`, any concrete `internal/providers/*` adapter, or `internal/translate` directly. Concrete instances reach presentation only via constructor params from composition root.
 - **`internal/config` and `internal/observability` are leaf utilities** — must not import any other package under `internal/`. Third-party utility deps fine; today pull only stdlib + gin (request-scoped logger middleware). `internal/observability/otel` subpackage *is* an adapter (builds real OTLP exporter) and can import other internal packages; parent `internal/observability` stays a leaf.
-- **Composition happens in `cmd/router/main.go`.** Only file that constructs concrete adapters + injects them. No other place wires things. See [`cmd/CLAUDE.md`](cmd/CLAUDE.md).
+- **Worker composition happens in `cmd/router/main.go`.** Workers own authentication, admission, policy selection and inference.
 
 If wanting to import something that violates these rules, design is wrong — surface as interface in appropriate inner-ring package and implement in adapter subpackage.
+
+## Inference policy boundary
+
+- Every inference or adjacent operation has a typed purpose and reviewed policy in `internal/router/policy/inference_registry.go`; generated review projections live in `docs/POLICY_INFERENCE.{md,json}`.
+- Feature orchestration describes an operation with `inference.InvocationRequest`; `policy.PlanResolver` is the only constructor for immutable `policy.ResolvedPlan` execution authorization. Invalid target or budget overrides fail closed instead of falling through to another model.
+- New feature code must not own a provider client/map, call `providers.Client.Proxy`/`Passthrough`, construct a provider/model `router.Decision` for execution, or add a fixed catalog target. Current migration exceptions are enumerated with owner, rationale, operation class, and removal phase in `internal/architecture/inference_boundary_baseline.json`.
+- `router.Decision` remains a compatibility/result DTO during migration; it is not provider-call authorization. New selection behavior starts as a policy entry and later resolves to the executor contract.
+- Run `make generate-inference-policy` after registry changes and `make inference-boundary` before broader tests. The latter is type-aware and rejects baseline growth, concrete-provider imports outside adapters/composition, raw HTTP calls to known inference routes, and unregistered purposes.
+- Read `docs/INFERENCE_BOUNDARY.md` before moving a call site. It records the operation taxonomy, current owners, pending PR sequencing, and behavior-regression suites.
 
 ## Where to put new code
 
@@ -139,7 +177,9 @@ Pick by responsibility, then read that package's `CLAUDE.md`:
 |---|---|---|
 | HTTP endpoint (handler + route) | `internal/api/<group>/` | [internal/api/CLAUDE.md](internal/api/CLAUDE.md) |
 | Identity / API-key logic | `internal/auth` (method on `*Service`) | [internal/auth/CLAUDE.md](internal/auth/CLAUDE.md) |
-| Routing / dispatch / per-action orchestration | `internal/proxy` (method on `*Service`) | [internal/proxy/CLAUDE.md](internal/proxy/CLAUDE.md) |
+| Per-action orchestration | `internal/proxy` (method on `*Service`) | [internal/proxy/CLAUDE.md](internal/proxy/CLAUDE.md) |
+| Execution authorization / provider attempts | `internal/router/policy` / `internal/dispatch` | [docs/INFERENCE_BOUNDARY.md](docs/INFERENCE_BOUNDARY.md) |
+| Managed admission / release identity | `internal/server/middleware` / `internal/policyregistry` | [docs/SERVING_CONTROL.md](docs/SERVING_CONTROL.md) |
 | Balance check / inference debit | `internal/billing` (method on `*Service`) | — |
 | Feedback-link token signing (no I/O) | `internal/feedback` | — |
 | Routing-decision export row shape / cursor / schema | `internal/analytics` | — |
@@ -191,7 +231,7 @@ If new helper doesn't fit, justify new package in code comment before creating.
 - Use `testify/assert` + `testify/require`. Use `require.Eventually` for async (see [service_test.go](internal/auth/service_test.go) `fireMarkUsed` assertion).
 - In-memory fakes for repos/routers/provider clients are cheap + far better than mocks for unit testing Service.
 - No DB-backed integration tests in `internal/`. If need real Postgres, `docker compose` stack is runtime fixture; write scripts under `scripts/` rather than `*_test.go`.
-- **Pre-merge end-to-end smoke suite** (`smoke/`, `smoke` build tag) boots the real router against real upstream providers via a record/replay MITM proxy — catches what unit/conformance tests can't see (real provider acceptance of translated wire formats, prompt-cache accounting, SSE lifecycle). Path-gated in CI to `internal/proxy/**`, `internal/translate/**`, `internal/providers/**`, `internal/router/catalog/**`, `cmd/router/**`. Add a scenario when a change touches one of those surfaces AND the bug class needs a real upstream call to catch (wire-format translation, dispatch error classification, streaming order) — not for pure unit-testable logic already covered elsewhere. See [docs/SMOKE.md](docs/SMOKE.md) for when it runs, how to add a scenario, and how to refresh cassettes.
+- **Pre-merge end-to-end smoke suite** (`smoke/`, `smoke` build tag) boots an isolated real router behind a record/replay MITM proxy. Local and PR runs replay recorded synthetic provider responses without provider keys; only explicit recording checks live provider acceptance. The shared selector in `scripts/agent_checks.py` includes request-path packages, dispatch/policy/SSE, gateway and build inputs. Add a scenario for stack-level wire/stream/cache behavior not already established by a smaller test. See [docs/SMOKE.md](docs/SMOKE.md) for isolation, scenario creation, recording and privacy constraints.
 
 ### Logging
 
@@ -219,8 +259,8 @@ A helper that logs on the request path takes `ctx` and calls `observability.From
 
 ## Things to NEVER do
 
-- **Never put customer/company/org names or private identifiers in anything committed here.** This repo is public — commit messages, branch names, PR titles/descriptions, code comments, tests, and fixtures are world-readable. This holds even when a change is motivated by one customer's investigation (e.g. a loop-break or spiral fix found from a specific org's agentic session): describe the trigger generically ("a customer", "a large agentic session", "an org's monorepo"). No org names, org IDs, account emails, internal ticket/Linear links, or verbatim private Slack/support excerpts — those stay in the private WorkWeave repo + Linear.
-- **Never import code from outside this subproject.** Router is standalone Go module (`module workweave/router`) with no cross-project deps. If need utility from elsewhere in monorepo, copy into appropriate `internal/` package with own godoc.
+- **Never put customer/company/org names or private identifiers in anything committed here.** This repo is public — commit messages, branch names, PR titles/descriptions, code comments, tests, and fixtures are world-readable. This holds even when a change is motivated by one customer's investigation (e.g. a loop-break or spiral fix found from a specific org's agentic session): describe the trigger generically ("a customer", "a large agentic session", "an org's monorepo"). No org names, org IDs, account emails, internal ticket/Linear links, or verbatim private Slack/support excerpts — those stay in the private Weave repo + Linear.
+- **Never import code from outside this subproject.** Router is standalone Go module (`module weave-os/router`) with no cross-project deps. If need utility from elsewhere in monorepo, copy into appropriate `internal/` package with own godoc.
 - **Never write raw SQL outside `db/queries/`** or call `pgx.Pool` directly from anywhere except `internal/postgres/`. SQLC is only data mapper.
 - **Never reach across layers.** Handler in `internal/api/` calling `*sqlc.Queries` directly = layering violation; surface Service method instead. Repo calling another repo = layering violation; put orchestration in `auth.Service` / `proxy.Service`.
 - **Never add FKs to tables outside router's own schema.** Such tables don't exist in this project. `organization_id` + `created_by` = opaque external strings, not FKs.
@@ -234,13 +274,13 @@ A helper that logs on the request path takes `ctx` and calls `observability.From
 `ROUTER_DEPLOYMENT_MODE` read at boot in `cmd/router/main.go`:
 
 - **`selfhosted`** (default): full dashboard at `/ui/*`, `/admin/v1/*` API (auth, metrics, keys, provider-keys, config, excluded-models), dashboard cookie auth all mounted. Provider keys read from env vars; missing keys keep providers registered for client-passthrough but exclude from hard-pin resolution.
-- **`managed`**: dashboard + `/admin/v1/*` not mounted at all — Weave-managed deploys have separate control plane. Every provider registered with empty deployment key; proxy service in BYOK-only mode, so request without BYOK or client-supplied auth for chosen provider 400s rather than silently spending platform budget. Setting variable to any other value panics at boot. BYOK is **opt-in per installation** here (`byok_enabled` on the installation row, set by the control plane): until it's set, `withAPIKey` strips external keys so a stored key can't spend against a credit-billed deployment. An opted-in BYOK turn debits no inference cost; a platform fee (`BYOK_FEE_RATE`, default 0) may be charged as a separate `byok_fee` ledger row.
+- **`managed`**: dashboard + `/admin/v1/*` not mounted; the control plane is separate. Billing is enabled when its tables exist (a transient billing health-check error also keeps billing enabled). With billing, deployment keys are loaded and platform requests are balance-gated. Only a managed deployment without billing stays BYOK-only and registers empty deployment keys. Inspect `cmd/router/main.go` and the incident's boot configuration rather than inferring credentials from the mode alone. Any other mode value panics at boot. BYOK remains **opt-in per installation** (`byok_enabled`): `withAPIKey` strips external keys until enabled; opted-in BYOK debits no inference cost, though `BYOK_FEE_RATE` may add a separate platform-fee ledger row.
 
 When adding new endpoint, put inside `selfhosted` block in `server.Register` unless part of product surface (`/v1/*`, `/v1beta/*`, `/health`, `/validate`). Do not re-expose admin surface in managed mode.
 
 ## Eval harness (sibling `router-internal/eval/`)
 
-The eval harness is a sibling Poetry package, **not in this repo** — lives at `router-internal/eval/` in the WorkWeave monorepo and runs as a Modal app. It exercises the router via staging headers; see that package's README.
+The eval harness is a sibling uv project, **not in this repo** — lives at `router-internal/eval/` in the Weave monorepo and runs as a Modal app. It exercises the router via staging headers; see that package's README.
 
 **Per-request router selection (server side):**
 

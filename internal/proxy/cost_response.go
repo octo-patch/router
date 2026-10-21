@@ -7,8 +7,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/sse"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/sse"
+	"weave-os/router/internal/usage"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -72,21 +73,27 @@ type routerResponseCost struct {
 	CacheCreationTokens int     `json:"cache_creation_tokens"`
 }
 
-type routerCostCalculator func(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int) routerResponseCost
+type routerCostCalculator func(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int, speed catalog.Speed, mods catalog.UsageModifiers) routerResponseCost
 
+// routerCostCalculatorFor binds the attempt's rate; a reported fast speed
+// reprices at the fast rate even when the router did not dispatch fast.
 func routerCostCalculatorFor(model, provider string, fast bool) routerCostCalculator {
 	pricing, ok := servedPricing(provider, model, fast)
 	if !ok {
 		return nil
 	}
-	return func(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int) routerResponseCost {
-		return routerResponseCostFromPricing(pricing, provider, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens)
+	return func(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int, speed catalog.Speed, mods catalog.UsageModifiers) routerResponseCost {
+		served := pricing
+		if speed == catalog.SpeedFast && !fast {
+			served, _ = servedPricing(provider, model, true)
+		}
+		return routerResponseCostFromPricing(served, provider, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, mods)
 	}
 }
 
-func routerResponseCostFromPricing(pricing catalog.Pricing, provider string, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int) routerResponseCost {
-	inputUSD := catalog.EffectiveInputCost(inputTokens, cacheCreationTokens, cacheReadTokens, pricing.InputUSDPer1M, pricing, provider)
-	outputUSD := catalog.EffectiveOutputCost(outputTokens, pricing.OutputUSDPer1M)
+func routerResponseCostFromPricing(pricing catalog.Pricing, provider string, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens int, mods catalog.UsageModifiers) routerResponseCost {
+	inputUSD := catalog.EffectiveInputCost(inputTokens, cacheCreationTokens, cacheReadTokens, pricing, provider, mods)
+	outputUSD := catalog.EffectiveOutputCost(catalog.PromptTokens(inputTokens, cacheCreationTokens, cacheReadTokens, provider), outputTokens, pricing, mods)
 	return routerResponseCost{
 		TotalUSD:            roundUSD(inputUSD + outputUSD),
 		InputUSD:            roundUSD(inputUSD),
@@ -113,15 +120,20 @@ func setRouterCostHeaders(h http.Header, cost routerResponseCost) {
 // streamCostWriter adds the final turn's authoritative cost to the Anthropic
 // message_delta usage object while preserving all other SSE events verbatim.
 type streamCostWriter struct {
-	inner     http.ResponseWriter
-	pending   bytes.Buffer
-	calculate routerCostCalculator
-	// Translated Anthropic usage reports fresh input, while the bound pricing
-	// calculator expects OpenAI/Gemini input to include cached tokens.
-	inputIncludesCache   bool
-	messageStartInput    int
-	messageStartRead     int
-	messageStartCreation int
+	inner   http.ResponseWriter
+	pending bytes.Buffer
+	// framing resumes the delimiter search across writes. A found event
+	// rewinds it, so when the forward write fails before pending consumes the
+	// event, the next write presents that same event again.
+	framing            sse.Scanner
+	calculate          routerCostCalculator
+	inputIncludesCache bool
+	facts              usage.Facts
+	source             func() usage.Facts
+	// requestCacheTTL1h prices unsplit cache writes at the 1-hour rate when
+	// every breakpoint of the dispatched request asked for it; nil when the
+	// attempt is not an Anthropic-spec request.
+	requestCacheTTL1h func() bool
 }
 
 func newStreamCostWriter(inner http.ResponseWriter) *streamCostWriter {
@@ -138,9 +150,11 @@ func (w *streamCostWriter) Flush() {
 	}
 }
 
-func (w *streamCostWriter) SetCostCalculator(calculator routerCostCalculator, inputIncludesCache bool) {
+func (w *streamCostWriter) SetCostCalculator(calculator routerCostCalculator, inputIncludesCache bool, requestCacheTTL1h func() bool) {
+	w.facts = usage.Facts{}
 	w.calculate = calculator
 	w.inputIncludesCache = inputIncludesCache
+	w.requestCacheTTL1h = requestCacheTTL1h
 }
 
 func (w *streamCostWriter) Write(p []byte) (int, error) {
@@ -155,7 +169,7 @@ func (w *streamCostWriter) Write(p []byte) (int, error) {
 	}
 	w.pending.Write(p)
 	for {
-		event, consumed := sse.SplitNext(w.pending.Bytes())
+		event, consumed := w.framing.Next(w.pending.Bytes())
 		if consumed == 0 {
 			break
 		}
@@ -170,41 +184,35 @@ func (w *streamCostWriter) Write(p []byte) (int, error) {
 
 func (w *streamCostWriter) annotateEvent(event []byte) []byte {
 	eventType, data := sse.ParseEvent(event)
-	if string(eventType) == "message_start" {
-		usage := gjson.GetBytes(data, "message.usage")
-		w.messageStartInput = int(usage.Get("input_tokens").Int())
-		w.messageStartRead = int(usage.Get("cache_read_input_tokens").Int())
-		w.messageStartCreation = int(usage.Get("cache_creation_input_tokens").Int())
-		return event
+	if w.source == nil {
+		switch string(eventType) {
+		case "message_start":
+			w.facts.Merge(usage.ParseAnthropic(gjson.GetBytes(data, "message.usage")))
+		case "message_delta":
+			w.facts.Merge(usage.ParseAnthropic(gjson.GetBytes(data, "usage")))
+		}
 	}
 	if string(eventType) != "message_delta" || w.calculate == nil {
 		return event
 	}
 	stopReason := gjson.GetBytes(data, "delta.stop_reason")
-	if !stopReason.Exists() || stopReason.String() == "" || stopReason.String() == "null" {
+	if stopReason.String() == "" || stopReason.String() == "null" || !gjson.GetBytes(data, "usage").IsObject() {
 		return event
 	}
-	usage := gjson.GetBytes(data, "usage")
-	if !usage.Exists() {
-		return event
+	facts := w.facts
+	if w.source != nil {
+		facts = w.source()
 	}
-	inputTokens := int(usage.Get("input_tokens").Int())
-	outputTokens := int(usage.Get("output_tokens").Int())
-	cacheCreation := int(usage.Get("cache_creation_input_tokens").Int())
-	cacheRead := int(usage.Get("cache_read_input_tokens").Int())
-	if inputTokens == 0 {
-		inputTokens = w.messageStartInput
+	inputTokens := facts.Input.Value
+	if w.source == nil && w.inputIncludesCache {
+		inputTokens = facts.PromptTokens()
 	}
-	if cacheCreation == 0 {
-		cacheCreation = w.messageStartCreation
+	cacheCreation, cacheRead := facts.CacheWrite.Value, facts.CacheRead.Value
+	mods := catalog.UsageModifiers{CacheCreation1h: facts.CacheWrite1h.Value, InferenceGeo: facts.InferenceGeo}
+	if !facts.CacheSplitReported() && cacheCreation > 0 && w.requestCacheTTL1h != nil && w.requestCacheTTL1h() {
+		mods.CacheCreation1h = cacheCreation
 	}
-	if cacheRead == 0 {
-		cacheRead = w.messageStartRead
-	}
-	if w.inputIncludesCache {
-		inputTokens += cacheCreation + cacheRead
-	}
-	cost, err := json.Marshal(w.calculate(inputTokens, outputTokens, cacheCreation, cacheRead))
+	cost, err := json.Marshal(w.calculate(inputTokens, facts.BilledOutputTokens(), cacheCreation, cacheRead, facts.Speed, mods))
 	if err != nil {
 		return event
 	}

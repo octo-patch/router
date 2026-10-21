@@ -7,13 +7,13 @@ import (
 
 	"github.com/google/uuid"
 
-	"workweave/router/internal/billing"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 )
 
 func (s *Service) anthropicRoutingRequest(
@@ -22,7 +22,7 @@ func (s *Service) anthropicRoutingRequest(
 	headers http.Header,
 	ingress string,
 ) (context.Context, router.Request, error) {
-	ctx = s.withUsageObserver(ctx, headers, routePathMessages)
+	ctx = s.withUsageObserver(ctx, headers)
 	log := observability.FromContext(ctx)
 	cleanBody, err := stripRoutingMarkerFromMessages(body)
 	if err != nil {
@@ -33,16 +33,28 @@ func (s *Service) anthropicRoutingRequest(
 	} else {
 		cleanBody = withoutFooter
 	}
-	if canonical, _, modelErr := translate.CanonicalizeModelInBody(cleanBody); modelErr != nil {
+	var modelVariant1M bool
+	if canonical, hadVariant, modelErr := translate.CanonicalizeModelInBody(cleanBody); modelErr != nil {
 		log.Error("Failed to canonicalize model for route preview", "err", modelErr)
 	} else {
 		cleanBody = canonical
+		modelVariant1M = hadVariant
 	}
 
 	env, err := translate.ParseAnthropic(cleanBody)
 	if err != nil {
 		return ctx, router.Request{}, fmt.Errorf("parse request: %w", err)
 	}
+
+	clientIdentity := ClientIdentityFrom(ctx)
+	headerIdentity := ClientIdentityFromHeaders(headers)
+	if clientIdentity.ClientApp == "" {
+		clientIdentity.ClientApp = headerIdentity.ClientApp
+	}
+	if clientIdentity.UserAgent == "" {
+		clientIdentity.UserAgent = headerIdentity.UserAgent
+	}
+	ctx = requestcontext.WithClientBudget(ctx, resolveClientBudget(clientIdentity, headers, env.Model(), modelVariant1M))
 
 	apiKeyID, _ := ctx.Value(APIKeyIDContextKey{}).(string)
 	var sessionKey [sessionpin.SessionKeyLen]byte
@@ -53,7 +65,7 @@ func (s *Service) anthropicRoutingRequest(
 	if removed := env.StripBetaArtifacts(); removed > 0 {
 		log.Info("Stripped beta artifacts from route preview", "removed_messages", removed)
 	}
-	ctx, err = s.applySessionStrategy(ctx, installationIDFromContext(ctx), sessionKey)
+	ctx, err = s.applySessionStrategy(ctx, installationIDFromContext(ctx), deriveBetaSessionKeyForRequest(ctx, env, apiKeyID, sessionKey))
 	if err != nil {
 		return ctx, router.Request{}, err
 	}
@@ -65,7 +77,7 @@ func (s *Service) anthropicRoutingRequest(
 	}
 
 	enabledProviders := s.enabledProvidersForRequest(ctx, providers.ProviderAnthropic, headers)
-	if billing.SubscriptionOnlyFromContext(ctx) {
+	if paidFallbackForbidden(ctx) {
 		enabledProviders = restrictToSubscriptionProviders(ctx, headers, enabledProviders)
 	}
 	outputReserve := contextWindowOutputReserve
@@ -82,6 +94,7 @@ func (s *Service) anthropicRoutingRequest(
 		s.availableModels,
 	)
 	excluded, _ = excludeGemini3xOnUnsignedHistory(env, excluded, s.availableModels)
+	excluded, _ = excludeAdvisorOutrankingModels(env, excluded, s.routableUniverse())
 
 	organizationID, _ := ctx.Value(ExternalIDContextKey{}).(string)
 	installationID := ""
@@ -90,6 +103,7 @@ func (s *Service) anthropicRoutingRequest(
 	}
 	return ctx, router.Request{
 		RequestedModel:               features.Model,
+		ClientBudget:                 requestcontext.ClientBudgetFrom(ctx),
 		EstimatedInputTokens:         features.Tokens,
 		HasTools:                     features.HasTools,
 		HasImages:                    features.HasImages,

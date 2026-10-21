@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/router/turntype"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/router/turntype"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -77,7 +77,7 @@ func TestForceModelCommand_RejectsExcludedModel(t *testing.T) {
 		WithDeploymentKeyedProviders(keyed(providers.ProviderAnthropic))
 
 	ctx := context.WithValue(context.Background(),
-		InstallationExcludedModelsContextKey{}, []string{"claude-opus-5"})
+		InstallationExcludedModelsContextKey{}, []string{"claude-opus-5-5"})
 	env := forceCommandEnv(t)
 	rec := httptest.NewRecorder()
 	require.NoError(t, svc.handleForceModelCommand(ctx, rec, env,
@@ -186,14 +186,13 @@ func TestForceModelHeader_UnfencedInstallationUnaffected(t *testing.T) {
 		context.Background(), req, uuid.New(), DeriveSessionKey(env, "key-1"))
 
 	require.NoError(t, forceErr)
-	assert.Equal(t, "claude-opus-5", model)
+	assert.Equal(t, "claude-opus-5-5", model)
 	require.Len(t, store.upserts, 1)
 }
 
-// The `:level` suffix must reach the caller's context, not only *r: the
-// dispatch path reads routingKnobsForRequest(ctx) from the context it was
-// already carrying, so a knob written only onto r.Context() never made it
-// into the upstream body.
+// The `:level` suffix must reach the caller's context and returned model spec:
+// plan-owned dispatch omits routing knobs, so the returned spec carries the
+// effort into req.ForceModel for the same turn.
 func TestForceModelHeader_EffortSuffixLandsOnReturnedContext(t *testing.T) {
 	store := &recordingPinStore{}
 	svc := NewService(nil, nil, nil, false, nil, store, false,
@@ -208,7 +207,7 @@ func TestForceModelHeader_EffortSuffixLandsOnReturnedContext(t *testing.T) {
 		context.Background(), req, uuid.New(), DeriveSessionKey(env, "key-1"))
 
 	require.NoError(t, forceErr)
-	assert.Equal(t, "claude-opus-5", model)
+	assert.Equal(t, "claude-opus-5-5:xhigh", model)
 	knobs := routingKnobsForRequest(ctx)
 	require.NotNil(t, knobs)
 	assert.Equal(t, "xhigh", knobs.ForceEffort)
@@ -296,7 +295,7 @@ func TestForceModelCommand_RejectsDeploymentExcludedModel(t *testing.T) {
 	svc := NewService(nil, nil, nil, false, nil, store, false,
 		providers.ProviderAnthropic, "claude-haiku-4-5", nil).
 		WithDeploymentKeyedProviders(keyed(providers.ProviderAnthropic)).
-		WithExcludedModelsOverride([]string{"claude-opus-5"})
+		WithExcludedModelsOverride([]string{"claude-opus-5-5"})
 
 	env := forceCommandEnv(t)
 	rec := httptest.NewRecorder()
@@ -416,7 +415,10 @@ func TestClassifyDispatchError_ForcedModelExcluded(t *testing.T) {
 	assert.True(t, cls.Kind.IsClientError(),
 		"an excluded force is a client-input problem, not an upstream failure")
 	assert.Contains(t, cls.Message, "claude-opus-5")
-	assert.Contains(t, cls.Message, "/unforce-model")
+	// Sigil-free: this classifier has no request context to tell a Codex
+	// caller (which needs "$") from a Claude Code one (which needs "/").
+	assert.Contains(t, cls.Message, "unforce-model")
+	assert.NotContains(t, cls.Message, "/unforce-model")
 }
 
 // Desugaring only covers routableUniverse; claude-opus-4-8 is passthrough-only
@@ -466,6 +468,19 @@ func TestForcedModelBinding_NoAllowlistLeavesPassthroughForcingUnchanged(t *test
 	assert.Equal(t, providers.ProviderAnthropic, binding)
 }
 
+func TestForcedModelBinding_RefreshesRetiredProviderOnSavedPin(t *testing.T) {
+	svc := NewService(nil, nil, nil, false, nil, nil, false,
+		providers.ProviderAnthropic, "claude-haiku-4-5", nil).
+		WithDeploymentKeyedProviders(keyed(providers.ProviderOpenRouter))
+
+	binding, reason := svc.forcedModelBinding(
+		context.Background(), "deepseek/deepseek-v4-flash", providers.ProviderMakora)
+
+	assert.Empty(t, reason)
+	assert.Equal(t, providers.ProviderOpenRouter, binding,
+		"a saved force pin must move off Makora after its V4 binding is retired")
+}
+
 func gatewayKeyCtx(model string) context.Context {
 	return context.WithValue(context.Background(), ExternalAPIKeysContextKey{},
 		[]*auth.ExternalAPIKey{{
@@ -501,4 +516,22 @@ func TestForcedModelBinding_GatewayExclusiveRefusesUnaliasedModel(t *testing.T) 
 
 	assert.Empty(t, binding)
 	assert.Contains(t, reason, "gateway keys")
+}
+
+// Gateway-exclusive forcing skips only the positive allowlist; an explicit
+// exclusion still refuses the model.
+func TestForcedModelBinding_GatewayExclusiveKeepsExplicitExclusion(t *testing.T) {
+	svc := NewService(nil, nil, nil, false, nil, nil, false,
+		providers.ProviderAnthropic, "claude-haiku-4-5", nil)
+	ctx := context.WithValue(gatewayKeyCtx("claude-opus-5"),
+		InstallationAllowedModelsContextKey{}, []string{"claude-opus-5-5"})
+
+	binding, reason := svc.forcedModelBinding(ctx, "claude-opus-5", providers.ProviderAnthropic)
+	assert.Empty(t, reason, "the gateway, not the allowlist, bounds a force")
+	assert.Equal(t, providers.ProviderAnthropicGateway, binding)
+
+	ctx = context.WithValue(ctx, InstallationExcludedModelsContextKey{}, []string{"claude-opus-5"})
+	binding, reason = svc.forcedModelBinding(ctx, "claude-opus-5", providers.ProviderAnthropic)
+	assert.Empty(t, binding)
+	assert.Contains(t, reason, "excluded on this installation")
 }

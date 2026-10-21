@@ -1,7 +1,7 @@
 package translate
 
 import (
-	"workweave/router/internal/router"
+	"weave-os/router/internal/router"
 
 	"github.com/tidwall/gjson"
 )
@@ -57,7 +57,6 @@ func (e *RequestEnvelope) buildResponsesFromOpenAI(opts EmitOptions) ([]byte, er
 		}
 	}
 
-	writeResponsesInputFromOpenAI(jw, messages, hoisted)
 	writeResponsesToolsFromOpenAI(jw, body)
 	writeResponsesToolChoiceFromOpenAI(jw, body)
 	if p := gjson.GetBytes(body, "parallel_tool_calls"); isJSONBool(p) {
@@ -73,10 +72,7 @@ func (e *RequestEnvelope) buildResponsesFromOpenAI(opts EmitOptions) ([]byte, er
 		mt = gjson.GetBytes(body, "max_tokens")
 	}
 	if mt.Type == gjson.Number {
-		want := mt.Int()
-		if opts.Capabilities.Supports(router.CapReasoning) {
-			want = max(want, minResponsesOutputTokens)
-		}
+		want := reasoningOutputFloor(mt.Int(), opts.Capabilities.Supports(router.CapReasoning))
 		jw.Key("max_output_tokens")
 		jw.Int(clampToModelOutputCap(want, opts.TargetModel))
 	}
@@ -88,6 +84,8 @@ func (e *RequestEnvelope) buildResponsesFromOpenAI(opts EmitOptions) ([]byte, er
 			}
 		}
 	}
+
+	writeResponsesInputFromOpenAI(jw, messages, hoisted)
 
 	jw.EndObj()
 	return jw.Bytes(), nil
@@ -155,7 +153,7 @@ func writeResponsesInputFromOpenAI(jw *jsonWriter, messages gjson.Result, skip i
 				jw.Key("call_id")
 				jw.Str(clampOpenAIToolCallID(call.Get("id").String()))
 				jw.Key("name")
-				jw.Str(call.Get("function.name").String())
+				jw.Str(sanitizeResponsesToolAlias(call.Get("function.name").String()))
 				args := call.Get("function.arguments").String()
 				if args == "" {
 					args = "{}"
@@ -315,7 +313,7 @@ func writeResponsesToolChoiceFromOpenAI(jw *jsonWriter, body []byte) {
 		jw.Key("type")
 		jw.Str("function")
 		jw.Key("name")
-		jw.Str(name)
+		jw.Str(sanitizeResponsesToolAlias(name))
 		jw.EndObj()
 	}
 }

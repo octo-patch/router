@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/router/catalog"
+	"weave-os/router/internal/router/catalog"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -231,7 +231,7 @@ func TestApplyDialAlpha_AgenticStaysOnCapableModelAtLowDial(t *testing.T) {
 
 	// Precondition: without the gate, the price extreme falls through to an
 	// agentic-incapable model — the bug the gate exists to fix.
-	full, _ := argmax(s.blendScoresV2(top, knobs, s.models, nil, nil), s.models)
+	full, _ := argmax(s.blendScoresV2(top, knobs, s.models, nil), s.models)
 	_, fullIncapable := low[full]
 	require.Truef(t, fullIncapable,
 		"precondition: without the gate the price-extreme dial must fall through to an AgenticLow model, got %s", full)
@@ -245,7 +245,7 @@ func TestApplyDialAlpha_AgenticStaysOnCapableModelAtLowDial(t *testing.T) {
 		}
 		gated = append(gated, m)
 	}
-	with, _ := argmax(s.blendScoresV2(top, knobs, gated, nil, nil), gated)
+	with, _ := argmax(s.blendScoresV2(top, knobs, gated, nil), gated)
 	_, withIncapable := low[with]
 	assert.Falsef(t, withIncapable,
 		"with the agentic-harness gate the price-extreme winner must be harness-capable, got %s", with)

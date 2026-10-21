@@ -11,10 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 )
 
 // The `:level` suffix of a /force-model command must be persisted on the pin;
@@ -31,9 +31,9 @@ func TestForceModelCommand_PersistsEffortOnPin(t *testing.T) {
 		uuid.New(), DeriveSessionKey(env, "key-1"), DeriveSessionKey(env, "key-1"), 10))
 
 	require.Len(t, store.upserts, 1)
-	assert.Equal(t, "claude-opus-5", store.upserts[0].Model)
+	assert.Equal(t, "claude-opus-5-5", store.upserts[0].Model)
 	assert.Equal(t, "xhigh", store.upserts[0].Effort)
-	assert.Contains(t, rec.Body.String(), "claude-opus-5:xhigh")
+	assert.Contains(t, rec.Body.String(), "claude-opus-5-5:xhigh")
 }
 
 // The tool-result form of the command dispatches on the same turn through
@@ -44,15 +44,15 @@ func TestApplyForceModelCommand_ReturnsEffortQualifiedSpec(t *testing.T) {
 		providers.ProviderAnthropic, "claude-haiku-4-5", nil)
 
 	env := forceCommandEnv(t)
-	spec, _, err := svc.applyForceModelCommand(context.Background(), env,
+	spec, _, err := svc.applyForceModelCommand(context.Background(),
 		translate.ForceModelResult{Model: "opus:xhigh", FromToolResult: true},
 		uuid.New(), DeriveSessionKey(env, "key-1"), DeriveSessionKey(env, "key-1"))
 	require.NoError(t, err)
-	assert.Equal(t, "claude-opus-5:xhigh", spec)
+	assert.Equal(t, "claude-opus-5-5:xhigh", spec)
 
 	model, _, known, effort := resolveForceModelWithEffort(spec)
 	require.True(t, known)
-	assert.Equal(t, "claude-opus-5", model)
+	assert.Equal(t, "claude-opus-5-5", model)
 	assert.Equal(t, "xhigh", effort)
 }
 
@@ -103,7 +103,9 @@ func TestRunTurnLoop_ForcedPinRehydratesEffort(t *testing.T) {
 
 	assert.Equal(t, "claude-opus-4-8", res.Decision.Model)
 	assert.Equal(t, "xhigh", res.Decision.Effort)
-	assert.Equal(t, "xhigh", forceEffortFor(context.Background(), res.Decision))
+	assert.Equal(t, "xhigh",
+		svc.resolveEffort(context.Background(), res.Decision,
+			router.Lookup(res.Decision.Model), false).Selected)
 }
 
 // req.ForceModel (the header path) carries its own suffix into the in-memory
@@ -128,7 +130,7 @@ func TestRunTurnLoop_RequestForceModelCarriesEffort(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, "claude-opus-5", res.Decision.Model)
+	assert.Equal(t, "claude-opus-5-5", res.Decision.Model)
 	assert.Equal(t, "medium", res.Decision.Effort)
 }
 
@@ -175,9 +177,21 @@ func TestOrderBandPair_AnchoredHalfKeepsEffort(t *testing.T) {
 }
 
 // An explicit per-request knob still outranks whatever the pin carries.
-func TestForceEffortFor_KnobWinsOverDecision(t *testing.T) {
+func TestResolveEffort_KnobWinsOverDecision(t *testing.T) {
+	svc := NewService(nil, nil, nil, false, nil, nil, false,
+		providers.ProviderAnthropic, "claude-haiku-4-5", nil)
+	decision := router.Decision{Provider: providers.ProviderAnthropic, Model: "claude-opus-4-8", Effort: "xhigh"}
+	caps := router.Lookup(decision.Model)
+
 	ctx := router.WithRoutingKnobs(context.Background(), &router.Overrides{ForceEffort: "low"})
-	assert.Equal(t, "low", forceEffortFor(ctx, router.Decision{Effort: "xhigh"}))
-	assert.Equal(t, "xhigh", forceEffortFor(context.Background(), router.Decision{Effort: "xhigh"}))
-	assert.Empty(t, forceEffortFor(context.Background(), router.Decision{}))
+	knobbed := svc.resolveEffort(ctx, decision, caps, false)
+	assert.Equal(t, "low", knobbed.Selected)
+	assert.Equal(t, effortSourceUser, knobbed.Source)
+
+	arm := svc.resolveEffort(context.Background(), decision, caps, false)
+	assert.Equal(t, "xhigh", arm.Selected)
+	assert.Equal(t, effortSourceArm, arm.Source)
+
+	assert.Empty(t, svc.resolveEffort(context.Background(),
+		router.Decision{Provider: decision.Provider, Model: decision.Model}, caps, false).Selected)
 }

@@ -6,14 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"github.com/tidwall/gjson"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"workweave/router/internal/router"
+	"weave-os/router/internal/router"
 )
+
+// SubscriptionTransport identifies adapters that accept native subscription OAuth.
+// Account quota and overage observations govern whether a credential is usable;
+// this capability does not promise provider-enforced included-only billing.
+type SubscriptionTransport interface {
+	SupportsSubscriptions() bool
+}
 
 // UpstreamHeaderObserver records subscription rate-limit headroom (see
 // internal/proxy/usage) without coupling adapters to the observer. Ctx lets it
@@ -52,6 +61,7 @@ const (
 	ProviderGoogle     = "google"
 	ProviderOpenRouter = "openrouter"
 	ProviderFireworks  = "fireworks"
+	ProviderDeepInfra  = "deepinfra"
 	ProviderBedrock    = "bedrock"
 	ProviderMakora     = "makora"
 	ProviderMiniMax    = "minimax"
@@ -89,8 +99,8 @@ const (
 	FamilyAnthropic
 	// FamilyOpenAICompat speaks the OpenAI Chat Completions wire format
 	// (OpenAI itself plus every OpenAI-compatible upstream: OpenRouter,
-	// Fireworks, Bedrock's OpenAI-compat surface, Makora, MiniMax, Together,
-	// XAI, Wafer).
+	// Fireworks, DeepInfra, Bedrock's OpenAI-compat surface, Makora, MiniMax,
+	// Together, XAI, Wafer).
 	FamilyOpenAICompat
 	// FamilyGemini speaks the Google Generative Language (Gemini) wire format.
 	FamilyGemini
@@ -104,6 +114,7 @@ var ProviderFamilies = map[string]TranslationFamily{
 	ProviderGoogle:     FamilyGemini,
 	ProviderOpenRouter: FamilyOpenAICompat,
 	ProviderFireworks:  FamilyOpenAICompat,
+	ProviderDeepInfra:  FamilyOpenAICompat,
 	ProviderBedrock:    FamilyOpenAICompat,
 	ProviderMakora:     FamilyOpenAICompat,
 	ProviderMiniMax:    FamilyOpenAICompat,
@@ -185,6 +196,7 @@ var APIKeyEnvVars = map[string]string{
 	ProviderGoogle:     "GOOGLE_API_KEY",
 	ProviderOpenRouter: "OPENROUTER_API_KEY",
 	ProviderFireworks:  "FIREWORKS_API_KEY",
+	ProviderDeepInfra:  "DEEPINFRA_API_KEY",
 	ProviderBedrock:    "AWS_BEARER_TOKEN_BEDROCK",
 	ProviderMakora:     "MAKORA_API_KEY",
 	ProviderMiniMax:    "MINIMAX_API_KEY",
@@ -220,6 +232,17 @@ func RequiresBaseURL(provider string) bool {
 	return ok
 }
 
+// OutputExcludesReasoning reports whether this provider's reported output token
+// count omits its reasoning tokens, so billed output is output + reasoning.
+// xAI reports completion_tokens_details.reasoning_tokens on top of
+// completion_tokens (prompt + completion + reasoning = total_tokens) while
+// billing reasoning at the output rate. Every other OpenAI-compatible
+// upstream, OpenRouter's xAI route included, folds reasoning into
+// completion_tokens as OpenAI does.
+func OutputExcludesReasoning(provider string) bool {
+	return provider == ProviderXAI
+}
+
 // CacheTTL is the best-effort upstream prompt-cache lifetime per provider.
 // Anthropic's 1h extended cache is what pinSessionTTL is sized to; OSS
 // OpenAI-compatible providers cache on an undocumented minutes-scale window,
@@ -231,6 +254,7 @@ var CacheTTL = map[string]time.Duration{
 	ProviderGoogle:         5 * time.Minute,
 	ProviderOpenRouter:     5 * time.Minute,
 	ProviderFireworks:      5 * time.Minute,
+	ProviderDeepInfra:      5 * time.Minute,
 	ProviderBedrock:        5 * time.Minute,
 	ProviderXAI:            5 * time.Minute,
 	ProviderMeta:           5 * time.Minute,
@@ -299,25 +323,70 @@ var ErrNotImplemented = errors.New("provider: not implemented")
 // been written to the client. Handlers seeing c.Writer.Written() must NOT
 // write their own JSON envelope.
 type UpstreamStatusError struct {
-	Status int
+	Status    int
+	Headers   http.Header
+	Body      []byte
+	BodyBytes int64
+	// Cause is the dispatch error an in-stream error frame stands in for;
+	// nil when Status was read off a real upstream response.
+	Cause error
 }
 
 func (e *UpstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream returned status %d", e.Status)
 }
 
+func (e *UpstreamStatusError) Unwrap() error { return e.Cause }
+
 // UpstreamErrorResponse is returned by adapters that buffer a non-2xx
 // response instead of streaming it, so the proxy can retry on a different
 // provider or flush it to the client. Body capped at MaxBufferedErrorBytes.
 type UpstreamErrorResponse struct {
-	Status  int
-	Headers http.Header
-	Body    []byte
+	Status     int
+	Headers    http.Header
+	Body       []byte
+	BodyBytes  int64
+	BodyCapped bool
+	// Cause carries a classified upstream failure that is not represented by
+	// the HTTP status alone, such as a successful HTTP response with no answer.
+	Cause error
+}
+
+type ProviderErrorType string
+
+const (
+	ProviderErrorTypeInvalidRequest     ProviderErrorType = "invalid_request_error"
+	ProviderErrorTypeAuthentication     ProviderErrorType = "authentication_error"
+	ProviderErrorTypePermission         ProviderErrorType = "permission_error"
+	ProviderErrorTypeNotFound           ProviderErrorType = "not_found_error"
+	ProviderErrorTypeRateLimit          ProviderErrorType = "rate_limit_error"
+	ProviderErrorTypeAPI                ProviderErrorType = "api_error"
+	ProviderErrorTypeOverloaded         ProviderErrorType = "overloaded_error"
+	ProviderErrorTypeServiceUnavailable ProviderErrorType = "service_unavailable"
+)
+
+func KnownProviderErrorType(value string) (ProviderErrorType, bool) {
+	errorType := ProviderErrorType(value)
+	switch errorType {
+	case ProviderErrorTypeInvalidRequest,
+		ProviderErrorTypeAuthentication,
+		ProviderErrorTypePermission,
+		ProviderErrorTypeNotFound,
+		ProviderErrorTypeRateLimit,
+		ProviderErrorTypeAPI,
+		ProviderErrorTypeOverloaded,
+		ProviderErrorTypeServiceUnavailable:
+		return errorType, true
+	default:
+		return "", false
+	}
 }
 
 func (e *UpstreamErrorResponse) Error() string {
 	return fmt.Sprintf("upstream returned status %d (buffered)", e.Status)
 }
+
+func (e *UpstreamErrorResponse) Unwrap() error { return e.Cause }
 
 // MaxBufferedErrorBytes caps the buffered upstream error body; beyond this
 // it's truncated and the rest of the stream is drained without retention.
@@ -330,12 +399,9 @@ const MaxBufferedErrorBytes = 64 * 1024
 // re-exports it as httputil.ErrUpstreamIdleTimeout.
 var ErrUpstreamIdleTimeout = errors.New("upstream sse idle timeout")
 
-// ErrUpstreamOutputStall: output-progress watchdog fired — stream stayed alive
-// on non-output frames (reasoning deltas, keepalives) but produced zero
-// output-bearing content for the full budget. Root cause of the 2026-06-16
-// gpt-5.x incident (a /v1/responses stream sat at zero output tokens until the
-// 600s cap). Upstream-owned and retryable, like ErrUpstreamIdleTimeout;
-// defined here for the same import-cycle reason and re-exported by httputil.
+// ErrUpstreamOutputStall: the stream made no output or qualifying reasoning
+// progress for the full budget. Retryable only before client commitment.
+// Defined here to avoid an import cycle and re-exported by httputil.
 var ErrUpstreamOutputStall = errors.New("upstream sse output stall")
 
 // ErrUpstreamSlowThroughput: minimum-throughput watchdog fired — upstream IS
@@ -344,6 +410,11 @@ var ErrUpstreamOutputStall = errors.New("upstream sse output stall")
 // tripping). Upstream-owned and retryable; defined here for the same
 // import-cycle reason as the other stall sentinels.
 var ErrUpstreamSlowThroughput = errors.New("upstream sse slow throughput")
+
+// ErrUpstreamEmptyCompletion marks a clean upstream terminal that carried no
+// usable assistant text or tool call. It is retryable because HTTP success is
+// not evidence that the model answered the request.
+var ErrUpstreamEmptyCompletion = errors.New("upstream returned an empty completion")
 
 // IsRetryableStatus reports whether an upstream status is worth retrying on
 // a different provider: 5xx, 408, and 429. Other 4xx are the client's fault
@@ -357,6 +428,48 @@ func IsRetryableStatus(status int) bool {
 	return status >= 500 && status <= 599
 }
 
+// IsUpstreamRateLimited reports whether err is a buffered upstream 429: the
+// provider is throttling this caller, which says nothing about the model's
+// health. Committed streams never qualify.
+func IsUpstreamRateLimited(err error) bool {
+	var buffered *UpstreamErrorResponse
+	return errors.As(err, &buffered) && buffered.Status == http.StatusTooManyRequests
+}
+
+// RetryAfter reads the Retry-After header of a buffered upstream error in
+// either RFC 9110 form: delay-seconds or an HTTP-date, resolved against now.
+// ok is false when the header is absent, negative, or unparseable; a zero
+// delay or an HTTP-date already in the past reports (0, true): retry now.
+// A delay-seconds value too large for time.Duration saturates rather than
+// wrapping negative.
+func RetryAfter(err error, now time.Time) (delay time.Duration, ok bool) {
+	var buffered *UpstreamErrorResponse
+	if !errors.As(err, &buffered) || buffered.Headers == nil {
+		return 0, false
+	}
+	raw := strings.TrimSpace(buffered.Headers.Get("Retry-After"))
+	if raw == "" {
+		return 0, false
+	}
+	if seconds, parseErr := strconv.Atoi(raw); parseErr == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		if seconds > int(math.MaxInt64/int64(time.Second)) {
+			return math.MaxInt64, true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	at, parseErr := http.ParseTime(raw)
+	if parseErr != nil {
+		return 0, false
+	}
+	if !at.After(now) {
+		return 0, true
+	}
+	return at.Sub(now), true
+}
+
 // IsRetryable reports whether err is safe to retry on a different provider,
 // i.e. no response bytes reached the client. False for *UpstreamStatusError
 // (bytes already flushed) and nil.
@@ -364,14 +477,14 @@ func IsRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isResponseHeaderTimeout(err) {
+	if IsResponseHeaderTimeout(err) {
 		return true
 	}
 	// All three stall sentinels are upstream-owned even though the watchdog
 	// surfaces them by canceling the request context (which may also chain
 	// context.Canceled) — so they must be checked before the cancellation
 	// guard below.
-	if errors.Is(err, ErrUpstreamIdleTimeout) || errors.Is(err, ErrUpstreamOutputStall) || errors.Is(err, ErrUpstreamSlowThroughput) {
+	if errors.Is(err, ErrUpstreamIdleTimeout) || errors.Is(err, ErrUpstreamOutputStall) || errors.Is(err, ErrUpstreamSlowThroughput) || errors.Is(err, ErrUpstreamEmptyCompletion) {
 		return true
 	}
 	// Caller-side cancellation/deadlines aren't the upstream's fault; a retry
@@ -392,7 +505,9 @@ func IsRetryable(err error) bool {
 	return true
 }
 
-func isResponseHeaderTimeout(err error) bool {
+// IsResponseHeaderTimeout reports whether err is the upstream transport's
+// response-header timeout rather than a caller request deadline.
+func IsResponseHeaderTimeout(err error) bool {
 	var urlErr *url.Error
 	if !errors.As(err, &urlErr) || urlErr.Err == nil {
 		return false
@@ -466,6 +581,7 @@ var schemaRejectionPhrases = []string{
 	"could not compile grammar",
 	"invalid tool schema",
 	"invalid function schema",
+	"invalid schema for function",
 	"schema is not representable",
 	"invalid input schema",
 }
@@ -482,6 +598,36 @@ func IsUpstreamSchemaRejection(err error) bool {
 	}
 	body := strings.ToLower(string(buffered.Body))
 	for _, phrase := range schemaRejectionPhrases {
+		if strings.Contains(body, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// thoughtSignatureRejectionPhrases are Gemini 3.x 400 bodies rejecting the
+// thoughtSignature replayed on a historical functionCall ("Corrupted thought
+// signature.", "Missing thought signature ..."). Any model that does not
+// validate Gemini signatures can serve the same history.
+var thoughtSignatureRejectionPhrases = []string{
+	"thought signature",
+	"thought_signature",
+	"thoughtsignature",
+}
+
+// IsUpstreamThoughtSignatureRejection reports whether err is a buffered
+// upstream 400 rejecting a Gemini thoughtSignature in the request history.
+// The signature is opaque and lives in the client-echoed tool id, so the
+// router cannot repair it; the same request 400s on every Gemini 3.x turn for
+// the rest of the session unless it is rescued onto a model that ignores the
+// signature. Cross-binding rescue signal only, like IsUpstreamSchemaRejection.
+func IsUpstreamThoughtSignatureRejection(err error) bool {
+	var buffered *UpstreamErrorResponse
+	if !errors.As(err, &buffered) || buffered.Status != http.StatusBadRequest {
+		return false
+	}
+	body := strings.ToLower(string(buffered.Body))
+	for _, phrase := range thoughtSignatureRejectionPhrases {
 		if strings.Contains(body, phrase) {
 			return true
 		}
@@ -625,8 +771,10 @@ const (
 )
 
 type PreparedRequest struct {
-	Body    []byte
-	Headers http.Header
+	// ResponseToolNames reverses wire aliases so clients receive executable names.
+	ResponseToolNames map[string]string
+	Body              []byte
+	Headers           http.Header
 	// Endpoint selects the upstream surface (zero value = chat/completions).
 	Endpoint Endpoint
 	// Stats records translation-time mutations applied to the body (populated
@@ -639,12 +787,16 @@ type PreparedRequest struct {
 // applied to the upstream request body. Surfaced in the ProxyMessages-
 // complete log with keys:
 //   - cc_only_tools_stripped
+//   - cc_task_reminders_stripped
 //   - gemini_reminder_injected
 //   - gemini_validated_tool_mode
 type RequestMutationStats struct {
 	// CCOnlyToolsStripped counts Claude-Code-only tools removed before
 	// dispatching to a non-Anthropic upstream. See claudecode_tool_filter.go.
 	CCOnlyToolsStripped int
+	// CCTaskRemindersStripped counts Claude Code "task tools haven't been used"
+	// reminder blocks removed alongside the task-list tools.
+	CCTaskRemindersStripped int
 	// ServerToolsStripped counts native server tools (web_search_*, web_fetch_*)
 	// removed before emitting to a non-Anthropic upstream. See websearch.StripServerTools.
 	ServerToolsStripped int
@@ -702,6 +854,14 @@ type RequestTransformation struct {
 // byte-idle-guarded only.
 type OutputProgressArmer interface {
 	ArmOutputProgress(mark func()) (armed bool)
+}
+
+// ReasoningProgressArmer reports advancing reasoning separately from output,
+// so it can reset the stall watchdog without stamping first-output latency or
+// counting toward output throughput. Arm after output progress is armed;
+// non-streaming writers return false.
+type ReasoningProgressArmer interface {
+	ArmReasoningProgress(mark func()) (armed bool)
 }
 
 type Client interface {

@@ -6,8 +6,8 @@ import (
 	"context"
 	"time"
 
-	"workweave/router/internal/flags"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/flags"
+	"weave-os/router/internal/router"
 )
 
 type Installation struct {
@@ -25,11 +25,14 @@ type Installation struct {
 	// routing is confined to these models minus ExcludedModels.
 	// Empty = no restriction; fail-closed when no eligible overlap remains.
 	AllowedModels []string
-	// ModelsWhenSubscriptionActive optionally confines routing while the caller's
-	// subscription has headroom. Empty means no conditional restriction.
+	// SubscriptionStateModelsEnabled makes the two model sets authoritative, so an
+	// empty set refuses that state's serving instead of falling back to the catalog.
+	SubscriptionStateModelsEnabled bool
+	// ModelsWhenSubscriptionActive is the catalog minus the active-state
+	// exclusions: the preference for included Claude or Codex capacity.
 	ModelsWhenSubscriptionActive []string
-	// ModelsWhenSubscriptionInactive optionally confines routing after the
-	// caller's subscription is exhausted. Empty means no conditional restriction.
+	// ModelsWhenSubscriptionInactive is the catalog minus the exhausted-state
+	// exclusions: the limit for paid fallback. Empty refuses paid fallback when enabled.
 	ModelsWhenSubscriptionInactive []string
 	// ExcludedProviders is the per-installation provider exclusion list.
 	// Empty means no exclusion.
@@ -95,6 +98,16 @@ type Installation struct {
 	// HideTerminalSurfaces suppresses the routing marker, feedback footer, and
 	// statusline; routing and feedback recording are unaffected. Defaults false.
 	HideTerminalSurfaces bool
+	// ShowModelSelectionReasoning enables a short explanation in newly emitted
+	// model-selection markers. It does not change the routing decision.
+	ShowModelSelectionReasoning bool
+	// TrialCaptureEnabled opts the installation into the consented trial-period
+	// benchmark's extra telemetry capture (client git context on a session's
+	// first turn). Written by WorkWeave; never influences routing. Defaults false.
+	TrialCaptureEnabled bool
+	// TrialEnrollmentID is the WorkWeave trial enrollment this installation is
+	// mirrored from. Empty when not enrolled.
+	TrialEnrollmentID string
 	// FirstRequestServedAt is when this installation first routed a request.
 	// Set once and never cleared so it survives key rotation.
 	FirstRequestServedAt *time.Time
@@ -148,6 +161,7 @@ type InstallationRepository interface {
 	// UpdateHideTerminalSurfaces toggles hiding the router's terminal surfaces
 	// (routing marker, feedback footer, statusline) for the installation.
 	UpdateHideTerminalSurfaces(ctx context.Context, externalID, id string, hide bool) error
+	UpdateShowModelSelectionReasoning(ctx context.Context, externalID, id string, show bool) error
 	// UpdateFlagOverrides replaces the per-installation behavioral flag override
 	// set. The whole sparse set is written, not a delta, so clearing one override
 	// means omitting its key. An empty Overrides clears every override.

@@ -7,6 +7,8 @@
 #
 # Usage:
 #   docker compose up --build
+#   # Optional capture in .env.local: ROUTER_HTTP_CAPTURE_FILE=/router-captures/router-traffic.jsonl
+#   # Capture output is written to the ignored .local/router-captures/ on the host.
 #
 # Health checks:
 #   curl http://localhost:8080/health
@@ -81,6 +83,7 @@ services:
     restart: "no"
 
   server:
+    image: router-server
     build:
       context: .
     depends_on:
@@ -130,8 +133,15 @@ services:
       PUBSUB_PROJECT_ID: router-local
       PUBSUB_TOPIC_ROUTER_INVALIDATION: router-installation-invalidate
       PUBSUB_SUBSCRIPTION_ROUTER_INVALIDATION: router-installation-invalidate
+      # The server listens on the container interface when capture is enabled;
+      # the published port below remains host-loopback-only.
+      ROUTER_HTTP_CAPTURE_LISTEN_HOST: "0.0.0.0"
+    volumes:
+      # Set ROUTER_HTTP_CAPTURE_FILE=/router-captures/<new-file>.jsonl in
+      # .env.local to enable Compose capture and keep the output on the host.
+      - ./.local/router-captures:/router-captures
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
 
   # Optional frozen HMM policy. It is not part of the default stack and does
@@ -162,24 +172,21 @@ services:
   # Cursor. Not started by `docker compose up`; invoke explicitly:
   #   docker compose run --rm seed
   seed:
-    image: golang:1.25-bookworm
-    working_dir: /app
-    volumes:
-      - .:/app
-      - go_modules:/go/pkg/mod
+    image: router-seed
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: seed-runtime
     depends_on:
       postgres:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
     environment:
-      CGO_ENABLED: "0"
       DATABASE_URL: postgres://router:router@postgres:5432/router?sslmode=disable
-    command: ["go", "run", "./cmd/seed"]
     profiles:
       - tools
     restart: "no"
 
 volumes:
   router_postgres_data:
-  go_modules:

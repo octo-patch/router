@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/proxy/usage"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/proxy/usage"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -148,10 +148,6 @@ func (r *shadowRequestRouter) Route(_ context.Context, request router.Request) (
 
 func TestPolicyShadowComparisonSkipsDryRunAndCollectsServingRoute(t *testing.T) {
 	const installID = "66666666-6666-6666-6666-666666666666"
-	serving := router.Decision{
-		Provider: providers.ProviderAnthropic,
-		Model:    "claude-haiku-4-5",
-	}
 	scorerDecision := router.Decision{
 		Provider: providers.ProviderAnthropic,
 		Model:    "claude-opus-4-7",
@@ -210,7 +206,7 @@ func TestPolicyShadowComparisonSkipsDryRunAndCollectsServingRoute(t *testing.T) 
 	assert.Equal(t, "rollout-1", row.RolloutID)
 	assert.True(t, row.TrainingAllowed)
 	assert.Equal(t, "cluster", row.ServingStrategy)
-	assert.Equal(t, serving.Model, row.ServingModel)
+	assert.Equal(t, scorerDecision.Model, row.ServingModel)
 	assert.Equal(t, "future-policy", row.ShadowStrategy)
 	assert.Equal(t, "gpt-5.5", row.ShadowModel)
 	assert.Equal(t, "shadow-route-1", row.ShadowRouteID)
@@ -238,7 +234,7 @@ func TestPolicyShadowComparisonCollectsUsageBypassRoute(t *testing.T) {
 		map[string]providers.Client{providers.ProviderAnthropic: &fakeProvider{}},
 		nil, false, nil, nil, false,
 		providers.ProviderAnthropic, bypassScorerPickMdl, telem,
-	).WithSubscriptionAwareRouting(observer, 0.05, 2.0).
+	).WithUsageObserver(observer).
 		WithPolicyStrategy(policy.StrategySpec{Strategy: shadowStrategy, Router: shadowRouter})
 
 	ctx := bypassCtx(0.80)
@@ -324,12 +320,28 @@ func TestProxyMessages_RecordsPolicyObservation(t *testing.T) {
 		Model:    "claude-haiku-4-5",
 		Reason:   "policy:hmm",
 		Metadata: &router.RoutingMetadata{
-			Strategy:             string(router.StrategyHMM),
-			RouteID:              "route-1",
-			PolicyRouteKey:       "medium|open",
-			PolicyArtifactID:     "hmm-prod",
-			PolicyArtifactSHA256: "sha256:abc",
-			RosterVersion:        "roster-v2",
+			Strategy:                 string(router.StrategyHMM),
+			RouteID:                  "route-1",
+			PolicyRouteKey:           "medium|open",
+			PolicyArtifactID:         "release-sha",
+			PolicyArtifactSHA256:     "policy-sha",
+			RosterVersion:            "policy-sha",
+			ClassifierArtifactID:     "classifier-model",
+			ClassifierArtifactSHA256: "classifier-sha",
+			ClassifierPredictedLabel: "high",
+			ClassifierClassOrder:     []string{"low", "medium", "high", "maximum"},
+			ClassifierProbabilities:  map[string]float64{"low": 0.05, "medium": 0.15, "high": 0.7, "maximum": 0.1},
+			SelectionPolicyReleaseID: "release-sha",
+			SelectionPolicySHA256:    "policy-sha",
+			SelectionHeadGeneration:  42,
+			SelectionTrace: &router.SelectionTrace{
+				ClassifierRanking:  []string{"high", "medium", "maximum", "low"},
+				Harness:            "claude-code",
+				CandidateRosterIDs: []string{"anthropic/claude-haiku-4-5"},
+				EffectiveOrders:    map[string][]string{"high": {"anthropic/claude-haiku-4-5"}},
+				SelectedGroup:      "high",
+				SelectedArm:        "anthropic/claude-haiku-4-5",
+			},
 			SidecarSchemaVersion: "policy_router_v1",
 			DebugRef:             "debug-1",
 		},
@@ -355,9 +367,19 @@ func TestProxyMessages_RecordsPolicyObservation(t *testing.T) {
 	assert.Equal(t, "hmm", row.Strategy)
 	assert.Equal(t, "route-1", row.RouteID)
 	assert.Equal(t, "medium|open", row.PolicyRouteKey)
-	assert.Equal(t, "hmm-prod", row.PolicyArtifactID)
-	assert.Equal(t, "sha256:abc", row.PolicyArtifactSHA256)
-	assert.Equal(t, "roster-v2", row.RosterVersion)
+	assert.Equal(t, "release-sha", row.PolicyArtifactID)
+	assert.Equal(t, "policy-sha", row.PolicyArtifactSHA256)
+	assert.Equal(t, "policy-sha", row.RosterVersion)
+	assert.Equal(t, "classifier-model", row.ClassifierArtifactID)
+	assert.Equal(t, "classifier-sha", row.ClassifierArtifactSHA256)
+	assert.Equal(t, "high", row.ClassifierPredictedLabel)
+	assert.Equal(t, []string{"low", "medium", "high", "maximum"}, row.ClassifierClassOrder)
+	require.JSONEq(t, `{"high":0.7,"low":0.05,"maximum":0.1,"medium":0.15}`, string(row.ClassifierProbabilities))
+	assert.Equal(t, "release-sha", row.SelectionPolicyReleaseID)
+	assert.Equal(t, "policy-sha", row.SelectionPolicySHA256)
+	require.NotNil(t, row.SelectionHeadGeneration)
+	assert.Equal(t, int64(42), *row.SelectionHeadGeneration)
+	require.JSONEq(t, `{"candidate_roster_ids":["anthropic/claude-haiku-4-5"],"classifier_ranking":["high","medium","maximum","low"],"effective_orders":{"high":["anthropic/claude-haiku-4-5"]},"fallback_depth":0,"harness":"claude-code","selected_arm":"anthropic/claude-haiku-4-5","selected_group":"high","served_group":"high"}`, string(row.SelectionTrace))
 	assert.Equal(t, "policy_router_v1", row.SidecarSchemaVersion)
 	assert.True(t, row.TrainingAllowed)
 	assert.Equal(t, "hashed", row.CaptureMode)
@@ -625,3 +647,317 @@ func TestNormalizeRolloutID(t *testing.T) {
 	assert.Equal(t, "", proxy.NormalizeRolloutID(strings.Repeat("x", 257)))
 	assert.Equal(t, strings.Repeat("x", 256), proxy.NormalizeRolloutID(strings.Repeat("x", 256)))
 }
+
+// TestProxyMessages_NativeAnthropicResponseSignals asserts the Anthropic-native
+// passthrough path reports the turn-ending signals the usage extractor observed,
+// and reports nothing when the stream ended before the stop reason.
+func TestProxyMessages_NativeAnthropicResponseSignals(t *testing.T) {
+	const installID = "88888888-8888-8888-8888-888888888888"
+	toolTurn := []string{
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\"}}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"Grep\"}}\n\n",
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}
+
+	tests := []struct {
+		name              string
+		enabled           bool
+		events            []string
+		wantStopReason    *string
+		wantToolUseBlocks *int32
+		wantCut           bool
+	}{
+		{
+			name:              "observed tool turn",
+			enabled:           true,
+			events:            toolTurn,
+			wantStopReason:    ptrTo("tool_use"),
+			wantToolUseBlocks: ptrTo(int32(2)),
+		},
+		{
+			name:    "stream cut before message_delta stays unknown",
+			enabled: true,
+			events:  toolTurn[:4],
+			wantCut: true,
+		},
+		{
+			name:    "flag off keeps the row as it is today",
+			enabled: false,
+			events:  toolTurn,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := router.Decision{Provider: providers.ProviderAnthropic, Model: "claude-opus-4-7"}
+			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+				for _, e := range tt.events {
+					_, _ = w.Write([]byte(e))
+				}
+			}}
+			telem := newCaptureTelemetry()
+			svc := proxy.NewService(
+				&fakeRouter{decision: decision},
+				map[string]providers.Client{providers.ProviderAnthropic: provider},
+				nil, false, nil, nil, false,
+				providers.ProviderAnthropic, "claude-opus-4-7", telem,
+			).WithNativeAnthropicResponseSignals(tt.enabled)
+
+			ctx := context.WithValue(context.Background(), proxy.InstallationIDContextKey{}, installID)
+			rec := httptest.NewRecorder()
+			body := []byte(`{"model":"claude-opus-4-7","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(""))
+			err := svc.ProxyMessages(ctx, body, rec, httpReq)
+
+			row := telem.firstRow(t)
+			if tt.wantCut {
+				require.Error(t, err, "a stream without message_stop is not a served turn")
+				assert.Equal(t, proxy.TurnErrorStreamCut, row.ErrorClass)
+			} else {
+				require.NoError(t, err)
+				assert.Empty(t, row.ErrorClass)
+			}
+			assert.Equal(t, tt.wantStopReason, row.StopReason)
+			assert.Equal(t, tt.wantStopReason, row.UpstreamFinishReason)
+			assert.Equal(t, tt.wantToolUseBlocks, row.ToolUseBlocks)
+			// Native tool arguments are never validated by the router, so the
+			// invalid-args count stays unknown even on an observed turn.
+			assert.Nil(t, row.InvalidToolArgsBlocks)
+		})
+	}
+}
+
+// TestProxyOpenAIChatCompletion_ResponseSignalTelemetry asserts the chat
+// surface persists the tool-block counts its translator already measures, and
+// leaves them unknown when the upstream stream ended before the turn did.
+func TestProxyOpenAIChatCompletion_ResponseSignalTelemetry(t *testing.T) {
+	const installID = "99999999-9999-9999-9999-999999999999"
+	completed := `{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"patching"}]},{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"main.go\"}"}],"usage":{"input_tokens":11,"output_tokens":7}}}`
+	frames := []string{
+		`{"type":"response.output_text.delta","output_index":0,"delta":"patching"}`,
+		`{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"read_file"}}`,
+		`{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"main.go\"}"}}`,
+		completed,
+	}
+
+	tests := []struct {
+		name                  string
+		frames                []string
+		wantStopReason        *string
+		wantToolUseBlocks     *int32
+		wantInvalidArgsBlocks *int32
+	}{
+		{
+			name:                  "observed tool turn",
+			frames:                frames,
+			wantStopReason:        ptrTo("tool_calls"),
+			wantToolUseBlocks:     ptrTo(int32(1)),
+			wantInvalidArgsBlocks: ptrTo(int32(0)),
+		},
+		{
+			name:   "stream cut before the terminal event stays unknown",
+			frames: frames[:3],
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				for _, frame := range tt.frames {
+					_, _ = w.Write([]byte("data: " + frame + "\n\n"))
+				}
+			}}
+			telem := newCaptureTelemetry()
+			svc := proxy.NewService(
+				&fakeRouter{decision: router.Decision{Provider: providers.ProviderOpenAI, Model: "gpt-5.6-luna"}},
+				map[string]providers.Client{providers.ProviderOpenAI: provider},
+				nil, false, nil, nil, false,
+				providers.ProviderOpenAI, "gpt-5.6-sol", telem,
+			)
+
+			ctx := context.WithValue(context.Background(), proxy.InstallationIDContextKey{}, installID)
+			rec := httptest.NewRecorder()
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatToolTurnBody))
+			_ = svc.ProxyOpenAIChatCompletion(ctx, []byte(chatToolTurnBody), rec, httpReq)
+
+			row := telem.firstRow(t)
+			assert.Equal(t, tt.wantStopReason, row.StopReason)
+			assert.Equal(t, tt.wantToolUseBlocks, row.ToolUseBlocks)
+			assert.Equal(t, tt.wantInvalidArgsBlocks, row.InvalidToolArgsBlocks)
+		})
+	}
+}
+
+// TestProxyOpenAIChatCompletion_NativeChatResponseSignals covers the
+// chat/completions passthrough, where no translator runs and the usage
+// extractor's parse of the upstream stream is the only account of the turn.
+func TestProxyOpenAIChatCompletion_NativeChatResponseSignals(t *testing.T) {
+	const installID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	toolTurn := []string{
+		`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant"}}]}`,
+		`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}`,
+		`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"main.go\"}"}}]}}]}`,
+		`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}`,
+	}
+
+	tests := []struct {
+		name              string
+		enabled           bool
+		frames            []string
+		wantFinishReason  *string
+		wantToolUseBlocks *int32
+	}{
+		{
+			name:              "observed tool turn",
+			enabled:           true,
+			frames:            toolTurn,
+			wantFinishReason:  ptrTo("tool_calls"),
+			wantToolUseBlocks: ptrTo(int32(1)),
+		},
+		{
+			name:              "observed text turn is a measured zero",
+			enabled:           true,
+			frames:            []string{`{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`},
+			wantFinishReason:  ptrTo("stop"),
+			wantToolUseBlocks: ptrTo(int32(0)),
+		},
+		{
+			name:    "stream cut before finish_reason stays unknown",
+			enabled: true,
+			frames:  toolTurn[:3],
+		},
+		{
+			name:    "flag off keeps the row as it is today",
+			enabled: false,
+			frames:  toolTurn,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				for _, frame := range tt.frames {
+					_, _ = w.Write([]byte("data: " + frame + "\n\n"))
+				}
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			}}
+			telem := newCaptureTelemetry()
+			svc := proxy.NewService(
+				&fakeRouter{decision: router.Decision{Provider: providers.ProviderOpenAI, Model: "gpt-4.1"}},
+				map[string]providers.Client{providers.ProviderOpenAI: provider},
+				nil, false, nil, nil, false,
+				providers.ProviderOpenAI, "gpt-4.1", telem,
+			).WithNativeOpenAIResponseSignals(tt.enabled)
+
+			ctx := context.WithValue(context.Background(), proxy.InstallationIDContextKey{}, installID)
+			rec := httptest.NewRecorder()
+			// A stop sequence has no Responses equivalent, so the turn stays on
+			// chat/completions and is served without a translator.
+			body := []byte(`{"model":"auto","stream":true,"stop":["END"],"messages":[{"role":"user","content":"read main.go"}]}`)
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
+			_ = svc.ProxyOpenAIChatCompletion(ctx, body, rec, httpReq)
+
+			require.Len(t, provider.proxyEndpoints, 1)
+			require.Equal(t, providers.EndpointChatCompletions, provider.proxyEndpoints[0])
+
+			row := telem.firstRow(t)
+			assert.Equal(t, tt.wantFinishReason, row.StopReason)
+			assert.Equal(t, tt.wantFinishReason, row.UpstreamFinishReason)
+			assert.Equal(t, tt.wantToolUseBlocks, row.ToolUseBlocks)
+			assert.Nil(t, row.InvalidToolArgsBlocks)
+		})
+	}
+}
+
+// TestProxyOpenAIResponses_NativeResponseSignals covers the /v1/responses
+// passthrough, whose terminal event is the only statement of how the turn
+// ended.
+func TestProxyOpenAIResponses_NativeResponseSignals(t *testing.T) {
+	const installID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	toolTurn := []string{
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read_file"}}`,
+		`{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"main.go\"}"},{"type":"function_call","call_id":"call_2","name":"grep","arguments":"{}"}],"usage":{"input_tokens":11,"output_tokens":7}}}`,
+	}
+
+	tests := []struct {
+		name              string
+		enabled           bool
+		frames            []string
+		wantFinishReason  *string
+		wantStopReason    *string
+		wantToolUseBlocks *int32
+	}{
+		{
+			name:              "observed tool turn",
+			enabled:           true,
+			frames:            toolTurn,
+			wantFinishReason:  ptrTo("tool_calls"),
+			wantStopReason:    ptrTo("tool_calls"),
+			wantToolUseBlocks: ptrTo(int32(2)),
+		},
+		{
+			name:              "observed text turn is a measured zero",
+			enabled:           true,
+			frames:            []string{`{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":5,"output_tokens":2}}}`},
+			wantFinishReason:  ptrTo("stop"),
+			wantStopReason:    ptrTo("stop"),
+			wantToolUseBlocks: ptrTo(int32(0)),
+		},
+		{
+			name:    "stream cut before the terminal event stays unknown",
+			enabled: true,
+			frames:  toolTurn[:1],
+		},
+		{
+			// The upstream finish reason predates this flag and is unaffected.
+			name:             "flag off keeps the row as it is today",
+			enabled:          false,
+			frames:           toolTurn,
+			wantFinishReason: ptrTo("tool_calls"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				for _, frame := range tt.frames {
+					_, _ = w.Write([]byte("data: " + frame + "\n\n"))
+				}
+			}}
+			telem := newCaptureTelemetry()
+			svc := proxy.NewService(
+				&fakeRouter{decision: router.Decision{Provider: providers.ProviderOpenAI, Model: "gpt-5.6-luna"}},
+				map[string]providers.Client{providers.ProviderOpenAI: provider},
+				nil, false, nil, nil, false,
+				providers.ProviderOpenAI, "gpt-5.6-sol", telem,
+			).WithNativeOpenAIResponseSignals(tt.enabled)
+
+			ctx := context.WithValue(context.Background(), proxy.InstallationIDContextKey{}, installID)
+			rec := httptest.NewRecorder()
+			body := []byte(`{"model":"auto","stream":true,"input":"read main.go","tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]}`)
+			httpReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
+			_ = svc.ProxyOpenAIResponses(ctx, body, rec, httpReq)
+
+			require.Len(t, provider.proxyEndpoints, 1)
+			require.Equal(t, providers.EndpointResponses, provider.proxyEndpoints[0])
+
+			row := telem.firstRow(t)
+			assert.Equal(t, tt.wantFinishReason, row.UpstreamFinishReason)
+			assert.Equal(t, tt.wantStopReason, row.StopReason)
+			assert.Equal(t, tt.wantToolUseBlocks, row.ToolUseBlocks)
+			assert.Nil(t, row.InvalidToolArgsBlocks)
+		})
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }

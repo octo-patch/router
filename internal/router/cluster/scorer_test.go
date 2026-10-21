@@ -12,10 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/policy"
 )
 
 // fakeEmbedder returns a fixed vector or error; captures last text for
@@ -169,89 +169,6 @@ func TestScorer_PicksClusterAlignedModel(t *testing.T) {
 	assert.Contains(t, got.Reason, "model=claude-opus-4-7")
 }
 
-// TestScorer_SubscriptionCostFactorNoop: on the V1 fallback bundle (no
-// model_axes), a 1.0 subsidy factor must be a no-op on routing and score.
-func TestScorer_SubscriptionCostFactorNoop(t *testing.T) {
-	emb := &fakeEmbedder{vec: makeOpusVec()}
-	s := newScorerForTest(t, emb, cfgForTest())
-	req := router.Request{PromptText: strings.Repeat("x", 100)}
-
-	base, err := s.Route(context.Background(), req)
-	require.NoError(t, err)
-	require.NotNil(t, base.Metadata)
-
-	noop := req
-	noop.SubsidizedModelCostFactor = map[string]float64{base.Model: 1.0, "claude-haiku-4-5": 1.0}
-	noopRes, err := s.Route(context.Background(), noop)
-	require.NoError(t, err)
-	assert.Equal(t, base.Model, noopRes.Model, "a 1.0 factor must not change the decision")
-	assert.InDelta(t, base.Metadata.ChosenScore, noopRes.Metadata.ChosenScore, 1e-9,
-		"a 1.0 factor must not change the score")
-}
-
-// subscriptionKnobs makes cluster 0 hard (quality-favored, alpha 0.9) and cluster
-// 1 easy (cost-favored, alpha 0.2), so the V2 blend has a real margin to flip.
-func subscriptionKnobs() *DefaultRoutingKnobs {
-	return &DefaultRoutingKnobs{
-		Alpha:                []float64{0.9, 0.2},
-		SpeedWeight:          0.0,
-		OutputCostRatio:      0.0,
-		ExpectedOutputTokens: 2000,
-	}
-}
-
-// TestScorer_SubscriptionPreferenceFlipsAndSpills: in the hard cluster 0
-// (opus quality-favored), a slack plan factor (f≈epsilon) on haiku adds a
-// headroom bonus that flips the pick to haiku; a bound factor (f=1) zeroes
-// the bonus and it spills back to opus.
-func TestScorer_SubscriptionPreferenceFlipsAndSpills(t *testing.T) {
-	emb := &fakeEmbedder{vec: makeOpusVec()}
-	s := newV2BundleForTest(t, emb, v2BundleOpts{defaultKnobs: subscriptionKnobs()})
-	req := router.Request{PromptText: strings.Repeat("x", 100)}
-
-	base, err := s.Route(context.Background(), req)
-	require.NoError(t, err)
-	require.Equal(t, "claude-opus-4-7", base.Model, "no subsidy: quality-favored model wins the hard cluster")
-
-	slack := req
-	slack.SubsidizedModelCostFactor = map[string]float64{"claude-haiku-4-5": 0.05}
-	slackRes, err := s.Route(context.Background(), slack)
-	require.NoError(t, err)
-	assert.Equal(t, "claude-haiku-4-5", slackRes.Model,
-		"a slack plan (f≈epsilon) lifts the covered model above the otherwise-preferred one")
-
-	bound := req
-	bound.SubsidizedModelCostFactor = map[string]float64{"claude-haiku-4-5": 1.0}
-	boundRes, err := s.Route(context.Background(), bound)
-	require.NoError(t, err)
-	assert.Equal(t, "claude-opus-4-7", boundRes.Model,
-		"a bound plan (f=1) zeroes the bonus; routing spills back to the cash model")
-}
-
-// TestScorer_SubscriptionPicksCheapestSufficientWithinFamily: with both
-// covered models subsidized at the same factor, the uniform bonus can't
-// reorder them, so the per-cluster quality/cost blend still picks the
-// strong model on a hard cluster and the cheap one on an easy cluster.
-func TestScorer_SubscriptionPicksCheapestSufficientWithinFamily(t *testing.T) {
-	covered := map[string]float64{"claude-opus-4-7": 0.05, "claude-haiku-4-5": 0.05}
-
-	hard := newV2BundleForTest(t, &fakeEmbedder{vec: makeOpusVec()}, v2BundleOpts{defaultKnobs: subscriptionKnobs()})
-	hardRes, err := hard.Route(context.Background(), router.Request{
-		PromptText: strings.Repeat("x", 100), SubsidizedModelCostFactor: covered,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, "claude-opus-4-7", hardRes.Model,
-		"hard cluster: a subscribed family still routes to the strong model")
-
-	easy := newV2BundleForTest(t, &fakeEmbedder{vec: makeHaikuVec()}, v2BundleOpts{defaultKnobs: subscriptionKnobs()})
-	easyRes, err := easy.Route(context.Background(), router.Request{
-		PromptText: strings.Repeat("y", 100), SubsidizedModelCostFactor: covered,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, "claude-haiku-4-5", easyRes.Model,
-		"easy cluster: a subscribed family routes to the cheap sufficient model (Haiku, not Opus)")
-}
-
 // TestScorer_PreferredModelSoftNudge: a preferred model wins a close call
 // but never overrides a clearly-better model, and a stale/unknown
 // preference is a no-op.
@@ -401,6 +318,8 @@ func TestScorer_DropsTextOnlyModelOnImageTurn(t *testing.T) {
 	assert.Equal(t, "claude-opus-4-7", imageTurn.Model, "image turn must skip the text-only model")
 	assert.NotContains(t, imageTurn.Metadata.CandidateModels, "z-ai/glm-5.1",
 		"text-only model must be absent from the image-turn candidate set")
+	assert.NotContains(t, imageTurn.Metadata.ScorerRescuePool, "z-ai/glm-5.1")
+	assert.Contains(t, imageTurn.Metadata.ScorerRescuePool, "claude-opus-4-7")
 }
 
 func TestScorer_KeepsTextOnlyPoolWhenNoImageCapableCandidate(t *testing.T) {
@@ -419,6 +338,7 @@ func TestScorer_KeepsTextOnlyPoolWhenNoImageCapableCandidate(t *testing.T) {
 	got, err := s.Route(context.Background(), router.Request{PromptText: strings.Repeat("x", 100), HasImages: true})
 	require.NoError(t, err)
 	assert.Equal(t, "z-ai/glm-5.1", got.Model)
+	assert.Empty(t, got.Metadata.ScorerRescuePool)
 }
 
 func TestScorer_ReturnsErrOnEmbedderError(t *testing.T) {
@@ -1017,6 +937,7 @@ func TestScorer_ExcludedModelsRemovesFromArgmax(t *testing.T) {
 	// Without exclusion gpt-5 wins; excluding it forces argmax onto claude.
 	assert.Equal(t, "claude-opus-4-7", got.Model)
 	assert.Equal(t, "anthropic", got.Provider)
+	assert.NotContains(t, got.Metadata.ScorerRescuePool, "gpt-5")
 }
 
 func TestScorer_AutomaticExcludedModelsRemovesFromArgmax(t *testing.T) {
@@ -1030,6 +951,8 @@ func TestScorer_AutomaticExcludedModelsRemovesFromArgmax(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "claude-opus-4-7", got.Model)
 	assert.Equal(t, "anthropic", got.Provider)
+	assert.NotContains(t, got.Metadata.CandidateModels, "gpt-5")
+	assert.Contains(t, got.Metadata.ScorerRescuePool, "gpt-5")
 }
 
 // The deployment-wide set is soft: unlike ExcludedModels it must never fail a
@@ -1250,12 +1173,12 @@ func TestScorer_DropsCatalogRetiredRegistryEntries(t *testing.T) {
 	cb := buildCentroidsBlob(t, 1, dim, c0)
 	rb := []byte(`{"rankings": {"0": {
 		"deepseek/deepseek-v4-pro": 0.99,
-		"deepseek/deepseek-v4-flash": 0.50
+		"deepseek/deepseek-v4.1-flash": 0.50
 	}}}`)
 	regb := []byte(`{
 		"deployed_models": [
 			{"model": "deepseek/deepseek-v4-pro", "provider": "together", "bench_column": "x", "proxy": true},
-			{"model": "deepseek/deepseek-v4-flash", "provider": "makora", "bench_column": "y", "proxy": true}
+			{"model": "deepseek/deepseek-v4.1-flash", "provider": "makora", "bench_column": "y", "proxy": true}
 		]
 	}`)
 	cfg := cfgForTest()
@@ -1271,7 +1194,7 @@ func TestScorer_DropsCatalogRetiredRegistryEntries(t *testing.T) {
 	// It outranks flash in the bundle, so it would win argmax if eligible.
 	got, err := s.Route(context.Background(), router.Request{PromptText: strings.Repeat("x", 100)})
 	require.NoError(t, err)
-	assert.Equal(t, "deepseek/deepseek-v4-flash", got.Model)
+	assert.Equal(t, "deepseek/deepseek-v4.1-flash", got.Model)
 }
 
 func TestScorer_V2DynamicScoring(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
@@ -317,10 +317,6 @@ func (s *Service) handleNoProgressBreak(
 		}
 	}
 
-	switch env.SourceFormat() {
-	case translate.FormatOpenAI:
-		return writeSyntheticOpenAIResponse(w, env, msg, inputTokens)
-	default:
-		return writeSyntheticAnthropicResponse(w, env, msg, inputTokens)
-	}
+	ack := newCommandAcknowledgment(translate.CommandLoopStop)
+	return writeCommandOutcome(ctx, w, env, msg, ack.outcome, inputTokens)
 }

@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 )
 
 // AllowedModelsHeader restricts routing for one request to a comma-separated
@@ -140,9 +140,11 @@ func telemetryDecisionReason(ctx context.Context, reason string) string {
 }
 
 // readmitForcedModel lifts a forced model's exclusion when it stems only from
-// the request allowlist: the force is a strict pin and outranks the header.
+// the request allowlist, or from the installation allowlist under
+// gateway-exclusive routing: the force is a strict pin and outranks both.
 // Callers must already have validated the model against installation policy
-// (forcedModelBinding); a policy or context-window exclusion is never lifted.
+// (forcedModelBinding); a policy, context-window, advisor-pairing or
+// unsigned-history exclusion is never lifted.
 func (s *Service) readmitForcedModel(
 	ctx context.Context,
 	req router.Request,
@@ -151,17 +153,20 @@ func (s *Service) readmitForcedModel(
 	pin sessionpin.Pin,
 ) map[string]struct{} {
 	excluded := req.ExcludedModels
-	subset := requestAllowedModelSet(ctx)
-	if subset == nil {
-		return excluded
-	}
-	if _, inSubset := subset[pin.Model]; inSubset {
+	bypassesAllowlist := len(s.gatewayProvidersForRequest(ctx)) > 0 && !modelPermittedByAllowlist(ctx, pin.Model)
+	if modelInRequestSubset(ctx, pin.Model) && !bypassesAllowlist {
 		return excluded
 	}
 	if _, ok := excluded[pin.Model]; !ok {
 		return excluded
 	}
-	if _, ok := s.policyExcludedModels(ctx)[pin.Model]; ok {
+	if _, ok := s.forcePolicyExcludedModels(ctx)[pin.Model]; ok {
+		return excluded
+	}
+	if advisorRejectsModel(env, pin.Model) {
+		return excluded
+	}
+	if gemini3xRequiresSignedHistory(pin.Model) && env.HasUnsignedToolCallHistory() {
 		return excluded
 	}
 	outputReserve := contextWindowOutputReserve

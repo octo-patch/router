@@ -1,7 +1,6 @@
 package proxy_test
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,15 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/billing"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/cache"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/handover"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/billing"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/cache"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/sessionpin"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -38,9 +35,8 @@ func responsesTextUpstream(w http.ResponseWriter) {
 	}
 }
 
-const chatCacheableTurnBody = `{"model":"auto","stream":false,"max_tokens":256,
+const chatCacheableTurnBody = `{"model":"auto","stream":false,"max_tokens":4096,
   "messages":[{"role":"user","content":"summarize the release notes"}],
-  "tools":[{"type":"function","function":{"name":"noop","parameters":{"type":"object"}}}],
   "reasoning_effort":"medium"}`
 
 func openAIChatServiceWithDecision(provider providers.Client, decision router.Decision, c *cache.Cache) *proxy.Service {
@@ -129,8 +125,8 @@ func TestService_ProxyOpenAIChatCompletion_ResponsesUsageDebitsBilling(t *testin
 	price, ok := catalog.PriceFor(providers.ProviderOpenAI, "gpt-5.6-luna")
 	require.True(t, ok)
 	want := catalog.USDToMicros(
-		catalog.EffectiveInputCost(40, 0, 32, price.InputUSDPer1M, price, providers.ProviderOpenAI) +
-			catalog.EffectiveOutputCost(6, price.OutputUSDPer1M))
+		catalog.EffectiveInputCost(40, 0, 32, price, providers.ProviderOpenAI, catalog.UsageModifiers{}) +
+			catalog.EffectiveOutputCost(40, 6, price, catalog.UsageModifiers{}))
 
 	debits := repo.recordedDebits()
 	require.Len(t, debits, 1, "a served Responses turn must debit exactly once")
@@ -182,55 +178,37 @@ func TestService_ProxyMessages_HandoverSwitchToOpenAIEmitsResponses(t *testing.T
 		"the client must still get an Anthropic message")
 }
 
-type fakeChatCompactionSummarizer struct {
-	summary string
-	calls   int
-}
-
-func (f *fakeChatCompactionSummarizer) SummarizeForCompaction(context.Context, *translate.RequestEnvelope, string, int) (string, handover.Usage, error) {
-	f.calls++
-	return f.summary, handover.Usage{InputTokens: 10, OutputTokens: 4}, nil
-}
-
-func (f *fakeChatCompactionSummarizer) Provider() string { return providers.ProviderAnthropic }
-
-// Compaction rewrites the envelope before emit, so a compacted chat turn must
-// still be emitted as Responses and carry the summary — the rewritten history,
-// never the original messages.
-func TestService_ProxyOpenAIChatCompletion_CompactedTurnStillEmitsResponses(t *testing.T) {
-	summarizer := &fakeChatCompactionSummarizer{summary: "COMPACTED HISTORY SUMMARY"}
-	provider := &fakeProvider{proxyResponse: responsesTextUpstream}
-	svc := openAIChatService(provider, "gpt-5.6-luna").
-		// gpt-4o's 128K window is the largest eligible one here, so a history
-		// past it forces the cascade all the way to summarization.
-		WithAvailableModels(map[string]struct{}{"gpt-4o": {}}).
-		WithCompaction(summarizer, proxy.DefaultCompactionTriggerPct)
-
-	var sb strings.Builder
-	sb.WriteString(`{"model":"auto","stream":false,"max_tokens":256,"messages":[`)
-	for i := range 400 {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		role := "user"
-		if i%2 == 1 {
-			role = "assistant"
-		}
-		sb.WriteString(`{"role":"` + role + `","content":"` + strings.Repeat("history ", 200) + `"}`)
+func TestService_ProxyOpenAIChatCompletion_HandoverUsesResponsesEndpoint(t *testing.T) {
+	store := newFakePinStore()
+	store.hasPin = true
+	store.pin = sessionpin.Pin{
+		Provider:        providers.ProviderAnthropic,
+		Model:           "claude-opus-4-7",
+		Reason:          "cluster:v0.2",
+		PinnedUntil:     time.Now().Add(time.Hour),
+		LastInputTokens: 5000,
+		LastTurnEndedAt: time.Now().Add(-30 * time.Second),
 	}
-	sb.WriteString(`],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"reasoning_effort":"medium"}`)
-	body := sb.String()
-
+	openAI := &fakeProvider{proxyResponse: responsesTextUpstream}
+	fr := &fakeRouter{decision: router.Decision{
+		Provider: providers.ProviderOpenAI, Model: "gpt-5.6-luna", Reason: "cluster:v0.2",
+	}}
+	summarizer := &fakeSummarizer{summary: "HANDOVER SUMMARY MARKER"}
+	svc := proxy.NewService(
+		fr,
+		map[string]providers.Client{
+			providers.ProviderAnthropic: &fakeProvider{},
+			providers.ProviderOpenAI:    openAI,
+		},
+		nil, false, nil, store, false, providers.ProviderOpenAI, "gpt-5.6-sol", nil,
+	).WithSummarizer(summarizer)
+	body := `{"model":"auto","stream":true,"max_tokens":256,"messages":[{"role":"user","content":"` + strings.Repeat("aaaa ", 8000) + `"}],"tools":[{"type":"function","function":{"name":"noop","parameters":{"type":"object"}}}],"reasoning_effort":"medium"}`
 	rec := httptest.NewRecorder()
-	require.NoError(t, svc.ProxyOpenAIChatCompletion(context.Background(), []byte(body), rec,
-		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 
-	require.Positive(t, summarizer.calls, "the oversized turn must be compacted")
-	require.Len(t, provider.proxyBodies, 1)
-	assert.Equal(t, providers.EndpointResponses, provider.proxyEndpoints[0],
-		"a rewritten envelope must still be emitted onto Responses")
-	sent := provider.proxyBodies[0]
-	assert.False(t, gjson.GetBytes(sent, "messages").Exists())
-	assert.Contains(t, string(sent), "COMPACTED HISTORY SUMMARY")
-	assert.Equal(t, "chat.completion", gjson.GetBytes(rec.Body.Bytes(), "object").String())
+	require.NoError(t, svc.ProxyOpenAIChatCompletion(authedCtx(uuid.New().String()), []byte(body), rec, req))
+	require.Equal(t, int32(1), summarizer.calls.Load(), "the switch must invoke the summarizer")
+	require.Len(t, openAI.proxyEndpoints, 1)
+	assert.Equal(t, providers.EndpointResponses, openAI.proxyEndpoints[0])
+	assert.Contains(t, string(openAI.proxyBodies[0]), "HANDOVER SUMMARY MARKER")
 }

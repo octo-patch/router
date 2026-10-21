@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -69,6 +69,10 @@ func (s *evictionStubPinStore) IncrementOverloadErrors(context.Context, [session
 }
 
 func (s *evictionStubPinStore) ResetOverloadErrors(context.Context, [sessionpin.SessionKeyLen]byte, string, router.Strategy) error {
+	return nil
+}
+
+func (*evictionStubPinStore) ExpireAndDemoteModel(context.Context, sessionpin.Pin, string, sessionpin.DemotionReason) error {
 	return nil
 }
 
@@ -401,6 +405,56 @@ func TestMaybeExpireDeadArmPin(t *testing.T) {
 				assert.True(t, expired.PinnedUntil.Before(time.Now()), "eviction expires the pin")
 			} else {
 				assert.Empty(t, store.upserts, "pin must survive")
+			}
+		})
+	}
+}
+
+func TestMaybeEvictPin_SubscriptionPoolExhaustedLeavesStrikeCounter(t *testing.T) {
+	store := &evictionStubPinStore{incrementNext: []int{1}}
+	svc := newEvictionTestService(store)
+	installationID := uuid.New()
+	sessionKey := nonZeroSessionKey()
+
+	svc.maybeEvictPinAfterUpstreamErr(
+		context.Background(),
+		true,
+		ErrSubscriptionPoolExhausted,
+		"loop_escalation",
+		installationID,
+		sessionKey,
+		sessionpin.DefaultRole,
+	)
+
+	assert.Zero(t, store.incrementCalls, "pool exhaustion has no upstream status and must not use the 4xx strike counter")
+	assert.Empty(t, store.upserts, "subscription-arm expiry is keyed off the primary attempt, not the final rescue error")
+}
+
+func TestMaybeExpireSubscriptionArmPin(t *testing.T) {
+	installationID := uuid.New()
+	sessionKey := nonZeroSessionKey()
+
+	cases := []struct {
+		name           string
+		failure        error
+		decisionReason string
+		wantReason     string
+	}{
+		{"pool exhaustion evicts the pin", ErrSubscriptionPoolExhausted, "loop_escalation", pinEvictionReasonSubscriptionPool},
+		{"model denial evicts the pin", modelAccessError(), "loop_escalation", pinEvictionReasonSubscriptionModel},
+		{"healthy arm leaves the pin", nil, "loop_escalation", ""},
+		{"force-model pin is never evicted", modelAccessError(), translate.ReasonUserForceModel, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &evictionStubPinStore{}
+			svc := newEvictionTestService(store)
+			svc.maybeExpireSubscriptionArmPin(context.Background(), tc.failure, tc.decisionReason, installationID, sessionKey, sessionpin.DefaultRole)
+			if tc.wantReason != "" {
+				require.Len(t, store.upserts, 1)
+				assert.Equal(t, tc.wantReason, store.upserts[0].Reason)
+			} else {
+				assert.Empty(t, store.upserts)
 			}
 		})
 	}

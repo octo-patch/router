@@ -2,26 +2,33 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"workweave/router/internal/analytics"
-	"workweave/router/internal/api/admin"
-	analyticsapi "workweave/router/internal/api/analytics"
-	anthropicapi "workweave/router/internal/api/anthropic"
-	feedbackapi "workweave/router/internal/api/feedback"
-	geminiapi "workweave/router/internal/api/gemini"
-	openaiapi "workweave/router/internal/api/openai"
-	"workweave/router/internal/auth"
-	"workweave/router/internal/billing"
-	"workweave/router/internal/policyclient"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
-	"workweave/router/internal/server/middleware"
+	"weave-os/router/internal/analytics"
+	"weave-os/router/internal/api/admin"
+	analyticsapi "weave-os/router/internal/api/analytics"
+	anthropicapi "weave-os/router/internal/api/anthropic"
+	classifierapi "weave-os/router/internal/api/classifier"
+	feedbackapi "weave-os/router/internal/api/feedback"
+	geminiapi "weave-os/router/internal/api/gemini"
+	openaiapi "weave-os/router/internal/api/openai"
+	subscriptionsapi "weave-os/router/internal/api/subscriptions"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/billing"
+	"weave-os/router/internal/policyclient"
+	"weave-os/router/internal/policyregistry"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/hmm/rosterdata"
+	"weave-os/router/internal/router/policy"
+	"weave-os/router/internal/server/middleware"
+	"weave-os/router/internal/subscriptions/entitlement"
+	"weave-os/router/internal/trafficcapture"
 
 	"github.com/gin-gonic/gin"
 )
@@ -29,6 +36,8 @@ import (
 const (
 	healthTimeout    = 1 * time.Second
 	readinessTimeout = 2 * time.Second
+	// Leave time to return a database failure before Cloud Run's 3-second probe timeout.
+	startupTimeout = 2 * time.Second
 	// Cold-cache key probe costs 3 sequential Postgres round trips; 1s made that a credential rejection.
 	validateTimeout = 5 * time.Second
 
@@ -37,12 +46,18 @@ const (
 	passthroughTimeout    = 10 * time.Second
 	routeTimeout          = 5 * time.Second
 	adminTimeout          = 10 * time.Second
+	// subscriptionAccountTimeout includes a 15-second provider exchange plus
+	// authentication, membership checks and the encrypted account write.
+	subscriptionAccountTimeout = 30 * time.Second
 	// catalogModelsTimeout bounds GET /v1/router/models; must exceed the HMM
 	// sidecar client budget (policyclient.DefaultTimeout) or a cold cache 503s.
-	catalogModelsTimeout = policyclient.DefaultTimeout * 2
+	catalogModelsTimeout    = policyclient.DefaultTimeout * 2
+	modelPreparationTimeout = 10 * time.Second
 	// feedbackTimeout bounds the no-login feedback link reads/writes. Both are
 	// single-row Postgres ops plus an async span emit, so 5s is generous.
 	feedbackTimeout = 5 * time.Second
+	// sessionCostTimeout bounds key verification plus one indexed aggregate.
+	sessionCostTimeout = 5 * time.Second
 	// analyticsTimeout bounds an export page. Keyset scans on a high-volume
 	// telemetry table warrant a batch-job budget, not an interactive one.
 	analyticsTimeout = 60 * time.Second
@@ -75,12 +90,55 @@ const (
 //
 // readinessChecker gates /readyz only; /health remains process liveness.
 //
-// hmmRosterSource, when non-nil, mounts GET /v1/router/hmm-roster for the
-// control plane's cluster allowlist UI.
+// hmmRosterSources, when non-nil, mounts GET /v1/router/hmm-roster for the
+// control plane's live stable/beta policy UI.
 //
 // analyticsSvc, when non-nil, mounts the /v1/analytics/* export surface;
 // nil leaves it unmounted (tests, deployments without telemetry storage).
-func Register(engine *gin.Engine, authSvc *auth.Service, proxySvc *proxy.Service, deployedModels admin.DeployedModelsSource, hmmModels admin.HMMRosterSource, mode DeploymentMode, billingSvc *billing.Service, readinessChecker admin.HealthChecker, hmmRosterSource policy.RosterSource, analyticsSvc *analytics.Service) {
+//
+// Register keeps the default route surface backwards-compatible. Optional
+// request features are enabled through RegisterWithFeatures.
+func Register(engine *gin.Engine, authSvc *auth.Service, proxySvc *proxy.Service, deployedModels admin.DeployedModelsSource, hmmModels admin.HMMRosterSource, mode DeploymentMode, billingSvc *billing.Service, readinessChecker admin.HealthChecker, hmmRosterSources map[router.Strategy]policy.RosterSource, analyticsSvc *analytics.Service, hmmDistributionRosters ...*rosterdata.Roster) {
+	RegisterWithFeatures(engine, authSvc, proxySvc, deployedModels, hmmModels, mode, billingSvc, readinessChecker, hmmRosterSources, analyticsSvc, Features{}, hmmDistributionRosters...)
+}
+
+// DefaultStrategyFromEnv is the deployment-level strategy for installations
+// with no persisted override (ROUTER_DEFAULT_STRATEGY, cluster when unset).
+func DefaultStrategyFromEnv() router.Strategy {
+	return ParseDefaultStrategy(os.Getenv("ROUTER_DEFAULT_STRATEGY"))
+}
+
+// ParseDefaultStrategy normalizes a raw ROUTER_DEFAULT_STRATEGY value; empty
+// means the legacy cluster default.
+func ParseDefaultStrategy(raw string) router.Strategy {
+	strategy := router.Strategy(strings.ToLower(strings.TrimSpace(raw)))
+	if strategy == "" {
+		return router.StrategyCluster
+	}
+	return strategy
+}
+
+// Features configures dependencies and optional request surfaces.
+type Features struct {
+	// StartupDatabasePing is required for /startupz to succeed.
+	StartupDatabasePing func(context.Context) error
+	// TrafficCapture records local conversation HTTP exchanges when explicitly configured.
+	TrafficCapture trafficcapture.Recorder
+	// PolicyPinEnabled registers the x-weave-policy-pin middleware. Off means
+	// the header is never read.
+	PolicyPinEnabled bool
+	// ServingAdmission admits authenticated requests and pins policy snapshots.
+	// Nil keeps legacy/self-hosted workers on their existing admission path.
+	ServingAdmission *middleware.ServingAdmissionConfig
+	TestPlans        *policyregistry.TestPlanTools
+	// SubscriberAllowance gates inference on an individual Max/Boost
+	// subscriber's included Router allowance. Nil leaves every request on the
+	// org/prepaid billing gates alone.
+	SubscriberAllowance *entitlement.Service
+}
+
+// RegisterWithFeatures is Register with optional request features enabled.
+func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *proxy.Service, deployedModels admin.DeployedModelsSource, hmmModels admin.HMMRosterSource, mode DeploymentMode, billingSvc *billing.Service, readinessChecker admin.HealthChecker, hmmRosterSources map[router.Strategy]policy.RosterSource, analyticsSvc *analytics.Service, features Features, hmmDistributionRosters ...*rosterdata.Roster) {
 	// Browser clients need an explicit expose list before fetch can read the
 	// router's routing and cost metadata from a cross-origin response.
 	engine.Use(func(c *gin.Context) {
@@ -100,25 +158,60 @@ func Register(engine *gin.Engine, authSvc *auth.Service, proxySvc *proxy.Service
 		}, ", "))
 		c.Next()
 	})
+	if features.TrafficCapture != nil {
+		engine.Use(middleware.WithTrafficCapture(features.TrafficCapture))
+	}
+	engine.Use(gin.Recovery())
 	// Managed mode: BYOK is opt-in per installation (see WithAuth).
 	byokRequiresOptIn := mode == DeploymentModeManaged
+	var policyPinMiddleware []gin.HandlerFunc
+	if features.PolicyPinEnabled {
+		policyPinMiddleware = []gin.HandlerFunc{middleware.WithPolicyPinOverride()}
+	}
+	// Ahead of the org billing gates: included turns skip them, while exhausted
+	// turns continue into the same organization balance and spend-limit path.
+	var subscriberAllowanceMiddleware []gin.HandlerFunc
+	var subscriberProductScopeMiddleware []gin.HandlerFunc
+	if features.SubscriberAllowance != nil {
+		subscriberAllowanceMiddleware = []gin.HandlerFunc{middleware.WithSubscriberAllowance(features.SubscriberAllowance)}
+		subscriberProductScopeMiddleware = []gin.HandlerFunc{middleware.WithSubscriberProductScope(features.SubscriberAllowance)}
+	}
+	var servingAdmissionMiddleware []gin.HandlerFunc
+	if features.ServingAdmission != nil {
+		servingAdmissionMiddleware = []gin.HandlerFunc{middleware.WithServingAdmission(features.ServingAdmission)}
+		engine.POST(policyregistry.WorkerValidationPath, middleware.WithTimeout(30*time.Second), middleware.WithInternalServiceAuth(strings.TrimSpace(os.Getenv("ROUTER_INTERNAL_SERVICE_TOKEN"))), middleware.ServingValidationHandler(features.ServingAdmission))
+	}
+	var discoveryMiddleware []gin.HandlerFunc
+	if features.ServingAdmission != nil {
+		discoveryMiddleware = append(discoveryMiddleware, middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission))
+		discoveryMiddleware = append(discoveryMiddleware, servingAdmissionMiddleware...)
+	}
+	discovery := engine.Group("", discoveryMiddleware...)
+	if features.ServingAdmission != nil && mode == DeploymentModeManaged {
+		discovery.POST("/v1/router/models/:model/prepare", middleware.WithTimeout(modelPreparationTimeout), classifierapi.PrepareModelHandler(proxySvc))
+		discovery.GET("/v1/router/models/:model/prepare/:operation", middleware.WithTimeout(modelPreparationTimeout), classifierapi.PrepareModelHandler(proxySvc))
+	}
+	if features.ServingAdmission != nil {
+		discovery.GET("/v1/test-plan/validate", middleware.WithTimeout(catalogModelsTimeout), admin.TestPlanValidationHandler)
+	}
 
+	engine.GET("/livez", middleware.WithTimeout(healthTimeout), admin.HealthHandler)
 	engine.GET("/health", middleware.WithTimeout(healthTimeout), admin.HealthHandler)
 	engine.GET("/readyz", middleware.WithTimeout(readinessTimeout), admin.ReadinessHandler(readinessChecker))
+	// Initialization finishes before listening; database connectivity gates startup.
+	engine.GET("/startupz", middleware.WithTimeout(startupTimeout), admin.StartupHandler(features.StartupDatabasePing))
 
 	// /v1/version reports the binary's git commit + build time (via -ldflags),
 	// used by the README's managed-deployment badge. Public build metadata, unauthed like /health.
 	engine.GET("/v1/version", middleware.WithTimeout(healthTimeout), admin.VersionHandler)
 	var registeredStrategies []router.Strategy
+	var strategyAvailability middleware.StrategyAvailability
 	if proxySvc != nil {
 		registeredStrategies = proxySvc.RegisteredStrategies()
+		strategyAvailability = proxySvc.PolicyStrategyAvailable
 	}
-	defaultStrategy := router.Strategy(strings.ToLower(strings.TrimSpace(os.Getenv("ROUTER_DEFAULT_STRATEGY"))))
-	if defaultStrategy == "" {
-		defaultStrategy = router.StrategyCluster
-	}
-	defaultStrategy = middleware.NormalizeRouterStrategyDefault(defaultStrategy, registeredStrategies...)
-	engine.GET(
+	defaultStrategy := middleware.NormalizeRouterStrategyDefault(DefaultStrategyFromEnv(), registeredStrategies...)
+	discovery.GET(
 		"/v1/router/policies",
 		middleware.WithTimeout(healthTimeout),
 		admin.PolicyCatalogHandler(proxySvc, defaultStrategy),
@@ -134,29 +227,67 @@ func Register(engine *gin.Engine, authSvc *auth.Service, proxySvc *proxy.Service
 		// Projects the quality-vs-price dial's model mix across dial positions
 		// for the dashboard's distribution preview. Same unauthed rationale as
 		// /v1/router/models; the assertion skips sources that can't project one.
-		if dist, ok := deployedModels.(admin.RoutingDistributionSource); ok {
-			engine.GET("/v1/router/routing-distribution", middleware.WithTimeout(healthTimeout), admin.RoutingDistributionHandler(dist))
+		if dist, ok := deployedModels.(admin.RoutingDistributionSource); ok && features.ServingAdmission == nil {
+			discovery.GET("/v1/router/routing-distribution", middleware.WithTimeout(healthTimeout), admin.RoutingDistributionHandler(dist, hmmDistributionRosters...))
 		}
+	}
+	if features.ServingAdmission != nil {
+		discovery.GET("/v1/router/routing-distribution", middleware.WithTimeout(healthTimeout), admin.AdmittedRoutingDistributionHandler(policyregistry.AdmittedRosterSource{}))
 	}
 
 	// /v1/router/hmm-roster: frozen per-cluster arm roster mapped to catalog IDs.
 	// Unauthed — read-only and non-sensitive, same rationale as /v1/router/models.
-	if hmmRosterSource != nil {
-		engine.GET("/v1/router/hmm-roster", middleware.WithTimeout(readinessTimeout), admin.HMMRosterHandler(hmmRosterSource))
+	if len(hmmRosterSources) > 0 {
+		discovery.GET("/v1/router/hmm-roster", middleware.WithTimeout(readinessTimeout), admin.HMMRosterHandler(hmmRosterSources))
 	}
 
 	// /internal/v1/*: control-plane-to-router calls, authed by a shared secret
 	// and mounted only when one is configured. This is not a second admin API —
-	// it carries only work the control plane cannot do itself because the
-	// credential is minted here per request (key-pair, workload identity).
+	// it carries only work the control plane cannot do itself because credentials
+	// are minted or encrypted here.
 	if internalToken := strings.TrimSpace(os.Getenv("ROUTER_INTERNAL_SERVICE_TOKEN")); internalToken != "" {
 		internalGroup := engine.Group("/internal/v1", middleware.WithTimeout(adminTimeout), middleware.WithInternalServiceAuth(internalToken))
+		if features.TestPlans != nil {
+			internalGroup.GET("/test-plans/identities", admin.InternalTestPlanIdentitiesHandler(features.TestPlans))
+			internalGroup.POST("/test-plans/preview", admin.InternalTestPlanPreviewHandler(features.TestPlans))
+			internalGroup.POST("/test-plans/prepare", admin.InternalTestPlanPrepareHandler(features.TestPlans))
+			internalGroup.DELETE("/test-plans/launches/:id", admin.InternalTestPlanRevokeHandler(features.TestPlans))
+		}
 		internalGroup.POST("/provider-keys/models", admin.InternalListUpstreamModelsHandler(authSvc, proxySvc))
+		if authSvc.SubscriptionAccountsEnabled() {
+			internalGroup.GET("/subscription-accounts/:subscriberID", admin.InternalListSubscriptionAccountsHandler(authSvc))
+			internalGroup.PATCH("/subscription-accounts/:subscriberID/:accountID", admin.InternalUpdateSubscriptionAccountHandler(authSvc))
+			internalGroup.DELETE("/subscription-accounts/:subscriberID/:accountID", admin.InternalDeleteSubscriptionAccountHandler(authSvc))
+		}
+		// Inference-policy inspection: the reviewed registry, the deployment's
+		// view of it, and a resolution preview. Read-only and content-free; the
+		// control plane mirrors these into its policy inventory.
+		internalGroup.GET("/inference-policies", admin.InternalInferencePoliciesHandler(proxySvc))
+		internalGroup.GET("/inference-policies/deployment", admin.InternalInferenceDeploymentHandler(proxySvc))
+		internalGroup.POST("/inference-policies/resolve", admin.InternalInferenceResolveHandler(proxySvc))
+		internalGroup.POST("/task-domain/preview", admin.InternalTaskDomainPreviewHandler())
+		internalGroup.GET("/escalation/sessions", admin.InternalLLMEscalationSessionsHandler(proxySvc))
+		internalGroup.GET("/escalation/dashboard", admin.InternalEscalationDashboardHandler(proxySvc))
+		internalGroup.GET("/escalation/sessions/:scope", admin.InternalLLMEscalationSessionHandler(proxySvc))
+		internalGroup.GET("/escalation/config/:installationID", admin.InternalEscalationConfigurationHandler(proxySvc))
+		internalGroup.PUT("/escalation/config/:installationID", admin.InternalUpdateEscalationConfigurationHandler(proxySvc))
 	}
 
 	// /validate is a token-validity probe used by clients (not the dashboard), so it stays mounted in both modes.
-	adminAuthed := engine.Group("", middleware.WithTimeout(validateTimeout), middleware.WithAuth(authSvc, byokRequiresOptIn))
+	// /v1/client-events is the harness CLI's off/on/uninstall report and rides the same key auth.
+	adminAuthed := engine.Group("", middleware.WithTimeout(validateTimeout), middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission))
+	threadHandlers := []gin.HandlerFunc{middleware.WithTimeout(validateTimeout), middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission)}
+	threadHandlers = append(threadHandlers, servingAdmissionMiddleware...)
+	threadHandlers = append(threadHandlers, classifierapi.StartThreadHandler(proxySvc))
+	engine.POST("/v1/router/threads", threadHandlers...)
+	adminAuthed.Use(servingAdmissionMiddleware...)
 	adminAuthed.GET("/validate", admin.ValidateHandler)
+	adminAuthed.POST("/v1/client-events", admin.ClientEventHandler(authSvc))
+	if authSvc.SubscriptionAccountsEnabled() {
+		subscriptionGroup := engine.Group("/v1", middleware.WithTimeout(subscriptionAccountTimeout), middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission))
+		subscriptionGroup.Use(servingAdmissionMiddleware...)
+		subscriptionsapi.Register(subscriptionGroup, authSvc)
+	}
 
 	if mode == DeploymentModeSelfHosted {
 		engine.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, "/ui") })
@@ -211,93 +342,142 @@ func Register(engine *gin.Engine, authSvc *auth.Service, proxySvc *proxy.Service
 	messagesMiddleware := []gin.HandlerFunc{
 		middleware.WithTimingEntry(),
 		middleware.WithTimeout(messagesTimeout),
-		middleware.WithAuth(authSvc, byokRequiresOptIn),
-		middleware.WithAgentShadowEvaluation(),
+		middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission),
 	}
+	messagesMiddleware = append(messagesMiddleware, servingAdmissionMiddleware...)
+	messagesMiddleware = append(messagesMiddleware, middleware.WithAgentShadowEvaluation())
+	messagesMiddleware = append(messagesMiddleware, subscriberAllowanceMiddleware...)
 	if billingSvc != nil {
-		messagesMiddleware = append(messagesMiddleware, middleware.WithBalanceCheck(billingSvc, billing.MinBalanceMicros), middleware.WithAPIKeySpendCap(billingSvc), middleware.WithOrgMonthlySpendCap(billingSvc))
+		messagesMiddleware = append(messagesMiddleware,
+			middleware.WithBillingSpan(),
+			middleware.WithBalanceCheck(billingSvc, billing.MinBalanceMicros),
+			middleware.WithAPIKeySpendCap(billingSvc),
+			middleware.WithOrgMonthlySpendCap(billingSvc),
+			middleware.WithBillingSpanEnd(),
+		)
 	}
 	messagesMiddleware = append(messagesMiddleware,
 		middleware.WithEmbedOnlyUserMessageOverride(),
 		middleware.WithClusterVersionOverride(),
-		middleware.WithRouterStrategyDefault(defaultStrategy, registeredStrategies...),
+		middleware.WithRouterStrategyDefault(defaultStrategy, strategyAvailability, registeredStrategies...),
 		middleware.WithPolicyDebugOverride(),
 		middleware.WithAllowedModelsOverride(proxySvc),
 		middleware.WithRoutingKnobsOverride(),
 		middleware.WithForceEffortOverride(),
 	)
+	messagesMiddleware = append(messagesMiddleware, policyPinMiddleware...)
+	messagesMiddleware = append(messagesMiddleware, middleware.WithClassifierThread(proxySvc, strategyAvailability))
 	messagesGroup := engine.Group("", messagesMiddleware...)
 	messagesGroup.POST("/v1/messages", anthropicapi.MessagesHandler(proxySvc, authSvc))
+	messagesGroup.POST("/v1/route/handoff", anthropicapi.PrepareHandoffHandler(proxySvc, authSvc))
 
 	chatCompletionMiddleware := []gin.HandlerFunc{
 		middleware.WithTimingEntry(),
 		middleware.WithTimeout(chatCompletionTimeout),
-		middleware.WithAuth(authSvc, byokRequiresOptIn),
+		middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission),
 	}
+	chatCompletionMiddleware = append(chatCompletionMiddleware, servingAdmissionMiddleware...)
+	chatCompletionMiddleware = append(chatCompletionMiddleware, subscriberAllowanceMiddleware...)
 	if billingSvc != nil {
-		chatCompletionMiddleware = append(chatCompletionMiddleware, middleware.WithBalanceCheck(billingSvc, billing.MinBalanceMicros), middleware.WithAPIKeySpendCap(billingSvc), middleware.WithOrgMonthlySpendCap(billingSvc))
+		chatCompletionMiddleware = append(chatCompletionMiddleware,
+			middleware.WithBillingSpan(),
+			middleware.WithBalanceCheck(billingSvc, billing.MinBalanceMicros),
+			middleware.WithAPIKeySpendCap(billingSvc),
+			middleware.WithOrgMonthlySpendCap(billingSvc),
+			middleware.WithBillingSpanEnd(),
+		)
 	}
 	chatCompletionMiddleware = append(chatCompletionMiddleware,
 		middleware.WithEmbedOnlyUserMessageOverride(),
 		middleware.WithClusterVersionOverride(),
-		middleware.WithRouterStrategyDefault(defaultStrategy, registeredStrategies...),
+		middleware.WithRouterStrategyDefault(defaultStrategy, strategyAvailability, registeredStrategies...),
 		middleware.WithPolicyDebugOverride(),
 		middleware.WithAllowedModelsOverride(proxySvc),
 		middleware.WithRoutingKnobsOverride(),
 		middleware.WithForceEffortOverride(),
 	)
+	chatCompletionMiddleware = append(chatCompletionMiddleware, middleware.WithClassifierThread(proxySvc, strategyAvailability))
+	chatCompletionWithoutPolicyPin := append([]gin.HandlerFunc(nil), chatCompletionMiddleware...)
+	chatCompletionMiddleware = append(chatCompletionMiddleware, policyPinMiddleware...)
 	chatCompletionGroup := engine.Group("", chatCompletionMiddleware...)
 	chatCompletionGroup.POST("/v1/chat/completions", openaiapi.ChatCompletionHandler(proxySvc, authSvc))
 	// Responses surface required by Codex CLI after wire_api="chat" was retired;
 	// translated internally to chat completions so the turn loop is reused.
-	chatCompletionGroup.POST("/v1/responses", openaiapi.ResponsesHandler(proxySvc, authSvc))
+	chatCompletionWithoutPolicyPinGroup := engine.Group("", chatCompletionWithoutPolicyPin...)
+	chatCompletionWithoutPolicyPinGroup.POST("/v1/responses", openaiapi.ResponsesHandler(proxySvc, authSvc))
 	// Action suffix (:generateContent or :streamGenerateContent) lives inside modelAction because Gin treats `:` outside the leading position as a literal.
-	chatCompletionGroup.POST("/v1beta/models/:modelAction", geminiapi.GenerateContentHandler(proxySvc, authSvc))
+	chatCompletionWithoutPolicyPinGroup.POST("/v1beta/models/:modelAction", geminiapi.GenerateContentHandler(proxySvc, authSvc))
 
 	// Passthrough endpoints cost no upstream tokens, so they stay open even
 	// with billing enabled — count_tokens is the SDK's pre-flight call before
 	// /v1/messages, and gating it would break client negotiation.
 	passthroughGroup := engine.Group("",
 		middleware.WithTimeout(passthroughTimeout),
-		middleware.WithAuth(authSvc, byokRequiresOptIn),
+		middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission),
 	)
+	passthroughGroup.Use(servingAdmissionMiddleware...)
 	passthroughGroup.POST("/v1/messages/count_tokens", anthropicapi.PassthroughHandler(proxySvc))
-	passthroughGroup.GET("/v1/models", openaiapi.ModelsHandler(anthropicapi.PassthroughHandler(proxySvc)))
+	passthroughGroup.GET("/v1/models", openaiapi.ModelsHandler(anthropicapi.PassthroughHandler(proxySvc), proxySvc.CodexModelCatalog))
 	passthroughGroup.GET("/v1/models/:model", anthropicapi.PassthroughHandler(proxySvc))
 	// Rides the passthrough group (cheap, no billing middleware) — read-only, no routing side-effects.
 	passthroughGroup.GET("/v1/display-settings", admin.DisplaySettingsHandler)
-	// Product surface (not admin): the Codex status hook's rk_ key needs the router's savings number.
-	passthroughGroup.GET("/v1/sessions/:session_id/cost", admin.SessionCostHandler(proxySvc))
+
+	// Read-only product surface: the Codex status hook's rk_ key and API clients'
+	// ra_ keys read one installation's committed cost. Deliberately outside
+	// serving admission and every billing gate.
+	sessionCostGroup := engine.Group("",
+		middleware.WithTimeout(sessionCostTimeout),
+		middleware.WithReadKey(authSvc),
+		middleware.WithInstallationRateLimit(middleware.SessionCostRequestsPerMinute, time.Now),
+	)
+	sessionCostGroup.GET("/v1/sessions/:session_id/cost", admin.SessionCostHandler(proxySvc))
 
 	routeMiddleware := []gin.HandlerFunc{
 		middleware.WithTimeout(routeTimeout),
-		middleware.WithAuth(authSvc, byokRequiresOptIn),
+		middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission),
 	}
+	routeMiddleware = append(routeMiddleware, servingAdmissionMiddleware...)
+	routeMiddleware = append(routeMiddleware, subscriberProductScopeMiddleware...)
 	if billingSvc != nil {
-		routeMiddleware = append(routeMiddleware, middleware.WithBalanceCheck(billingSvc, billing.MinBalanceMicros), middleware.WithAPIKeySpendCap(billingSvc), middleware.WithOrgMonthlySpendCap(billingSvc))
+		routeMiddleware = append(routeMiddleware,
+			middleware.WithBillingSpan(),
+			middleware.WithBalanceCheck(billingSvc, billing.MinBalanceMicros),
+			middleware.WithAPIKeySpendCap(billingSvc),
+			middleware.WithOrgMonthlySpendCap(billingSvc),
+			middleware.WithBillingSpanEnd(),
+		)
 	}
 	routeMiddleware = append(routeMiddleware,
 		middleware.WithEmbedOnlyUserMessageOverride(),
 		middleware.WithClusterVersionOverride(),
-		middleware.WithRouterStrategyDefault(defaultStrategy, registeredStrategies...),
+		middleware.WithRouterStrategyDefault(defaultStrategy, strategyAvailability, registeredStrategies...),
 		middleware.WithPolicyDebugOverride(),
 		middleware.WithAllowedModelsOverride(proxySvc),
 		middleware.WithRoutingKnobsOverride(),
 		middleware.WithForceEffortOverride(),
 	)
+	routeMiddleware = append(routeMiddleware, policyPinMiddleware...)
+	routeMiddleware = append(routeMiddleware, middleware.WithClassifierThread(proxySvc, strategyAvailability))
 	routeGroup := engine.Group("", routeMiddleware...)
 	routeGroup.POST("/v1/route", anthropicapi.RouteHandler(proxySvc))
 
-	previewGroup := engine.Group("",
+	previewMiddleware := []gin.HandlerFunc{
 		middleware.WithTimingEntry(),
 		middleware.WithTimeout(routeTimeout),
-		middleware.WithAuth(authSvc, byokRequiresOptIn),
+		middleware.WithAuth(authSvc, byokRequiresOptIn, features.ServingAdmission),
+	}
+	previewMiddleware = append(previewMiddleware, servingAdmissionMiddleware...)
+	previewMiddleware = append(previewMiddleware, subscriberProductScopeMiddleware...)
+	previewMiddleware = append(previewMiddleware,
 		middleware.WithEmbedOnlyUserMessageOverride(),
-		middleware.WithRouterStrategyDefault(defaultStrategy, registeredStrategies...),
+		middleware.WithRouterStrategyDefault(defaultStrategy, strategyAvailability, registeredStrategies...),
 		middleware.WithPolicyDebugOverride(),
 		middleware.WithAllowedModelsOverride(proxySvc),
 		middleware.WithRoutingKnobsOverride(),
 	)
+	previewMiddleware = append(previewMiddleware, policyPinMiddleware...)
+	previewMiddleware = append(previewMiddleware, middleware.WithClassifierThread(proxySvc, strategyAvailability))
+	previewGroup := engine.Group("", previewMiddleware...)
 	previewGroup.POST("/v1/route/preview", anthropicapi.PreviewRouteHandler(proxySvc))
 
 	// Read-only routing-decision export. Product surface, so it mounts in both

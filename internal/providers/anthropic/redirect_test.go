@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/providers/anthropic"
-	"workweave/router/internal/providers/httputil"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/providers/anthropic"
+	"weave-os/router/internal/providers/httputil"
+	"weave-os/router/internal/router"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,15 +49,22 @@ func TestProxy_RefusedRedirectFailsRetryablyWithoutTouchingWriter(t *testing.T) 
 // TestListModels_RedirectRefused: a redirecting /v1/models must fail loud
 // instead of feeding redirect boilerplate to the roster parser.
 func TestListModels_RedirectRefused(t *testing.T) {
+	var targetHit atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHit.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "https://unconfigured.example"+r.URL.Path, http.StatusMovedPermanently)
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusMovedPermanently)
 	}))
 	defer upstream.Close()
 
-	c := anthropic.NewClient("deployment-key", upstream.URL)
+	c := anthropic.NewClient("deployment-key", upstream.URL, anthropic.WithModelListHTTPClient(anthropicDiscoveryClient(t, upstream.URL)))
 	ids, err := c.ListModels(context.Background())
 
 	require.Error(t, err)
-	assert.ErrorIs(t, err, httputil.ErrRefusedRedirect)
+	assert.ErrorIs(t, err, providers.ErrModelDiscoveryTransport)
 	assert.Empty(t, ids)
+	assert.False(t, targetHit.Load(), "the redirect target must never be contacted")
 }

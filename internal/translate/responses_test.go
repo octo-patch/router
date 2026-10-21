@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -240,6 +242,13 @@ func TestStripRoutingBadgeFromResponsesInput_PreservesNativeFields(t *testing.T)
 	assert.True(t, root.Get("metadata.keep").Bool())
 }
 
+func TestStripRoutingBadgeFromResponsesInput_RemovesSelectionReasoning(t *testing.T) {
+	body := []byte(`{"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\u2063\u2060\u2063\u2060✦ **Weave Router** → claude-sonnet-5\nREASONING: This part of the conversation was classified as high difficulty.\n\nanswer"}]}]}`)
+	cleaned, err := translate.StripRoutingBadgeFromResponsesInput(body)
+	require.NoError(t, err)
+	assert.Equal(t, "answer", gjson.GetBytes(cleaned, "input.0.content.0.text").String())
+}
+
 func TestStripRouterCommandsFromResponsesInput_RemovesAgentToolCommand(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"custom_tool_call_output","call_id":"call_skill","output":" /router-feedback too slow"},{"type":"function_call_output","call_id":"call_fm","output":[{"type":"input_text","text":" /force-model gpt-5"}]}]}`)
 	out, err := translate.StripRouterCommandsFromResponsesInput(body)
@@ -253,6 +262,13 @@ func TestStripRouterCommandsFromResponsesInput_RemovesCollapsedExecCommand(t *te
 	out, err := translate.StripRouterCommandsFromResponsesInput(body)
 	require.NoError(t, err)
 	assert.Equal(t, "Script completed\nOutput:", gjson.GetBytes(out, "input.0.output").String())
+}
+
+func TestStripRouterCommandsFromResponsesInput_PreservesModelAliasInToolOutput(t *testing.T) {
+	body := []byte(`{"input":[{"type":"function_call_output","call_id":"call_exec","output":"/model opus"}]}`)
+	out, err := translate.StripRouterCommandsFromResponsesInput(body)
+	require.NoError(t, err)
+	assert.Equal(t, body, out, "an arbitrary tool result mentioning /model must remain intact")
 }
 
 // A tool-call-only or reasoning-only turn ships a badge-only assistant message.
@@ -279,6 +295,20 @@ func TestStripRoutingBadgeFromResponsesInput_DropsBadgeOnlyAssistantItem(t *test
 	assert.Equal(t, "call_1", input[1].Get("call_id").Str)
 }
 
+func TestStripRoutingBadgeFromResponsesInput_DropsAlreadyEmptyAssistantShell(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]},
+		{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}
+	]}`)
+
+	out, err := translate.StripRoutingBadgeFromResponsesInput(body)
+	require.NoError(t, err)
+
+	input := gjson.GetBytes(out, "input").Array()
+	require.Len(t, input, 1)
+	assert.Equal(t, "function_call", input[0].Get("type").Str)
+}
+
 // Only the badge part is empty here — the item still carries content, so it stays.
 func TestStripRoutingBadgeFromResponsesInput_KeepsItemWithRemainingContent(t *testing.T) {
 	body := []byte(`{
@@ -298,6 +328,27 @@ func TestStripRoutingBadgeFromResponsesInput_KeepsItemWithRemainingContent(t *te
 	require.Len(t, input, 1)
 	assert.Equal(t, "", input[0].Get("content.0.text").Str)
 	assert.Equal(t, "the answer", input[0].Get("content.1.text").Str)
+}
+
+func TestStripRoutingBadgeFromResponsesInput_RebuildsEachChangedArrayOnce(t *testing.T) {
+	badge := codexResponsesBadgeSentinelForTest + "**Weave Router** — gpt-5.6-terra ← gpt-5.6-sol\n\n"
+	badgeJSON := codexResponsesBadgeSentinelForTest + "**Weave Router** — gpt-5.6-terra ← gpt-5.6-sol\\n\\n"
+	body := []byte(`{"input":[
+{"role":"assistant","content":[
+{"type":"input_text","text":"` + badgeJSON + `answer"},
+{"type":"output_text","text":"` + badgeJSON + `later text"},
+{"type":"image","source":{"url":"https://example.com/image"}}
+],"extension":{"keep":true}},
+{"type":"message","role":"user","content":[{"type":"input_text","text":"` + badge + `quoted"}]}
+]}`)
+
+	out, err := translate.StripRoutingBadgeFromResponsesInput(body)
+	require.NoError(t, err)
+	assert.Equal(t, "answer", gjson.GetBytes(out, "input.0.content.0.text").Str)
+	assert.Equal(t, badge+"later text", gjson.GetBytes(out, "input.0.content.1.text").Str)
+	assert.Equal(t, "https://example.com/image", gjson.GetBytes(out, "input.0.content.2.source.url").Str)
+	assert.True(t, gjson.GetBytes(out, "input.0.extension.keep").Bool())
+	assert.Equal(t, badge+"quoted", gjson.GetBytes(out, "input.1.content.0.text").Str)
 }
 
 // Defense in depth for clients that echo an already-emptied assistant message.
@@ -391,6 +442,105 @@ func TestResponsesWriter_FinalizeErrorEmitsFailed(t *testing.T) {
 	assert.NotNil(t, resp["error"])
 }
 
+func TestResponsesWriter_EmitRoutingBadgeAfterPrelude(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.6-sol")
+	w.SetBadgeText("initial decision")
+
+	require.NoError(t, w.Prelude(true))
+	require.NoError(t, w.EmitRoutingBadge("fallback decision"))
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	var deltas []string
+	for _, event := range events {
+		if event["type"] == "response.output_text.delta" {
+			deltas = append(deltas, event["delta"].(string))
+		}
+	}
+	require.Len(t, deltas, 2)
+	assert.Contains(t, deltas[0], "initial decision")
+	assert.Contains(t, deltas[1], "fallback decision")
+}
+
+func TestResponsesWriter_NativePreludeFallbackAndFailureStaySequenced(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.6-sol")
+	w.SetBadgeText("initial decision")
+	w.SetPassthroughBadge()
+
+	require.NoError(t, w.Prelude(true))
+	w.SetRoutedModel("claude-opus-4-8")
+	require.NoError(t, w.EmitRoutingBadge("fallback decision"))
+	require.NoError(t, w.FinalizeError(errors.New("upstream failed")))
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	require.Len(t, events, 14)
+	for index, event := range events {
+		assert.EqualValues(t, index, event["sequence_number"])
+	}
+	assert.Equal(t, "response.created", events[0]["type"])
+	assert.EqualValues(t, 0, events[1]["output_index"])
+	assert.EqualValues(t, 1, events[7]["output_index"])
+	assert.Contains(t, events[3]["delta"], "initial decision")
+	assert.Contains(t, events[9]["delta"], "fallback decision")
+	assert.Equal(t, "response.failed", events[13]["type"])
+	failed := events[13]["response"].(map[string]any)
+	assert.Equal(t, "failed", failed["status"])
+	assert.Equal(t, "claude-opus-4-8", failed["model"])
+	output := failed["output"].([]any)
+	require.Len(t, output, 2)
+	initialContent := output[0].(map[string]any)["content"].([]any)
+	assert.Contains(t, initialContent[0].(map[string]any)["text"], "initial decision")
+	content := output[1].(map[string]any)["content"].([]any)
+	assert.Contains(t, content[0].(map[string]any)["text"], "fallback decision")
+}
+
+func TestResponsesWriter_NativePreludeRewritesFinalServingModel(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.6-sol")
+	w.SetBadgeText("initial decision")
+	w.SetPassthroughBadge()
+
+	require.NoError(t, w.Prelude(true))
+	w.SetRoutedModel("gpt-5.6-luna")
+	require.NoError(t, w.EmitRoutingBadge("fallback decision"))
+	_, err := w.Write([]byte("event: response.completed\n" +
+		`data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_upstream","model":"gpt-5.6-sol","status":"completed","output":[{"id":"msg_upstream","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}` +
+		"\n\n"))
+	require.NoError(t, err)
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	completed := events[len(events)-1]
+	require.Equal(t, "response.completed", completed["type"])
+	response := completed["response"].(map[string]any)
+	assert.Equal(t, "gpt-5.6-luna", response["model"])
+}
+
+func TestResponsesWriter_ClearPassthroughContinuesVisiblePrelude(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.6-sol")
+	w.SetBadgeText("initial decision")
+	w.SetPassthroughBadge()
+
+	require.NoError(t, w.Prelude(true))
+	require.True(t, w.ClearPassthrough())
+	w.SetRoutedModel("claude-opus-4-8")
+	require.NoError(t, w.EmitRoutingBadge("fallback decision"))
+	require.NoError(t, w.FinalizeError(errors.New("fallback failed")))
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	for index, event := range events {
+		assert.EqualValues(t, index, event["sequence_number"])
+	}
+	assert.EqualValues(t, 0, events[1]["output_index"])
+	assert.EqualValues(t, 1, events[7]["output_index"])
+	assert.Contains(t, events[3]["delta"], "initial decision")
+	assert.Contains(t, events[9]["delta"], "fallback decision")
+	assert.Equal(t, "response.failed", events[len(events)-1]["type"])
+	failed := events[len(events)-1]["response"].(map[string]any)
+	assert.Equal(t, "claude-opus-4-8", failed["model"])
+}
+
 // Before anything streams, FinalizeError writes nothing so the handler can
 // still emit a JSON error envelope.
 func TestResponsesWriter_FinalizeErrorNoopBeforeCreated(t *testing.T) {
@@ -458,6 +608,140 @@ func TestResponsesWriter_StreamingText(t *testing.T) {
 	assert.EqualValues(t, 2, usage["output_tokens"])
 }
 
+func TestResponsesWriter_TrailingUsageFramePrecedesCompletion(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	chunks := []string{
+		`data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}` + "\n\n",
+		`data: {"choices":[],"usage":{"prompt_tokens":21,"completion_tokens":4,"total_tokens":25}}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, chunk := range chunks {
+		_, err := w.Write([]byte(chunk))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	completed := make([]map[string]any, 0, 1)
+	for _, event := range events {
+		if event["type"] == "response.completed" {
+			completed = append(completed, event)
+		}
+	}
+	require.Len(t, completed, 1)
+	usage := completed[0]["response"].(map[string]any)["usage"].(map[string]any)
+	assert.EqualValues(t, 21, usage["input_tokens"])
+	assert.EqualValues(t, 4, usage["output_tokens"])
+	assert.EqualValues(t, 25, usage["total_tokens"])
+}
+
+func TestResponsesWriter_MissingUsageEmitsValidTerminalUsage(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	_, err := w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}` + "\n\n" +
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	final := events[len(events)-1]
+	require.Equal(t, "response.completed", final["type"])
+	usage := final["response"].(map[string]any)["usage"].(map[string]any)
+	assert.EqualValues(t, 0, usage["input_tokens"])
+	assert.EqualValues(t, 0, usage["output_tokens"])
+	assert.EqualValues(t, 0, usage["total_tokens"])
+}
+
+func TestResponsesWriter_NonStreamingMissingUsageEmitsValidUsage(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	_, err := w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	usage := gjson.GetBytes(rec.Body.Bytes(), "usage")
+	require.True(t, usage.IsObject())
+	assert.Zero(t, usage.Get("input_tokens").Int())
+	assert.Zero(t, usage.Get("output_tokens").Int())
+	assert.Zero(t, usage.Get("total_tokens").Int())
+}
+
+func TestResponsesWriter_StreamingSSEFragmentationDrainsAfterBoundary(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	first := []byte(`data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+
+`)
+	_, err := w.Write(first[:len(first)-1])
+	require.NoError(t, err)
+	w.Flush()
+	assert.Empty(t, responsesTextDeltas(t, rec.Body.Bytes()), "an incomplete delimiter must not emit the event")
+
+	_, err = w.Write(first[len(first)-1:])
+	require.NoError(t, err)
+	w.Flush()
+	assert.Equal(t, []string{"Hello"}, responsesTextDeltas(t, rec.Body.Bytes()))
+
+	_, err = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+	assert.Equal(t, []string{"Hello"}, responsesTextDeltas(t, rec.Body.Bytes()))
+}
+
+func TestResponsesWriter_NativeSSESniffDoesNotConsumeFirstEvent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+	w.SetPassthroughBadge()
+	w.WriteHeader(http.StatusOK)
+
+	first := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"answer\"}\n\n")
+	_, err := w.Write(first[:len(first)-1])
+	require.NoError(t, err)
+	w.Flush()
+	assert.Empty(t, parseSSEEvents(t, rec.Body.Bytes()), "an incomplete first event must stay buffered")
+
+	_, err = w.Write(first[len(first)-1:])
+	require.NoError(t, err)
+	w.Flush()
+	require.NoError(t, w.Finalize())
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	require.Len(t, events, 1)
+	assert.Equal(t, "response.output_text.delta", events[0]["type"])
+	assert.Contains(t, events[0]["delta"], "answer")
+}
+
+func TestResponsesWriter_ClearPassthroughResetsFramingMode(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+	w.SetPassthroughBadge()
+	require.NoError(t, w.Prelude(true))
+	require.True(t, w.ClearPassthrough())
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	_, err := w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+	assert.Contains(t, responsesTextDeltas(t, rec.Body.Bytes()), "fallback")
+	assert.NotContains(t, rec.Body.String(), `choices`)
+
+}
+
 // When upstream already speaks Responses natively, the writer must forward
 // bytes unchanged and skip its own response.created prelude.
 func TestResponsesWriter_PassthroughForwardsVerbatim(t *testing.T) {
@@ -482,6 +766,36 @@ func TestResponsesWriter_PassthroughForwardsVerbatim(t *testing.T) {
 	// Output is exactly the upstream bytes: no chat->Responses translation, no
 	// synthesized or duplicated events.
 	assert.Equal(t, native, rec.Body.String())
+}
+
+func TestResponsesWriter_PassthroughForwardsUndelimitedFinalEvent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.5")
+	w.SetPassthrough()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	native := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}"
+	_, err := w.Write([]byte(native))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	assert.Equal(t, native, rec.Body.String())
+}
+
+func TestResponsesWriter_PassthroughRejectsUndelimitedEmptyTerminal(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.5")
+	w.SetPassthrough()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	native := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}"
+	_, err := w.Write([]byte(native))
+	require.NoError(t, err)
+	require.ErrorIs(t, w.Finalize(), providers.ErrUpstreamEmptyCompletion)
+	assert.Empty(t, rec.Body.String())
 }
 
 // passthroughTestMarker stands in for the routing marker the proxy supplies.
@@ -761,8 +1075,8 @@ func TestResponsesWriter_EmitsBadgeOnToolCallOnlyTurn(t *testing.T) {
 }
 
 // Reasoning deltas are not translated into output items, so a reasoning-only
-// turn reaches finish with nothing that would otherwise pull in the badge.
-func TestResponsesWriter_EmitsBadgeOnReasoningOnlyTurn(t *testing.T) {
+// turn must not be reported as a badge-only successful answer.
+func TestResponsesWriter_RejectsReasoningOnlyTurn(t *testing.T) {
 	for _, field := range []string{"reasoning", "reasoning_content"} {
 		t.Run(field, func(t *testing.T) {
 			rec := httptest.NewRecorder()
@@ -771,34 +1085,19 @@ func TestResponsesWriter_EmitsBadgeOnReasoningOnlyTurn(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
 
-			for _, c := range []string{
+			for i, c := range []string{
 				`data: {"choices":[{"index":0,"delta":{"` + field + `":"thinking"},"finish_reason":null}]}` + "\n\n",
 				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
 				"data: [DONE]\n\n",
 			} {
 				_, err := w.Write([]byte(c))
+				if i == 1 {
+					require.ErrorIs(t, err, providers.ErrUpstreamEmptyCompletion)
+					continue
+				}
 				require.NoError(t, err)
 			}
-			require.NoError(t, w.Finalize())
-
-			events := parseSSEEvents(t, rec.Body.Bytes())
-
-			var deltas []string
-			var completed map[string]any
-			for _, e := range events {
-				switch e["type"] {
-				case "response.output_text.delta":
-					deltas = append(deltas, e["delta"].(string))
-				case "response.completed":
-					completed = e["response"].(map[string]any)
-				}
-			}
-			require.Equal(t, []string{passthroughTestMarker + "\n\n"}, deltas)
-			require.NotNil(t, completed)
-			output := completed["output"].([]any)
-			require.Len(t, output, 1)
-			assert.Equal(t, passthroughTestMarker+"\n\n",
-				output[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"])
+			assert.NotContains(t, rec.Body.String(), `"type":"response.completed"`)
 		})
 	}
 }
@@ -1143,6 +1442,26 @@ func TestStripFeedbackFooterFromResponsesInput(t *testing.T) {
 	assert.Equal(t, "answer", gjson.GetBytes(out, "input.0.content.0.text").Str)
 }
 
+func TestStripFeedbackFooterFromResponsesInput_StripsAllMatchingTextParts(t *testing.T) {
+	const footer = "\n\n_Weave Router feedback:_ `$rf +` good experience · `$rf -` poor experience"
+	const footerJSON = "\\n\\n_Weave Router feedback:_ `$rf +` good experience · `$rf -` poor experience"
+	body := []byte(`{"input":[
+{"type":"message","role":"assistant","content":[
+{"type":"output_text","text":"first` + footerJSON + `","annotations":[{"type":"url_citation","url":"https://example.com"}]},
+{"type":"input_text","text":"second` + footerJSON + `"},
+{"type":"image","detail":"high"}
+]},
+{"type":"message","role":"user","content":[{"type":"output_text","text":"user` + footerJSON + `"}]}
+]}`)
+
+	out, err := translate.StripFeedbackFooterFromResponsesInput(body)
+	require.NoError(t, err)
+	assert.Equal(t, "first", gjson.GetBytes(out, "input.0.content.0.text").Str)
+	assert.Equal(t, "second", gjson.GetBytes(out, "input.0.content.1.text").Str)
+	assert.Equal(t, "high", gjson.GetBytes(out, "input.0.content.2.detail").Str)
+	assert.Equal(t, "user"+footer, gjson.GetBytes(out, "input.1.content.0.text").Str)
+}
+
 // Strip operates on passthrough bytes; extraction runs on the chat projection (conv.OriginalBody vs conv.Body). Ordered as ProxyOpenAIResponses does, so aliasing surfaces here.
 func TestStripRouterCommandsFromResponsesInput_LeavesChatProjectionIntact(t *testing.T) {
 	const body = `{"model":"gpt-5.6-terra","input":[
@@ -1195,4 +1514,17 @@ func TestConvertResponsesToChatCompletions_AcceptsInputOnlyBody(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, "hi", gjson.GetBytes(conv.Body, "messages.0.content").String())
+}
+
+func responsesTextDeltas(t *testing.T, body []byte) []string {
+	t.Helper()
+	var deltas []string
+	for _, event := range parseSSEEvents(t, body) {
+		if event["type"] == "response.output_text.delta" {
+			delta, ok := event["delta"].(string)
+			require.True(t, ok, "text delta must carry a string")
+			deltas = append(deltas, delta)
+		}
+	}
+	return deltas
 }

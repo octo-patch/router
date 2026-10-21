@@ -5,8 +5,9 @@ import (
 	"net/http"
 	"strings"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/proxy"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/requestcontext"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,6 +26,10 @@ type AllowedModelsHeaderGate interface {
 // roster.
 func WithAllowedModelsOverride(gate AllowedModelsHeaderGate) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if identity, managed := requestcontext.ServingIdentityFromContext(c.Request.Context()); managed && identity.Plan != "" {
+			c.Next()
+			return
+		}
 		raw := strings.TrimSpace(c.GetHeader(proxy.AllowedModelsHeader))
 		if raw == "" {
 			c.Next()

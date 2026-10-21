@@ -13,17 +13,19 @@ import (
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/providers/httputil"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/timing"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/providers/httputil"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/timing"
 )
 
 const (
 	DefaultBaseURL   = "https://openrouter.ai/api/v1"
 	FireworksBaseURL = "https://api.fireworks.ai/inference/v1"
+	// DeepInfraBaseURL serves OpenAI-compatible inference for the OSS catalog.
+	DeepInfraBaseURL = "https://api.deepinfra.com/v1/openai"
 	// MakoraBaseURL serves the OSS catalog at higher throughput than commodity
 	// providers; pair with NewClientWithModelIDMap to rewrite slugs to Makora's
 	// upstream IDs.
@@ -76,9 +78,10 @@ func BedrockMantleBaseURL(region string) string {
 }
 
 type Client struct {
-	apiKey  string
-	baseURL string
-	http    *http.Client
+	apiKey    string
+	baseURL   string
+	http      *http.Client
+	modelHTTP *http.Client
 	// grokHTTP carries the wider time-to-first-byte guard used for Grok
 	// models; see grokResponseHeaderTimeout.
 	grokHTTP *http.Client
@@ -110,35 +113,61 @@ type Client struct {
 	versionMemo providers.GatewayVersionMemo
 }
 
-func NewClient(apiKey, baseURL string) *Client {
-	return NewClientWithModelIDMap(apiKey, baseURL, nil)
+// Option configures a Client at construction.
+type Option func(*Client)
+
+// WithModelListHTTPClient supplies the client used only for model discovery.
+// A nil client is ignored so a misconfigured option cannot strip the
+// constructor's destination-checked default and panic on the first call.
+func WithModelListHTTPClient(client *http.Client) Option {
+	return func(c *Client) {
+		if client == nil {
+			return
+		}
+		c.modelHTTP = client
+	}
+}
+
+func NewClient(apiKey, baseURL string, opts ...Option) *Client {
+	return NewClientWithModelIDMap(apiKey, baseURL, nil, opts...)
 }
 
 // NewClientWithModelIDMap builds a client that rewrites the body's top-level
 // "model" field before forwarding when the requested model has a mapping.
 // Pass nil to disable rewriting.
-func NewClientWithModelIDMap(apiKey, baseURL string, modelIDMap map[string]string) *Client {
+func NewClientWithModelIDMap(apiKey, baseURL string, modelIDMap map[string]string, opts ...Option) *Client {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return newClient(apiKey, baseURL, modelIDMap)
+	return newClient(apiKey, baseURL, modelIDMap, opts...)
 }
 
 // NewGatewayClient builds a client for a customer-supplied OpenAI-spec endpoint.
 // Unlike NewClient, no default base URL is applied: an unconfigured gateway must
 // fail rather than silently dispatch the tenant's token to OpenRouter.
-func NewGatewayClient(apiKey, baseURL string) *Client {
-	return newClient(apiKey, baseURL, nil)
+func NewGatewayClient(apiKey, baseURL string, opts ...Option) *Client {
+	return newClient(apiKey, baseURL, nil, opts...)
 }
 
-func newClient(apiKey, baseURL string, modelIDMap map[string]string) *Client {
-	return &Client{
+func newClient(apiKey, baseURL string, modelIDMap map[string]string, opts ...Option) *Client {
+	client := &Client{
 		apiKey:     apiKey,
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		http:       httputil.NewClient(httputil.NewTransport(5*time.Second, 5*time.Second)),
 		grokHTTP:   httputil.NewClient(httputil.NewTransportWithResponseHeaderTimeout(5*time.Second, 5*time.Second, grokResponseHeaderTimeout)),
+		modelHTTP:  httputil.NewDefaultModelDiscoveryClient(),
 		modelIDMap: modelIDMap,
 	}
+	for _, opt := range opts {
+		opt(client)
+	}
+	return client
+}
+
+// DeploymentPrincipal fingerprints the account this client's own key
+// authenticates as; see providers.DeploymentPrincipal.
+func (c *Client) DeploymentPrincipal() string {
+	return providers.CredentialPrincipal(c.baseURL, c.apiKey)
 }
 
 // httpFor picks the HTTP client for a routed model: Grok models get the
@@ -259,17 +288,28 @@ func rewriteModelField(body []byte, modelIDMap map[string]string) []byte {
 	return out
 }
 
+func stripSnowflakeCortexUnsupportedResponsesFields(body []byte, baseURL string, endpoint providers.Endpoint) []byte {
+	if endpoint != providers.EndpointResponses || !providers.IsCortexBaseURL(baseURL) {
+		return body
+	}
+	out, err := sjson.DeleteBytes(body, "reasoning.summary")
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // effectiveBaseURL resolves this request's base URL, folding an Azure resource
-// endpoint onto /openai/v1 and a Snowflake Cortex REST root onto
-// /api/v2/cortex/v1 — the OpenAI-spec surfaces they actually serve.
+// endpoint onto /openai/v1 and a Cortex REST or AI Gateway root onto
+// its /v1 — the OpenAI-spec surfaces they actually serve.
 func (c *Client) effectiveBaseURL(ctx context.Context) string {
-	base := providers.NormalizeAzureOpenAIBaseURL(proxy.EffectiveBaseURL(ctx, c.baseURL))
-	return providers.NormalizeSnowflakeCortexOpenAIBaseURL(base)
+	base := providers.NormalizeAzureOpenAIBaseURL(requestcontext.EffectiveBaseURL(ctx, c.baseURL))
+	return providers.NormalizeCortexOpenAIBaseURL(base)
 }
 
 // setAuth sets the Authorization header, preferring BYOK credentials over the deployment-level key.
 func (c *Client) setAuth(ctx context.Context, upstream *http.Request) {
-	if creds := proxy.CredentialsFromContext(ctx); creds != nil {
+	if creds := requestcontext.CredentialsFromContext(ctx); creds != nil {
 		upstream.Header.Set("Authorization", "Bearer "+string(creds.APIKey))
 		return
 	}
@@ -284,8 +324,9 @@ func (c *Client) Proxy(ctx context.Context, decision router.Decision, prep provi
 
 	body := rewriteModelField(prep.Body, c.modelIDMap)
 	// Applied after the catalog map so a BYOK endpoint's own naming wins.
-	body = proxy.ApplyModelAlias(ctx, body, decision.Model)
+	body = requestcontext.ApplyModelAlias(ctx, body, decision.Model)
 	baseURL := c.effectiveBaseURL(ctx)
+	body = stripSnowflakeCortexUnsupportedResponsesFields(body, baseURL, prep.Endpoint)
 
 	// EndpointResponses is the Responses surface: reasoning models reject a tool
 	// turn on chat/completions, and gateways that mount /v1/responses (Snowflake
@@ -324,9 +365,9 @@ func (c *Client) proxyTo(ctx context.Context, cancel context.CancelCauseFunc, ur
 	}
 	c.applyProtectedHeaders(upstream)
 	c.setAuth(ctx, upstream)
-	proxy.ApplyWIFTokenType(ctx, upstream)
-	proxy.ApplyIdentityHeader(ctx, upstream)
-	proxy.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
+	requestcontext.ApplyWIFTokenType(ctx, upstream)
+	requestcontext.ApplyIdentityHeader(ctx, upstream)
+	requestcontext.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
 	if v := r.Header.Get("Accept"); v != "" {
 		upstream.Header.Set("Accept", v)
 	}
@@ -362,26 +403,19 @@ func (c *Client) proxyTo(ctx context.Context, cancel context.CancelCauseFunc, ur
 		errHeaders := http.Header{}
 		providers.CopyUpstreamHeaders(httputil.HeaderCapture{H: errHeaders}, resp)
 		return &providers.UpstreamErrorResponse{
-			Status:  resp.StatusCode,
-			Headers: errHeaders,
-			Body:    bufBody,
+			Status:     resp.StatusCode,
+			Headers:    errHeaders,
+			Body:       bufBody,
+			BodyBytes:  totalRead,
+			BodyCapped: totalRead > int64(len(bufBody)),
 		}
 	}
 
 	providers.CopyUpstreamHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 
-	// Output-progress watchdog: StreamBody's byte-idle watchdog resets on ANY
-	// byte, so keepalive/empty-delta frames with zero real output ride to the
-	// request cap (2026-06-19 DeepInfra incident). This one is marked only on
-	// output-bearing deltas by the SSE translator (via ArmOutputProgress) and
-	// trips ErrUpstreamOutputStall (retryable). Non-streaming/no-hook writers
-	// stay byte-idle-guarded only.
-	//
-	// A second watchdog shares the same mark: minimum-throughput. It catches a
-	// clean 200 that keeps dribbling output at a crawl (2026-06-25
-	// deepseek-v4-flash ~132s dribble) by counting deltas over a rolling window
-	// and tripping ErrUpstreamSlowThroughput once warmup passes.
+	// Output callbacks feed stall, latency, and throughput tracking. Responses
+	// reasoning feeds only the stall clock; buffered/no-hook writers decline.
 	if arm, ok := w.(providers.OutputProgressArmer); ok {
 		outMark, outStop := httputil.StartIdleWatchdogCause(ctx, cancel, c.outputStallTimeout(), httputil.ErrUpstreamOutputStall)
 		tpWindow, tpMinElapsed, tpMinDeltas := c.throughputParams()
@@ -393,6 +427,9 @@ func (c *Client) proxyTo(ctx context.Context, cancel context.CancelCauseFunc, ur
 		if arm.ArmOutputProgress(timing.FirstOutputMark(ctx, combined)) {
 			defer outStop()
 			defer tpStop()
+			if reasoningArmer, ok := w.(providers.ReasoningProgressArmer); ok {
+				reasoningArmer.ArmReasoningProgress(outMark)
+			}
 		} else {
 			outStop()
 			tpStop()
@@ -406,9 +443,8 @@ func (c *Client) proxyTo(ctx context.Context, cancel context.CancelCauseFunc, ur
 	return streamErr
 }
 
-// logStreamStall reports a watchdog trip at ERROR after upstream returned
-// 200 + headers then stalled for the full budget. Both stall kinds are
-// retryable (dispatchWithFallback re-attempts); this is the paper trail.
+// logStreamStall reports the watchdog cause without promising a retry after
+// client output has committed.
 func logStreamStall(ctx context.Context, model, baseURL string, cause error) {
 	stallKind := "byte_idle"
 	switch {
@@ -417,7 +453,7 @@ func logStreamStall(ctx context.Context, model, baseURL string, cause error) {
 	case errors.Is(cause, httputil.ErrUpstreamSlowThroughput):
 		stallKind = "slow_throughput"
 	}
-	observability.FromContext(ctx).Error("Upstream OpenAI-compatible stream stalled mid-response; aborting for retry",
+	observability.FromContext(ctx).Error("Upstream OpenAI-compatible stream stalled mid-response; aborting stream",
 		"model", model,
 		"base_url", baseURL,
 		"stall_kind", stallKind,
@@ -446,8 +482,8 @@ func (c *Client) Passthrough(ctx context.Context, prep providers.PreparedRequest
 	}
 	c.applyProtectedHeaders(upstream)
 	c.setAuth(ctx, upstream)
-	proxy.ApplyWIFTokenType(ctx, upstream)
-	proxy.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
+	requestcontext.ApplyWIFTokenType(ctx, upstream)
+	requestcontext.ApplyForwardedClientHeaders(ctx, upstream, r.Header)
 	if v := r.Header.Get("Accept"); v != "" {
 		upstream.Header.Set("Accept", v)
 	}

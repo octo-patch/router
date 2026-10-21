@@ -7,9 +7,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
 )
 
 type registryRouter struct {
@@ -21,6 +21,15 @@ type registryRouter struct {
 type dynamicCapabilityRouter struct {
 	registryRouter
 	capabilities policy.Capabilities
+}
+
+type availabilityRouter struct {
+	registryRouter
+	available bool
+}
+
+func (r *availabilityRouter) Available() bool {
+	return r.available
 }
 
 func (r *dynamicCapabilityRouter) CurrentCapabilities() policy.Capabilities {
@@ -102,4 +111,17 @@ func TestPolicyCapabilitiesReadsRefreshedRouterCapabilities(t *testing.T) {
 
 	require.True(t, ok)
 	assert.True(t, capabilities.SupportsShadow)
+}
+
+func TestPolicyStrategyAvailableReadsDynamicReadiness(t *testing.T) {
+	strategy := router.Strategy("future-policy")
+	policyRouter := &availabilityRouter{}
+	svc := (&Service{}).WithPolicyStrategy(policy.StrategySpec{
+		Strategy: strategy,
+		Router:   policyRouter,
+	})
+
+	assert.False(t, svc.PolicyStrategyAvailable(strategy))
+	policyRouter.available = true
+	assert.True(t, svc.PolicyStrategyAvailable(strategy))
 }

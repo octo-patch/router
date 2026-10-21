@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"sort"
 
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
 
 	"github.com/gin-gonic/gin"
 )
@@ -37,12 +37,7 @@ func PolicyCatalogHandler(service *proxy.Service, defaultStrategy router.Strateg
 		}}
 		if service != nil {
 			for _, strategy := range service.RegisteredStrategies() {
-				// Beta is a session control, not an installation strategy. Keep it
-				// out of the control-plane catalog so /beta remains its only surface.
-				if strategy == router.StrategyHMMBeta {
-					continue
-				}
-				capabilities, _ := service.PolicyCapabilities(strategy)
+				capabilities, _ := service.PolicyCapabilitiesForRequest(c.Request.Context(), strategy)
 				// Derived, not separately negotiated: ranked fallback is the
 				// precondition for cluster overrides taking effect.
 				capabilities.HonorsClusterModelLists = capabilities.ReportsRankedFallback

@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"workweave/router/internal/translate/toolcheck"
+	"weave-os/router/internal/translate/toolcheck"
+	"weave-os/router/internal/usage"
 
 	"github.com/tidwall/gjson"
 )
@@ -12,14 +13,14 @@ import (
 // ResponsesToOpenAIChatResponse converts a non-streaming OpenAI Responses
 // response object into a chat.completion body.
 func ResponsesToOpenAIChatResponse(body []byte, requestModel string) ([]byte, error) {
-	out, _, err := responsesToOpenAIChatResponse(body, requestModel, nil)
+	out, _, err := responsesToOpenAIChatResponse(body, requestModel, nil, usage.ParseOpenAI(gjson.GetBytes(body, "usage")))
 	return out, err
 }
 
 // responsesToOpenAIChatResponse is the validator-aware variant: checks/repairs
 // tool-call arguments against the caller's schemas, returning one
 // toolcheck.Issue per violation; nil → syntax-check-only.
-func responsesToOpenAIChatResponse(body []byte, requestModel string, toolValidator *toolcheck.Validator) ([]byte, []toolcheck.Issue, error) {
+func responsesToOpenAIChatResponse(body []byte, requestModel string, toolValidator *toolcheck.Validator, facts usage.Facts) ([]byte, []toolcheck.Issue, error) {
 	if !gjson.ValidBytes(body) {
 		return nil, nil, fmt.Errorf("unmarshal responses response: invalid JSON")
 	}
@@ -36,7 +37,11 @@ func responsesToOpenAIChatResponse(body []byte, requestModel string, toolValidat
 	}
 	var toolCalls []toolCall
 	var issues []toolcheck.Issue
+	ledger := NewToolCallLedger()
+	outputIndex := 0
 	root.Get("output").ForEach(func(_, item gjson.Result) bool {
+		index := outputIndex
+		outputIndex++
 		switch item.Get("type").String() {
 		case "reasoning":
 			if summary := joinReasoningSummary(item.Get("summary")); summary != "" {
@@ -53,19 +58,17 @@ func responsesToOpenAIChatResponse(body []byte, requestModel string, toolValidat
 				return true
 			})
 		case "function_call":
-			name := item.Get("name").String()
-			if name == "" {
-				// A nameless call makes the client invoke tool "" in a loop.
+			call := ledger.Close(index, item.Get("call_id").String(), item.Get("name").String(), item.Get("arguments").String()).Accept(toolValidator)
+			if call.Suppression != ToolCallNotSuppressed {
 				return true
 			}
-			verdict := toolValidator.Check(name, item.Get("arguments").String())
-			if verdict.Issue != nil {
-				issues = append(issues, *verdict.Issue)
+			if call.Issue != nil {
+				issues = append(issues, *call.Issue)
 			}
 			toolCalls = append(toolCalls, toolCall{
-				id:   callIDOrGenerated(item.Get("call_id").String()),
-				name: name,
-				args: verdict.Args,
+				id:   ledger.ProjectID(index, clampOpenAIToolCallID),
+				name: call.Name,
+				args: call.Arguments,
 			})
 		}
 		return true
@@ -141,58 +144,95 @@ func responsesToOpenAIChatResponse(body []byte, requestModel string, toolValidat
 	jw.EndObj()
 	jw.EndArr()
 
-	usage := root.Get("usage")
-	if usage.Exists() {
-		_, cacheRead := OpenAICacheTokens(usage)
-		total := usage.Get("total_tokens").Int()
-		if total == 0 {
-			total = usage.Get("input_tokens").Int() + usage.Get("output_tokens").Int()
-		}
+	if object := root.Get("usage"); object.IsObject() {
 		jw.Key("usage")
-		jw.Obj()
-		jw.Key("prompt_tokens")
-		jw.Int(usage.Get("input_tokens").Int())
-		jw.Key("completion_tokens")
-		jw.Int(usage.Get("output_tokens").Int())
-		jw.Key("total_tokens")
-		jw.Int(total)
-		if cacheRead > 0 {
-			jw.Key("prompt_tokens_details")
-			jw.Obj()
-			jw.Key("cached_tokens")
-			jw.Int(int64(cacheRead))
-			jw.EndObj()
-		}
-		if reasoningTokens := usage.Get("output_tokens_details.reasoning_tokens").Int(); reasoningTokens > 0 {
-			jw.Key("completion_tokens_details")
-			jw.Obj()
-			jw.Key("reasoning_tokens")
-			jw.Int(reasoningTokens)
-			jw.EndObj()
-		}
-		jw.EndObj()
+		writeChatUsage(jw, facts)
 	}
+
 	jw.EndObj()
 	return jw.Bytes(), issues, nil
+}
+
+// responsesToolCalls counts the tool calls a terminal Responses `response`
+// object carries. Codex emits custom_tool_call for its shell-style tools; both
+// end the turn in a tool call.
+func responsesToolCalls(resp gjson.Result) int {
+	n := 0
+	resp.Get("output").ForEach(func(_, item gjson.Result) bool {
+		switch item.Get("type").String() {
+		case "function_call", "custom_tool_call":
+			n++
+		}
+		return true
+	})
+	return n
 }
 
 // responsesFinishReason maps a terminal Responses `response` object to the chat
 // finish_reason it corresponds to.
 func responsesFinishReason(resp gjson.Result) string {
-	hasToolCall := false
-	resp.Get("output").ForEach(func(_, item gjson.Result) bool {
-		if item.Get("type").String() == "function_call" {
-			hasToolCall = true
-			return false
-		}
-		return true
-	})
 	switch {
-	case hasToolCall:
+	case responsesToolCalls(resp) > 0:
 		return "tool_calls"
 	case resp.Get("incomplete_details.reason").String() == "max_output_tokens":
 		return "length"
 	default:
 		return "stop"
 	}
+}
+
+// responsesOutputLimitReached reports whether a terminal Responses `response`
+// object states that the output-token cap ended the turn. Unlike
+// responsesFinishReason it is not tool-prioritized: a capped turn that also
+// carries a (possibly partial) function_call is still capped.
+func responsesOutputLimitReached(resp gjson.Result) bool {
+	return resp.Get("status").String() == "incomplete" &&
+		resp.Get("incomplete_details.reason").String() == "max_output_tokens"
+}
+
+// ResponsesTerminalSignals are the turn-ending signals a terminal Responses
+// payload states, for a caller that forwards the response verbatim.
+type ResponsesTerminalSignals struct {
+	// FinishReason is the chat finish_reason the terminal payload corresponds to.
+	FinishReason string
+	// ToolCalls is how many tool calls the turn ended with.
+	ToolCalls int
+	// OutputLimitReached is true when the upstream stated the output-token
+	// cap ended the turn, independent of FinishReason's tool priority.
+	OutputLimitReached bool
+}
+
+// ResponsesTerminal reports the turn-ending signals of a terminal Responses
+// payload. It exists for callers that forward a native Responses response
+// verbatim: no translator runs there, so the upstream's terminal statement is
+// the only account of how the turn ended. It accepts both a streaming terminal
+// event and a non-streaming body, which is the bare response object — no
+// envelope type, no nested response. ok is false for anything that states no
+// outcome: a non-terminal event, an unfinished body, or a failed one, whose
+// outcome is the upstream error instead.
+func ResponsesTerminal(payload []byte) (signals ResponsesTerminalSignals, ok bool) {
+	resp := gjson.GetBytes(payload, "response")
+	switch gjson.GetBytes(payload, "type").String() {
+	case "response.completed", "response.incomplete":
+	default:
+		if resp.Exists() {
+			return ResponsesTerminalSignals{}, false
+		}
+		// A non-streaming body is the response object itself. Only a settled
+		// status is terminal; an in-progress snapshot states nothing yet.
+		switch gjson.GetBytes(payload, "status").String() {
+		case "completed", "incomplete":
+			resp = gjson.ParseBytes(payload)
+		default:
+			return ResponsesTerminalSignals{}, false
+		}
+	}
+	if responsesTerminalIsFailure(resp) {
+		return ResponsesTerminalSignals{}, false
+	}
+	return ResponsesTerminalSignals{
+		FinishReason:       responsesFinishReason(resp),
+		ToolCalls:          responsesToolCalls(resp),
+		OutputLimitReached: responsesOutputLimitReached(resp),
+	}, true
 }

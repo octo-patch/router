@@ -5,15 +5,18 @@ import (
 	"log/slog"
 	"net/http"
 
-	"workweave/router/internal/billing"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/bandit"
-	"workweave/router/internal/router/cluster"
-	"workweave/router/internal/router/hmm"
-	"workweave/router/internal/router/policy"
-	"workweave/router/internal/router/rl"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/billing"
+	"weave-os/router/internal/dispatch"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/bandit"
+	"weave-os/router/internal/router/cluster"
+	"weave-os/router/internal/router/decisionmodel"
+	"weave-os/router/internal/router/eligibility"
+	"weave-os/router/internal/router/hmm"
+	"weave-os/router/internal/router/policy"
+	"weave-os/router/internal/router/rl"
+	"weave-os/router/internal/translate"
 )
 
 // DispatchErrorKind identifies which sentinel a dispatch error (from
@@ -42,6 +45,8 @@ const (
 	DispatchErrorPolicyUnavailable
 	DispatchErrorClusterUnavailable
 	DispatchErrorCreditsExhausted
+	DispatchErrorSubscriptionPoolExhausted
+	DispatchErrorSubscriptionPoolUnavailable
 	DispatchErrorTranslationIntrinsicallyIncompatible
 	DispatchErrorTranslationProviderUnavailable
 	DispatchErrorUserSpendLimitReached
@@ -49,11 +54,24 @@ const (
 	DispatchErrorAnthropicCacheControlInvalid
 	DispatchErrorForcedModelExcluded
 	DispatchErrorForcedModelUnknown
+	DispatchErrorPassthroughModelUnknown
 	DispatchErrorForcedClusterUnsupportedStrategy
 	DispatchErrorForcedClusterUnservable
 	DispatchErrorRoutedModelIncompatible
 	DispatchErrorGatewayServesNoModel
 	DispatchErrorNoRoutableModels
+	DispatchErrorPlanTargetMismatch
+	DispatchErrorPlanOverrideRejected
+	DispatchErrorPlanUnresolvable
+	DispatchErrorPolicyPinUnavailable
+	DispatchErrorHandoff
+	DispatchErrorProductIneligible
+	DispatchErrorClassifierHistory
+	DispatchErrorClassifierInputTooLong
+	DispatchErrorClassifierUnavailable
+	DispatchErrorSpendCapReached
+	DispatchErrorSubscriptionClientAppRefused
+	DispatchErrorDecisionModelUnavailable
 )
 
 // DispatchErrorClass is the format-agnostic classification of a dispatch
@@ -88,16 +106,84 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 	var bufferedErr *providers.UpstreamErrorResponse
 	var forcedExcluded *ForcedModelExcludedError
 	var forcedUnknown *ForcedModelUnknownError
+	var passthroughUnknown *PassthroughModelUnknownError
 	var forcedClusterStrategy *ForcedClusterUnsupportedStrategyError
 	var forcedClusterUnservable *policy.ForcedClusterUnservableError
+	var resolution *policy.ResolutionError
 	switch {
+	case errors.Is(err, policy.ErrClassifierWarming):
+		return DispatchErrorClass{Kind: DispatchErrorPolicyUnavailable, Status: http.StatusServiceUnavailable,
+			Message: policy.ErrClassifierWarming.Error(), RetryAfter: true, LogLevel: "warn", LogMessage: "Classifier warming"}, true
+	case errors.Is(err, router.ErrClassifierHistoryUnavailable), errors.Is(err, router.ErrClassifierThreadInvalid):
+		return DispatchErrorClass{Kind: DispatchErrorClassifierHistory, Status: http.StatusConflict, Message: "Classifier thread history is unavailable or changed. Restore the complete original history; do not re-enroll a compacted thread.", LogLevel: "warn", LogMessage: "Classifier history rejected"}, true
+	case errors.Is(err, router.ErrClassifierInputTooLong):
+		return DispatchErrorClass{Kind: DispatchErrorClassifierInputTooLong, Status: http.StatusRequestEntityTooLarge, Message: "Classifier input exceeds its inference limit. No history was truncated and no alternate policy was used.", LogLevel: "warn", LogMessage: "Classifier input exceeds inference limit"}, true
+	case errors.Is(err, router.ErrClassifierUnavailable):
+		return DispatchErrorClass{Kind: DispatchErrorClassifierUnavailable, Status: http.StatusServiceUnavailable, Message: "The thread's classifier release is unavailable. No alternate policy was used.", LogLevel: "warn", LogMessage: "Classifier release unavailable"}, true
+	case errors.Is(err, eligibility.ErrModelIneligible):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorProductIneligible,
+			Status:     http.StatusForbidden,
+			Message:    "This model is not included in your plan. Pick a model your plan covers.",
+			LogLevel:   "warn",
+			LogMessage: "Rejected request: model is not eligible for the caller's product",
+		}, true
+	case errors.Is(err, ErrSubscriptionClientAppRefused):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorSubscriptionClientAppRefused,
+			Status:     http.StatusForbidden,
+			Message:    "Anthropic only lets Claude Code use Claude subscription plan limits, so this app can't use them for the forced Claude model. Use Claude Code, add extra usage at claude.ai/settings/usage, or pick a non-Claude model.",
+			LogLevel:   "warn",
+			LogMessage: "Rejected forced Claude turn: subscriptions refused third-party client",
+		}, true
+	// Ahead of the pool cases: a billing-gated pool refusal carries both.
+	case errors.Is(err, ErrSpendCapSubscriptionUnavailable):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorSpendCapReached,
+			Status:     http.StatusPaymentRequired,
+			Message:    "A Weave router spend cap has been reached and your subscription can't serve this turn (rate-limited, or the requested model isn't subscription-covered).",
+			LogLevel:   "warn",
+			LogMessage: "Subscription-only request refused: spend cap reached and subscription unavailable",
+		}, true
+	case errors.Is(err, ErrCreditsExhaustedSubscriptionUnavailable):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorCreditsExhausted,
+			Status:     http.StatusPaymentRequired,
+			Message:    "Your Weave router credits are exhausted and your subscription can't serve this turn (rate-limited, or the requested model isn't subscription-covered). Add credits to re-enable paid routing: " + topUpURL,
+			LogLevel:   "warn",
+			LogMessage: "Subscription-only request refused: credits exhausted and subscription unavailable",
+		}, true
+	case errors.Is(err, ErrSubscriptionPoolExhausted):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorSubscriptionPoolExhausted,
+			Status:     http.StatusTooManyRequests,
+			Message:    "All enrolled subscription accounts are currently unavailable.",
+			RetryAfter: true,
+			LogLevel:   "warn",
+			LogMessage: "Subscription account pool exhausted",
+		}, true
+	case errors.Is(err, ErrSubscriptionPoolUnavailable):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorSubscriptionPoolUnavailable,
+			Status:     http.StatusServiceUnavailable,
+			Message:    "Subscription account service is temporarily unavailable.",
+			RetryAfter: true,
+			LogLevel:   "error",
+			LogMessage: "Subscription account pool unavailable",
+		}, true
+	case errors.Is(err, ErrHandoffInvalid):
+		return DispatchErrorClass{Kind: DispatchErrorHandoff, Status: http.StatusConflict, Message: ErrHandoffInvalid.Error(), LogLevel: "warn", LogMessage: "Pi handoff rejected"}, true
+	case errors.Is(err, ErrHandoffUnavailable):
+		return DispatchErrorClass{Kind: DispatchErrorHandoff, Status: http.StatusServiceUnavailable, Message: ErrHandoffUnavailable.Error(), LogLevel: "warn", LogMessage: "Pi handoff unavailable"}, true
 	case errors.As(err, &forcedExcluded):
 		// Ahead of the sentinel cases so the reason reaches the caller: a bare
 		// "forced model is excluded" doesn't say which model or why.
 		return DispatchErrorClass{
-			Kind:       DispatchErrorForcedModelExcluded,
-			Status:     http.StatusBadRequest,
-			Message:    forcedExcluded.Reason + ". Clear the force (/unforce-model) or pick a model from a permitted provider.",
+			Kind:   DispatchErrorForcedModelExcluded,
+			Status: http.StatusBadRequest,
+			// Sigil-free on purpose: this classifier has no request context to
+			// read the client from, and Codex never accepts the "/" form.
+			Message:    forcedExcluded.Reason + ". Clear it with the unforce-model directive, or pick a model from a permitted provider.",
 			LogLevel:   "warn",
 			LogMessage: "Rejected request: forced model is excluded on this installation",
 		}, true
@@ -108,6 +194,18 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			Message:    forcedUnknown.Error() + ". Use a full model ID, e.g. claude-opus-5, gpt-5.6-sol, or gemini-3-pro-preview.",
 			LogLevel:   "warn",
 			LogMessage: "Rejected request: forced model is not a known model",
+		}, true
+	case errors.As(err, &passthroughUnknown):
+		message := "This request is served with the requested model as-is, but " + passthroughUnknown.Error() + ". Request a full model ID (e.g. claude-opus-5-5 or gpt-5.6-sol)."
+		if passthroughUnknown.RoutingPolicyPassthrough {
+			message = "Automatic routing isn't enabled for you in this organization, so the requested model is served as-is, but " + passthroughUnknown.Error() + ". Request a full model ID (e.g. claude-opus-5-5 or gpt-5.6-sol), or ask your org admin to enable automatic routing."
+		}
+		return DispatchErrorClass{
+			Kind:       DispatchErrorPassthroughModelUnknown,
+			Status:     http.StatusBadRequest,
+			Message:    message,
+			LogLevel:   "warn",
+			LogMessage: "Rejected request: passthrough requested model is not a known model",
 		}, true
 	case errors.As(err, &forcedClusterStrategy):
 		return DispatchErrorClass{
@@ -125,6 +223,10 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			LogLevel:   "warn",
 			LogMessage: "Rejected request: forced cluster has no eligible model",
 		}, true
+	// Before the generic upstream cases: an overflow must reach every client in
+	// its native shape, not as an opaque upstream failure.
+	case isContextOverflow(err):
+		return contextWindowExceededClass, true
 	case errors.As(err, &statusErr):
 		return DispatchErrorClass{
 			Kind:    DispatchErrorUpstreamStatus,
@@ -146,7 +248,7 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			Status:  http.StatusNotImplemented,
 			Message: "Provider not implemented.",
 		}, true
-	case errors.Is(err, ErrProviderNotConfigured):
+	case errors.Is(err, ErrProviderNotConfigured), errors.Is(err, dispatch.ErrProviderNotConfigured):
 		return DispatchErrorClass{
 			Kind:    DispatchErrorProviderNotConfigured,
 			Status:  http.StatusBadGateway,
@@ -238,22 +340,6 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			LogLevel:   "error",
 			LogMessage: "Spend-limit check unavailable",
 		}, true
-	case errors.Is(err, ErrCreditsExhaustedSubscriptionUnavailable):
-		return DispatchErrorClass{
-			Kind:       DispatchErrorCreditsExhausted,
-			Status:     http.StatusPaymentRequired,
-			Message:    "Your Weave router credits are exhausted and your subscription can't serve this turn (rate-limited, or the requested model isn't subscription-covered). Add credits to re-enable paid routing: " + topUpURL,
-			LogLevel:   "warn",
-			LogMessage: "Subscription-only request refused: credits exhausted and subscription unavailable",
-		}, true
-	case errors.Is(err, ErrContextWindowExceeded):
-		return DispatchErrorClass{
-			Kind:       DispatchErrorContextWindowExceeded,
-			Status:     http.StatusRequestEntityTooLarge,
-			Message:    "Request context exceeds the largest available model's context window even after compaction. Reduce the conversation (e.g. /compact or start a new session).",
-			LogLevel:   "warn",
-			LogMessage: "Request context exceeds every eligible model's window after compaction",
-		}, true
 	case errors.Is(err, cluster.ErrInvalidRoutingKnobs):
 		return DispatchErrorClass{
 			Kind:       DispatchErrorInvalidRoutingKnobs,
@@ -261,6 +347,15 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			Message:    "Invalid routing knobs supplied.",
 			LogLevel:   "warn",
 			LogMessage: "Invalid routing knobs supplied",
+		}, true
+	case errors.Is(err, router.ErrPolicyPinUnavailable):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorPolicyPinUnavailable,
+			Status:     http.StatusServiceUnavailable,
+			Message:    router.PolicyPinUnavailableReason + ": the pinned policy artifact or roster is not loaded on this router.",
+			RetryAfter: false,
+			LogLevel:   "warn",
+			LogMessage: "Policy pin unavailable",
 		}, true
 	// Must precede every policy-unavailable case: ErrGatewayServesNoDeployedModel
 	// also wraps ErrHMMUnavailable, and the more-specific sentinel wins.
@@ -280,6 +375,16 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			LogLevel:   "warn",
 			LogMessage: "Installation configuration leaves no routable model",
 		}, true
+	case errors.Is(err, dispatch.ErrTargetMismatch):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorPlanTargetMismatch,
+			Status:     http.StatusBadGateway,
+			Message:    "Upstream call failed: the prepared request did not match the authorized inference target.",
+			LogLevel:   "error",
+			LogMessage: "Prepared request rejected by inference target check",
+		}, true
+	case errors.As(err, &resolution):
+		return classifyResolutionError(resolution), true
 	case errors.Is(err, rl.ErrPolicyUnavailable):
 		return DispatchErrorClass{
 			Kind:       DispatchErrorRLPolicyUnavailable,
@@ -297,6 +402,15 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 			RetryAfter: true,
 			LogLevel:   "error",
 			LogMessage: "Bandit routing unavailable",
+		}, true
+	case errors.Is(err, decisionmodel.ErrUnavailable):
+		return DispatchErrorClass{
+			Kind:       DispatchErrorDecisionModelUnavailable,
+			Status:     http.StatusServiceUnavailable,
+			Message:    "Router unavailable: decision model routing failed and no fallback is configured.",
+			RetryAfter: true,
+			LogLevel:   "error",
+			LogMessage: "decision model routing unavailable",
 		}, true
 	case errors.Is(err, hmm.ErrHMMUnavailable):
 		return DispatchErrorClass{
@@ -330,12 +444,42 @@ func ClassifyDispatchError(err error) (DispatchErrorClass, bool) {
 	}
 }
 
+// classifyResolutionError maps a failed plan resolution to a client-facing
+// class: an override or selection the request itself supplied is a client
+// error; a policy with nothing eligible to run on is a routing outage.
+func classifyResolutionError(err *policy.ResolutionError) DispatchErrorClass {
+	switch err.Code {
+	case policy.ResolutionErrorInvalidOverride, policy.ResolutionErrorOverrideNotAllowed, policy.ResolutionErrorDuplicateOverride, policy.ResolutionErrorUnknownSelection, policy.ResolutionErrorBudgetViolation:
+		if err.Source == policy.OverrideSourceRequest || err.Code == policy.ResolutionErrorUnknownSelection {
+			return DispatchErrorClass{
+				Kind:       DispatchErrorPlanOverrideRejected,
+				Status:     http.StatusBadRequest,
+				Message:    "The requested model, provider, or budget is not permitted for this operation.",
+				LogLevel:   "warn",
+				LogMessage: "Inference plan rejected request-supplied override",
+			}
+		}
+	}
+	return DispatchErrorClass{
+		Kind:       DispatchErrorPlanUnresolvable,
+		Status:     http.StatusServiceUnavailable,
+		Message:    "Router unavailable: no inference target could be authorized for this request.",
+		RetryAfter: true,
+		LogLevel:   "error",
+		LogMessage: "Inference plan resolution failed",
+	}
+}
+
 // unwrapToSentinelMessage returns the message of the wrap layer whose direct
 // child is one of the cache_control sentinels, stripping outer prefixes like
 // "emit body: ". Falls back to err.Error().
 func unwrapToSentinelMessage(err error) string {
 	for e := err; e != nil; e = errors.Unwrap(e) {
-		if child := errors.Unwrap(e); child == translate.ErrAnthropicCacheControlOverflow || child == translate.ErrAnthropicCacheControlInvalid {
+		child := errors.Unwrap(e)
+		if errors.Unwrap(child) != nil {
+			continue
+		}
+		if errors.Is(child, translate.ErrAnthropicCacheControlOverflow) || errors.Is(child, translate.ErrAnthropicCacheControlInvalid) {
 			return e.Error()
 		}
 	}
@@ -348,7 +492,9 @@ func unwrapToSentinelMessage(err error) string {
 // rather than "api_error".
 func (k DispatchErrorKind) IsClientError() bool {
 	switch k {
-	case DispatchErrorRequestNotJSONObject, DispatchErrorResponsesChatCompletionsBody, DispatchErrorNoEligibleProvider, DispatchErrorAllowlistEmptiesPool, DispatchErrorContextWindowExceeded, DispatchErrorInvalidRoutingKnobs, DispatchErrorTranslationIntrinsicallyIncompatible, DispatchErrorAnthropicCacheControlInvalid, DispatchErrorForcedModelExcluded, DispatchErrorForcedModelUnknown, DispatchErrorForcedClusterUnsupportedStrategy, DispatchErrorForcedClusterUnservable, DispatchErrorGatewayServesNoModel, DispatchErrorNoRoutableModels:
+	case DispatchErrorClassifierHistory, DispatchErrorClassifierInputTooLong:
+		return true
+	case DispatchErrorRequestNotJSONObject, DispatchErrorResponsesChatCompletionsBody, DispatchErrorNoEligibleProvider, DispatchErrorAllowlistEmptiesPool, DispatchErrorContextWindowExceeded, DispatchErrorInvalidRoutingKnobs, DispatchErrorTranslationIntrinsicallyIncompatible, DispatchErrorAnthropicCacheControlInvalid, DispatchErrorForcedModelExcluded, DispatchErrorForcedModelUnknown, DispatchErrorPassthroughModelUnknown, DispatchErrorForcedClusterUnsupportedStrategy, DispatchErrorForcedClusterUnservable, DispatchErrorGatewayServesNoModel, DispatchErrorNoRoutableModels, DispatchErrorPlanOverrideRejected, DispatchErrorProductIneligible, DispatchErrorSubscriptionClientAppRefused:
 		return true
 	default:
 		return false

@@ -7,14 +7,24 @@ import (
 	"log/slog"
 	"net/http"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/server/middleware"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/server/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
+
+// PrepareHandoffHandler applies Messages authentication and validation before route preparation.
+func PrepareHandoffHandler(svc *proxy.Service, authSvc *auth.Service) gin.HandlerFunc {
+	messages := MessagesHandler(svc, authSvc)
+	return func(c *gin.Context) {
+		c.Request = c.Request.WithContext(proxy.WithHandoffPreparation(c.Request.Context()))
+		messages(c)
+	}
+}
 
 func MessagesHandler(svc *proxy.Service, authSvc *auth.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -46,6 +56,13 @@ func MessagesHandler(svc *proxy.Service, authSvc *auth.Service) gin.HandlerFunc 
 		// Skip identity upsert for agent-shadow eval requests to avoid mutating production router-user state.
 		if _, agentShadow := proxy.AgentShadowEvalFromContext(ctx); !agentShadow {
 			ctx = proxy.ResolveUserFromContext(ctx, authSvc, middleware.InstallationFrom(c))
+			ctx, err = proxy.ResolveRoutingAssignment(ctx, authSvc, middleware.InstallationFrom(c))
+			if err != nil {
+				log.Error("Failed to resolve routing assignment", "installation_id", middleware.InstallationFrom(c).ID, "err", err)
+				c.Header("Retry-After", "1")
+				writeAnthropicError(c, http.StatusServiceUnavailable, "api_error", "Routing policy temporarily unavailable.")
+				return
+			}
 		}
 		c.Request = c.Request.WithContext(ctx)
 
@@ -89,15 +106,12 @@ func stashClientIdentity(ctx context.Context, h http.Header, body []byte) contex
 	id := proxy.ClientIdentityFromHeaders(h)
 	id.DeviceID = proxy.NormalizeClientIdentifier(meta.DeviceID)
 	id.AccountID = proxy.NormalizeClientIdentifier(meta.AccountID)
-	if meta.SessionID != "" {
-		id.SessionID = proxy.NormalizeClientIdentifier(meta.SessionID)
-	}
+	id.SessionID = requestcontext.AnthropicHeaderSessionID(h, meta)
 	if metaEmail := proxy.NormalizeEmail(meta.Email); metaEmail != "" {
 		id.Email = metaEmail
 	}
 	observability.FromContext(ctx).Debug("anthropic stashClientIdentity",
 		"meta_raw_len", len(metaRaw),
-		"meta_raw_preview", observability.Preview(metaRaw, 200),
 		"parsed_email_present", meta.Email != "",
 		"parsed_account_present", meta.AccountID != "",
 		"parsed_device_present", meta.DeviceID != "",
@@ -108,7 +122,7 @@ func stashClientIdentity(ctx context.Context, h http.Header, body []byte) contex
 		"header_email_present", h.Get("X-Weave-User-Email") != "",
 		"header_name_present", h.Get("X-Weave-User-Name") != "",
 	)
-	return context.WithValue(ctx, proxy.ClientIdentityContextKey{}, id)
+	return requestcontext.WithClientIdentity(ctx, id)
 }
 
 // anthropicErrorType maps a classified dispatch error to the Anthropic

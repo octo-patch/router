@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"workweave/router/internal/sse"
+	"weave-os/router/internal/sse"
 
 	"github.com/tidwall/gjson"
 )
@@ -47,7 +47,8 @@ type AnthropicRoutingFooterWriter struct {
 
 	footer string
 
-	buf bytes.Buffer
+	buf     bytes.Buffer
+	scanner sse.Scanner
 
 	streaming      bool
 	headersEmitted bool
@@ -119,7 +120,7 @@ func (w *AnthropicRoutingFooterWriter) processUpstream(data []byte) (int, error)
 	// an event split across two Write calls is parsed whole, not truncated.
 	w.buf.Write(data)
 	for {
-		event, n := sse.SplitNext(w.buf.Bytes())
+		event, n := w.scanner.Next(w.buf.Bytes())
 		if n == 0 {
 			break
 		}

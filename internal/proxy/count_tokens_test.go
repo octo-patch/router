@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,6 +35,19 @@ func assertLocalEstimate(t *testing.T, rec *httptest.ResponseRecorder) {
 	tokens := gjson.GetBytes(rec.Body.Bytes(), "input_tokens")
 	require.True(t, tokens.Exists())
 	assert.Positive(t, tokens.Int())
+}
+
+func TestCountTokens_RoutingModelNeverReachesUpstream(t *testing.T) {
+	provider := &fakeProvider{passthroughResponse: func(context.Context, http.ResponseWriter) error {
+		t.Fatal("virtual routing model reached upstream")
+		return nil
+	}}
+	for _, model := range []router.RoutingModel{router.ModelAutomatic, router.ModelHMM, router.ModelQwen} {
+		rec := httptest.NewRecorder()
+		body := strings.Replace(countTokensBody, "claude-sonnet-4-6", string(model), 1)
+		require.NoError(t, countTokensService(provider).PassthroughToProvider(context.Background(), []byte(body), rec, countTokensRequest()))
+		assertLocalEstimate(t, rec)
+	}
 }
 
 func TestCountTokens_UpstreamAnswerIsForwardedVerbatim(t *testing.T) {

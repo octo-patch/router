@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/router/sessionstrategy"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/policyregistry"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/router/sessionstrategy"
+	"weave-os/router/internal/subscriptions/entitlement"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 )
@@ -20,7 +24,33 @@ const (
 	betaDisabledMessage = "Beta disabled. Stable routing restored."
 	betaUsageMessage    = "Usage: /beta"
 	betaUnavailable     = "Beta is unavailable for this session."
+	betaPinnedMessage   = "Beta is always on for this installation; /beta has no effect."
+	qwenEnabledMessage  = "Qwen beta enabled. Type /beta-llm again to turn it off."
+	qwenDisabledMessage = "Qwen beta disabled. Stable routing restored."
+	qwenUsageMessage    = "Usage: /beta-llm"
+	qwenUnavailable     = "Qwen beta is unavailable for this session."
 )
+
+// WriteRetiredBetaRequest keeps this protocol-specific, non-inference reply
+// after authenticated admission and ahead of inference and billing gates.
+func WriteRetiredBetaRequest(w http.ResponseWriter, r *http.Request, body []byte) (bool, error) {
+	var surface requestcontext.ConversationSurface
+	switch r.URL.Path {
+	case "/v1/messages", "/v1/route", "/v1/route/preview", "/v1/route/handoff":
+		surface = requestcontext.ConversationAnthropic
+	case "/v1/chat/completions":
+		surface = requestcontext.ConversationChat
+	case "/v1/responses":
+		surface = requestcontext.ConversationResponses
+	default:
+		if strings.HasPrefix(r.URL.Path, "/v1beta/models/") {
+			surface = requestcontext.ConversationGemini
+		} else {
+			return false, nil
+		}
+	}
+	return translate.WriteRetiredBetaRequest(w, r, body, surface)
+}
 
 type betaArtifactHistoryContextKey struct{}
 
@@ -35,6 +65,11 @@ func betaArtifactHistoryFromContext(ctx context.Context) bool {
 	return found
 }
 
+func internalBetaSession(ctx context.Context) bool {
+	identity, managed := requestcontext.ServingIdentityFromContext(ctx)
+	return managed && policyregistry.ExperimentalRoutingModelsPermitted(policyregistry.ServingTarget(identity.Target), entitlement.Plan(identity.Plan)) && identity.ReleaseID != "" && identity.BindingID != "" && identity.CredentialIdentity != ""
+}
+
 // WithSessionStrategyStore wires durable per-session routing preferences.
 // A nil store leaves normal routing unchanged and makes /beta unavailable.
 func (s *Service) WithSessionStrategyStore(store sessionstrategy.Store) *Service {
@@ -42,23 +77,37 @@ func (s *Service) WithSessionStrategyStore(store sessionstrategy.Store) *Service
 	return s
 }
 
+// applySessionStrategy reads the /beta preference stored under preferenceKey
+// (see deriveBetaSessionKeyForRequest), not the per-thread pin key.
 func (s *Service) applySessionStrategy(
 	ctx context.Context,
 	installationID uuid.UUID,
-	sessionKey [sessionpin.SessionKeyLen]byte,
+	preferenceKey [sessionpin.SessionKeyLen]byte,
 ) (context.Context, error) {
-	if s.sessionStrategyStore == nil || installationID == uuid.Nil || sessionKey == ([sessionpin.SessionKeyLen]byte{}) {
+	if _, selected := router.RoutingModelFromContext(ctx); selected {
 		return ctx, nil
 	}
-	preference, found, err := s.sessionStrategyStore.Get(ctx, installationID, sessionKey)
+	if router.StrategyFromContext(ctx) == router.StrategyLLMClassifier {
+		return ctx, nil
+	}
+	if _, managed := requestcontext.ServingIdentityFromContext(ctx); managed && !internalBetaSession(ctx) {
+		return ctx, nil
+	}
+	if s.sessionStrategyStore == nil || installationID == uuid.Nil || preferenceKey == ([sessionpin.SessionKeyLen]byte{}) {
+		return ctx, nil
+	}
+	preference, found, err := s.sessionStrategyStore.Get(ctx, installationID, preferenceKey)
 	if err != nil {
 		return ctx, fmt.Errorf("load session routing strategy: %w", err)
 	}
 	if !found {
 		return ctx, nil
 	}
-	if preference.Strategy != router.StrategyHMMBeta {
+	if !router.IsBetaStrategy(preference.Strategy) {
 		return ctx, fmt.Errorf("unsupported persisted session routing strategy %q", preference.Strategy)
+	}
+	if preference.Strategy == router.StrategyHMMQwen && !internalBetaSession(ctx) {
+		return ctx, nil
 	}
 	return router.WithStrategy(ctx, preference.Strategy), nil
 }
@@ -70,49 +119,81 @@ func (s *Service) handleBetaCommand(
 	cmd translate.BetaCommandResult,
 	installationID uuid.UUID,
 	sessionKey [sessionpin.SessionKeyLen]byte,
+	preferenceKey [sessionpin.SessionKeyLen]byte,
 	inputTokens int,
 ) error {
-	if cmd.Invalid {
-		return writeBetaCommandResponse(w, env, betaUsageMessage, inputTokens)
+	if _, selected := router.RoutingModelFromContext(ctx); selected {
+		return writeBetaCommandResponse(w, env, fmt.Sprintf("Select a router with `wv router set-model %s`, `wv router set-model %s`, `wv router set-model %s`, or `wv router set-model %s`, then start a new session.", router.ModelHMM, router.ModelQwen, router.ModelDecision, router.ModelAutomatic), inputTokens)
 	}
-	if s.sessionStrategyStore == nil || installationID == uuid.Nil || sessionKey == ([sessionpin.SessionKeyLen]byte{}) || clientSessionIDForRequest(ctx, env) == "" {
-		return writeBetaCommandResponse(w, env, betaUnavailable, inputTokens)
+	strategy := cmd.Strategy
+	enabledMessage, disabledMessage, usageMessage, unavailableMessage := betaEnabledMessage, betaDisabledMessage, betaUsageMessage, betaUnavailable
+	if strategy == router.StrategyHMMQwen {
+		enabledMessage, disabledMessage, usageMessage, unavailableMessage = qwenEnabledMessage, qwenDisabledMessage, qwenUsageMessage, qwenUnavailable
+		if !internalBetaSession(ctx) {
+			return writeBetaCommandResponse(w, env, unavailableMessage, inputTokens)
+		}
+	}
+	if _, managed := requestcontext.ServingIdentityFromContext(ctx); managed && !internalBetaSession(ctx) {
+		return writeBetaCommandResponse(w, env, translate.BetaRetiredMessage, inputTokens)
+	}
+	if cmd.Invalid {
+		return writeBetaCommandResponse(w, env, usageMessage, inputTokens)
+	}
+	if s.sessionStrategyStore == nil || installationID == uuid.Nil || preferenceKey == ([sessionpin.SessionKeyLen]byte{}) || clientSessionIDForRequest(ctx, env) == "" {
+		return writeBetaCommandResponse(w, env, unavailableMessage, inputTokens)
+	}
+	previousStrategy := router.StrategyFromContext(ctx)
+	previous, found, err := s.sessionStrategyStore.Get(ctx, installationID, preferenceKey)
+	if err != nil {
+		return fmt.Errorf("read session routing strategy before beta toggle: %w", err)
+	}
+	if found {
+		previousStrategy = previous.Strategy
+	}
+	// Runs before applySessionStrategy, so the context strategy here is the
+	// installation's baseline; a session toggle cannot leave an installation pin.
+	if router.StrategyFromContext(ctx) == strategy {
+		return writeBetaCommandResponse(w, env, betaPinnedMessage, inputTokens)
 	}
 
 	// Both branches decide from what the store persisted rather than a prior
 	// read, so overlapping /beta commands for one session cannot act on the
 	// same stale state: an unavailable beta policy can only ever be left.
 	nowEnabled := false
-	if s.PolicyStrategyAvailable(router.StrategyHMMBeta) {
+	available := s.PolicyStrategyAvailable(strategy)
+	if snapshot := policyregistry.ServingSnapshotFromContext(ctx); snapshot != nil {
+		available = snapshot.Routers[strategy] != nil
+	}
+	if available {
 		enabled, err := s.sessionStrategyStore.Toggle(context.Background(), sessionstrategy.Preference{
 			InstallationID: installationID,
-			SessionKey:     sessionKey,
-			Strategy:       router.StrategyHMMBeta,
+			SessionKey:     preferenceKey,
+			Strategy:       strategy,
 		})
 		if err != nil {
 			return fmt.Errorf("toggle beta routing: %w", err)
 		}
 		nowEnabled = enabled
 	} else {
-		wasEnabled, err := s.sessionStrategyStore.Disable(context.Background(), installationID, sessionKey)
+		wasEnabled, err := s.sessionStrategyStore.Disable(context.Background(), installationID, preferenceKey, strategy)
 		if err != nil {
 			return fmt.Errorf("disable beta routing: %w", err)
 		}
 		if !wasEnabled {
-			return writeBetaCommandResponse(w, env, betaUnavailable, inputTokens)
+			return writeBetaCommandResponse(w, env, unavailableMessage, inputTokens)
 		}
 	}
 
-	message := betaEnabledMessage
-	previousStrategy := router.StrategyFromContext(ctx)
+	message := enabledMessage
 	if !nowEnabled {
-		previousStrategy = router.StrategyHMMBeta
-		message = betaDisabledMessage
+		previousStrategy = strategy
+		message = disabledMessage
 	}
 
 	log := observability.FromContext(ctx)
 	// Persist first: strategy-bound reads make old-strategy pins ineligible
 	// immediately, so cleanup cannot overwrite a concurrent new-mode pin.
+	// Pins stay keyed per thread, so only this thread's state is dropped.
 	if err := s.invalidateSessionRoutingState(
 		router.WithStrategy(ctx, previousStrategy),
 		sessionKey,
@@ -122,6 +203,7 @@ func (s *Service) handleBetaCommand(
 
 	log.Info(
 		"session beta routing toggled",
+		"strategy", strategy,
 		"enabled", nowEnabled,
 		"session_key_prefix", shortSessionKey(sessionKey),
 	)

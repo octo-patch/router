@@ -1,15 +1,14 @@
 /**
- * @workweave/router — route the pi coding agent through the Weave Router.
+ * @weave-os/router — route the pi coding agent through the Weave Router.
  *
- * Wiring (all on the existing router surface — no router source change beyond
- * the installer):
+ * Wiring:
  *   - provider:     register `weave` with per-process knob headers (quality on
  *                   the main loop, speed/cheap in subagents).
  *   - metadata:     stamp body.metadata.user_id for sticky sessions + subagent
  *                   detection.
  *   - Loom UI:      branded header, Wooly animation, actual route, and saved $.
  *   - safety:       block catastrophic bash (unless WEAVE_NO_SAFETY=1).
- *   - compaction:   protect long tool loops, then compact routed context.
+ *   - compaction:   protect long tool loops and compact before model escalation.
  *   - dispatch:     parallel, context-isolated subagents — top-level process
  *                   only (no grandchildren).
  *   - lsp:          code intelligence (definition/references/hover/symbols/
@@ -23,8 +22,10 @@
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { registerBetaCommand } from "./beta.js";
+import { registerClassifierThread } from "./classifier-thread.js";
 import { isSubagent } from "./config.js";
 import { registerCompaction } from "./compaction.js";
+import { registerEscalationCompaction } from "./escalation.js";
 import { registerDispatch } from "./dispatch.js";
 import { registerForceModelCommands } from "./force-model.js";
 import { registerLsp } from "./lsp.js";
@@ -32,6 +33,7 @@ import { registerMetadata } from "./metadata.js";
 import { registerRoutedModel } from "./routed-model.js";
 import { registerSafety } from "./safety.js";
 import { registerWeave } from "./provider.js";
+import { registerWooly } from "./ui.js";
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 
@@ -43,10 +45,14 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", () => registerWeave(pi));
 
 	registerMetadata(pi);
+	const classifierThreadActive = registerClassifierThread(pi);
 	registerBetaCommand(pi);
 	registerForceModelCommands(pi);
 	registerRoutedModel(pi);
-	registerCompaction(pi);
+	if (!isSubagent()) registerWooly(pi);
+	let handoffPending = () => false;
+	registerCompaction(pi, undefined, () => handoffPending() || classifierThreadActive());
+	handoffPending = registerEscalationCompaction(pi, undefined, undefined, classifierThreadActive);
 
 	if (process.env.WEAVE_NO_SAFETY !== "1") registerSafety(pi);
 

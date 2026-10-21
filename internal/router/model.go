@@ -20,7 +20,19 @@ const (
 	// field (opus-5 and fable-5 today — the models whose safety classifiers can
 	// return stop_reason "refusal"). Every other Claude 400s on the field.
 	CapServerSideFallback ModelCapability = "server_side_fallback"
+	// CapAutoToolChoiceOnly marks models that 400 on a forced tool_choice
+	// ({"type":"any"} / {"type":"tool"}); emit downgrades those to auto.
+	CapAutoToolChoiceOnly ModelCapability = "auto_tool_choice_only"
+	// CapTemperatureUnsupported marks Anthropic models that reject the
+	// temperature parameter even though they accept other sampling controls.
+	CapTemperatureUnsupported ModelCapability = "temperature_unsupported"
+	// CapAssistantPrefillUnsupported marks models that 400 when the
+	// conversation ends on an assistant message.
+	CapAssistantPrefillUnsupported ModelCapability = "assistant_prefill_unsupported"
 )
+
+// ModelGemini4Argon is the canonical Google Gemini 4 Argon model ID.
+const ModelGemini4Argon = "gemini-4-argon"
 
 // ModelSpec describes what a model supports. Zero value is safe: provider
 // adapters strip all capability-gated fields when Supports reports false.
@@ -123,14 +135,28 @@ var (
 	anthropicAdaptiveXhigh = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true}, CapAdaptiveThinking, CapExtendedContext, CapXhighEffort)
 	// Opus 5 / Fable 5 add server-side fallback on top of the xhigh menu.
 	anthropicAdaptiveFallback = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true}, CapAdaptiveThinking, CapExtendedContext, CapXhighEffort, CapServerSideFallback)
-	anthropicExtended         = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high"}, SupportsBudget: true}, CapExtendedThinking)
+	// Fable 5.1, Opus 5.5, and Sonnet 5.5 additionally reject tool_choice
+	// any/tool ("not supported for this model"); opus-5 and fable-5 accept them.
+	anthropicAdaptiveFallbackAutoTools = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true}, CapAdaptiveThinking, CapExtendedContext, CapXhighEffort, CapServerSideFallback, CapAutoToolChoiceOnly)
+	anthropicExtended                  = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high"}, SupportsBudget: true}, CapExtendedThinking)
 )
 
 var (
 	openaiReasoning = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high"}, SupportsBudget: true}, CapReasoning)
 	openaiBase      = NewSpec()
+	// GPT-5.6 accepts "xhigh"; "max" is Codex-backend only (the OpenAI adapter
+	// clamps it to xhigh for api.openai.com), so it stays off the menu.
+	openai56 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
+	// GPT-6 Astra exposes max on the public Responses API and always reasons.
+	openaiAstra = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh", "max"}, SupportsBudget: true, AlwaysOn: true}, CapReasoning, CapXhighEffort)
+	// GPT-6 Sol/Luna expose Astra's menu but also accept reasoning.effort=none,
+	// so a disable passes through instead of clamping to the floor.
+	openai6  = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh", "max"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
+	openai61 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh", "max"}, SupportsBudget: true, AlwaysOn: true}, CapReasoning, CapXhighEffort)
 	// grok-4.6: openaiReasoning + the extra "xhigh" level.
 	grok46 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
+	// Grok 4.7 exposes the same four reasoning effort levels as Grok 4.6.
+	grok47 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
 	// museSpark: reasoning_effort minimal/low/medium/high/xhigh; "none" is a 400
 	// (always reasons), so AlwaysOn maps a disable to the floor level. The
 	// router canonicalizes "minimal" to "low" before dispatch.
@@ -154,11 +180,22 @@ var minimaxFlash = NewSpecWithReasoning(ReasoningCapabilities{
 var registry = map[string]ModelSpec{
 	// claude-fable-5 has adaptive thinking always on (disabled is rejected);
 	// 1M context is native, so CapExtendedContext's beta header is a no-op.
-	"claude-fable-5":   anthropicAdaptiveFallback,
-	"claude-fable-5-1": anthropicAdaptiveFallback,
-	"claude-opus-5":    anthropicAdaptiveFallback,
-	"claude-opus-4-8":  anthropicAdaptiveXhigh,
-	"claude-opus-4-7":  anthropicAdaptiveXhigh,
+	"claude-fable-5": anthropicAdaptiveFallback,
+	"claude-fable-5-1": NewSpecWithReasoning(
+		ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true},
+		CapAdaptiveThinking, CapExtendedContext, CapXhighEffort, CapServerSideFallback,
+		CapAutoToolChoiceOnly, CapTemperatureUnsupported,
+	),
+	"claude-opus-5-5": NewSpecWithReasoning(
+		ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true},
+		CapAdaptiveThinking, CapExtendedContext, CapXhighEffort, CapServerSideFallback,
+		CapAutoToolChoiceOnly, CapAssistantPrefillUnsupported,
+	),
+	// Sonnet 5.5 accepts xhigh, unlike Sonnet 5.
+	"claude-sonnet-5-5": anthropicAdaptiveFallbackAutoTools,
+	"claude-opus-5":     anthropicAdaptiveFallback,
+	"claude-opus-4-8":   anthropicAdaptiveXhigh,
+	"claude-opus-4-7":   anthropicAdaptiveXhigh,
 	// claude-sonnet-5 mirrors sonnet-4-6: no xhigh, since Sonnet tops out at
 	// effort "max" and marking xhigh unsupported clamps rather than 400s.
 	"claude-sonnet-5":   anthropicAdaptive,
@@ -172,14 +209,30 @@ var registry = map[string]ModelSpec{
 	"claude-opus-4-1":  anthropicExtended,
 	"claude-opus-4-0":  anthropicExtended,
 
+	// Haiku 5.5 is adaptive-only but, unlike Sonnet/Opus 5.5, accepts
+	// thinking.type=disabled and forced tool_choice.
+	"claude-haiku-5-5": NewSpecWithReasoning(
+		ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}},
+		CapAdaptiveThinking,
+		CapExtendedContext,
+		CapXhighEffort,
+		CapServerSideFallback,
+	),
+
 	"claude-sonnet-4-5": NewSpec(),
 	"claude-sonnet-4-0": NewSpec(),
 
-	"gpt-5.6-sol":      openaiReasoning,
-	"gpt-5.6-sol-pro":  openaiReasoning,
-	"gpt-5.6-terra":    openaiReasoning,
-	"gpt-5.6-luna":     openaiReasoning,
-	"gpt-5.6-luna-pro": openaiReasoning,
+	"gpt-6-astra":     openaiAstra,
+	"gpt-6-sol":       openai6,
+	"gpt-6.1-sol":     openai61,
+	"gpt-6-luna":      openai6,
+	ModelGemini4Argon: google3Base,
+
+	"gpt-5.6-sol":      openai56,
+	"gpt-5.6-sol-pro":  openai56,
+	"gpt-5.6-terra":    openai56,
+	"gpt-5.6-luna":     openai56,
+	"gpt-5.6-luna-pro": openai56,
 
 	"gpt-5.5":      openaiReasoning,
 	"gpt-5.5-pro":  openaiReasoning,
@@ -193,11 +246,12 @@ var registry = map[string]ModelSpec{
 	// grok-4.6: grok-4.5 added an "xhigh" effort that xAI didn't document for 4.5;
 	// xAI's 4.6 docs keep the low/medium/high/xhigh menu. CapReasoning + CapXhighEffort.
 	"grok-4.6": grok46,
+	"grok-4.7": grok47,
 
 	"muse-spark-1.3": museSpark,
 
 	"gpt-5.4":      openaiReasoning,
-	"gpt-5.4-pro":  openaiReasoning,
+	"gpt-5.4-pro":  NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"medium", "high", "xhigh"}, AlwaysOn: true}, CapReasoning, CapXhighEffort),
 	"gpt-5.4-mini": openaiReasoning,
 	"gpt-5.4-nano": openaiReasoning,
 

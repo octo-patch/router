@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/flags"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/flags"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -60,6 +60,7 @@ func (f *fakeRouter) Route(ctx context.Context, req router.Request) (router.Deci
 type fakeProvider struct {
 	proxyBodies    [][]byte
 	proxyEndpoints []providers.Endpoint
+	proxyHeaders   []http.Header
 	proxyResponse  func(w http.ResponseWriter)
 	proxyErr       error
 	// proxyCreds records the resolved credential per dispatch; nil means
@@ -74,11 +75,14 @@ type fakeProvider struct {
 	proxyErrByEndpoint map[providers.Endpoint]error
 }
 
+func (*fakeProvider) SupportsSubscriptions() bool { return true }
+
 func (f *fakeProvider) Proxy(ctx context.Context, decision router.Decision, prep providers.PreparedRequest, w http.ResponseWriter, r *http.Request) error {
 	saved := make([]byte, len(prep.Body))
 	copy(saved, prep.Body)
 	f.proxyBodies = append(f.proxyBodies, saved)
 	f.proxyEndpoints = append(f.proxyEndpoints, prep.Endpoint)
+	f.proxyHeaders = append(f.proxyHeaders, prep.Headers.Clone())
 	f.proxyCreds = append(f.proxyCreds, proxy.CredentialsFromContext(ctx))
 	if err, ok := f.proxyErrByEndpoint[prep.Endpoint]; ok {
 		return err
@@ -175,8 +179,7 @@ func TestService_AgentShadowEvaluationForcesEphemerallyWithoutServingRouter(t *t
 		providers.ProviderAnthropic: provider,
 	}, nil, false, nil, pins, false, providers.ProviderAnthropic, "claude-haiku-4-5", telemetry).
 		WithDeploymentKeyedProviders(map[string]struct{}{providers.ProviderAnthropic: {}}).
-		WithAvailableModels(map[string]struct{}{"claude-opus-4-8": {}}).
-		WithCompaction(nil, 0.0001)
+		WithAvailableModels(map[string]struct{}{"claude-opus-4-8": {}})
 
 	ctx := context.WithValue(context.Background(), proxy.AgentShadowEvalContextKey{}, proxy.AgentShadowEvaluation{
 		Model: "CLAUDE-OPUS-4-8", RolloutID: "pilot-1", StateID: "state-1",
@@ -217,6 +220,7 @@ func TestService_AgentShadowEvaluationForcesEphemerallyWithoutServingRouter(t *t
 	// claude-opus-4-8 is CapExtendedContext, so the served context window header
 	// reports the effective 1M window clients should budget against.
 	assert.Equal(t, "1000000", rec.Header().Get(proxy.HeaderRouterContextWindow))
+	assertContextHeaders(t, rec.Header())
 	assert.Equal(t, providers.ProviderAnthropic, rec.Header().Get(proxy.HeaderRouterProvider))
 	assert.Equal(t, proxy.ReasonAgentShadowEval, rec.Header().Get(proxy.HeaderRouterDecision))
 	assert.Never(t, func() bool {
@@ -294,7 +298,7 @@ func TestService_AgentShadowEvaluationNeverRetriesSubscriptionOnDeploymentKey(t 
 func TestService_ProxyOpenAIResponses_CustomToolUsesNativeOpenAIFamily(t *testing.T) {
 	provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[]}`)
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}`)
 	}}
 	fr := &fakeRouter{decision: router.Decision{Provider: providers.ProviderOpenAI, Model: "gpt-5.5", Reason: "test"}}
 	svc := proxy.NewService(fr, map[string]providers.Client{
@@ -316,7 +320,24 @@ func TestService_ProxyOpenAIResponses_CustomToolUsesNativeOpenAIFamily(t *testin
 	require.Len(t, provider.proxyBodies, 1)
 	assert.JSONEq(t, `{"model":"gpt-5.5","input":"apply a patch","reasoning":{"effort":"high"},"tools":[{"type":"custom","name":"apply_patch"}]}`, string(provider.proxyBodies[0]))
 	assert.Equal(t, providers.EndpointResponses, provider.proxyEndpoints[0])
-	assert.JSONEq(t, `{"id":"resp_1","object":"response","output":[]}`, rec.Body.String())
+	assert.JSONEq(t, `{"id":"resp_1","object":"response","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}`, rec.Body.String())
+}
+
+func TestService_ProxyOpenAIResponses_CodexFeedbackSkillIsSynthetic(t *testing.T) {
+	provider := &fakeProvider{}
+	fr := &fakeRouter{}
+	svc := proxy.NewService(fr, map[string]providers.Client{
+		providers.ProviderOpenAI: provider,
+	}, nil, false, nil, nil, false, providers.ProviderOpenAI, "gpt-5.6-terra", nil)
+	ctx := context.WithValue(context.Background(), proxy.ClientIdentityContextKey{}, proxy.ClientIdentity{ClientApp: proxy.ClientAppCodex})
+	body := []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"$rf +"},{"type":"message","role":"user","content":"<skill>\n<name>rf</name>\nrun the feedback skill\n</skill>"},{"type":"custom_tool_call","call_id":"call_skill","name":"exec","input":"..."},{"type":"custom_tool_call_output","call_id":"call_skill","output":[{"type":"input_text","text":"Script completed\nOutput:\n /router-feedback +\n"}]}]}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
+
+	require.NoError(t, svc.ProxyOpenAIResponses(ctx, body, rec, req))
+	assert.Empty(t, provider.proxyBodies, "a Codex feedback skill must not dispatch a model turn")
+	assert.Zero(t, fr.routeCalls, "a Codex feedback skill must be answered before routing")
+	assert.Contains(t, rec.Body.String(), "Feedback recorded 👍")
 }
 
 // A direct-OpenAI Responses caller dispatches on its original bytes rather
@@ -363,6 +384,7 @@ func TestService_ProxyOpenAIResponses_StaysNativeForDirectOpenAI(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
 
 			require.NoError(t, svc.ProxyOpenAIResponses(ctx, body, rec, req))
+			assertContextHeaders(t, rec.Header())
 			require.Len(t, provider.proxyBodies, 1)
 			assert.Equal(t, tc.wantEndpoint, provider.proxyEndpoints[0])
 			assert.Equal(t, tc.model, gjson.GetBytes(provider.proxyBodies[0], "model").Str)
@@ -467,14 +489,14 @@ func TestService_ProxyOpenAIResponses_ToolTurnFallsBackWhenEndpointLacksResponse
 // markerReasonBestPickForTest mirrors proxy's unexported markerReasonBestPick.
 const markerReasonBestPickForTest = "best pick for this turn"
 
-func TestService_ProxyOpenAIResponses_NativeBadgeIsCodexOnlyAndHonorsSuppression(t *testing.T) {
+func TestService_ProxyOpenAIResponses_NativeBadgeForTerminalClientsHonorsSuppression(t *testing.T) {
 	const native = "event: response.output_text.delta\n" +
 		"data: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n" +
 		"event: response.output_item.done\n" +
 		"data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n" +
 		"event: response.completed\n" +
 		"data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6-terra\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"
-	const priorBadge = "\u2063\u2060\u2063\u2060**Weave Router** — gpt-5.6-sol\n\nold answer"
+	const priorBadge = "\u2063\u2060\u2063\u2060**Weave Router** — gpt-5.6-sol\n\nold answer\n\n_Weave Router feedback:_ /rf + good experience"
 
 	for _, tc := range []struct {
 		name       string
@@ -487,7 +509,9 @@ func TestService_ProxyOpenAIResponses_NativeBadgeIsCodexOnlyAndHonorsSuppression
 		{name: "Codex", clientApp: proxy.ClientAppCodex, wantBadge: true, wantStrip: true},
 		{name: "Codex marker opt-out", clientApp: proxy.ClientAppCodex, marker: "off", wantStrip: true},
 		{name: "Codex suggestion mode", clientApp: proxy.ClientAppCodex, suggestion: true, wantStrip: true},
-		{name: "non-Codex", clientApp: proxy.ClientAppOpencode},
+		{name: "OpenCode", clientApp: proxy.ClientAppOpencode, wantBadge: true, wantStrip: true},
+		{name: "OpenCode marker opt-out", clientApp: proxy.ClientAppOpencode, marker: "off", wantStrip: true},
+		{name: "non-terminal Responses client"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
@@ -507,7 +531,7 @@ func TestService_ProxyOpenAIResponses_NativeBadgeIsCodexOnlyAndHonorsSuppression
 			ctx := context.WithValue(context.Background(), proxy.OpenAISubscriptionContextKey{}, "eyJhbGciOiJSUzI1NiJ9.codex.sig")
 			ctx = context.WithValue(ctx, proxy.OpenAIAccountIDContextKey{}, "acct-123")
 			ctx = context.WithValue(ctx, proxy.ClientIdentityContextKey{}, proxy.ClientIdentity{ClientApp: tc.clientApp})
-			body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\u2063\u2060\u2063\u2060**Weave Router** — gpt-5.6-sol\n\nold answer"}]},{"type":"message","role":"user","content":"continue"}]}`)
+			body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\u2063\u2060\u2063\u2060**Weave Router** — gpt-5.6-sol\n\nold answer\n\n_Weave Router feedback:_ /rf + good experience"}]},{"type":"message","role":"user","content":"continue"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]},{"type":"function_call","call_id":"call_shell","name":"shell","arguments":"{}"}]}`)
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
 			if tc.marker != "" {
@@ -523,17 +547,103 @@ func TestService_ProxyOpenAIResponses_NativeBadgeIsCodexOnlyAndHonorsSuppression
 			upstreamHistory := gjson.GetBytes(provider.proxyBodies[0], "input.0.content.0.text").Str
 			if tc.wantStrip {
 				assert.Equal(t, "old answer", upstreamHistory)
+				nativeInput := gjson.GetBytes(provider.proxyBodies[0], "input").Array()
+				require.Len(t, nativeInput, 3)
+				assert.Equal(t, "function_call", nativeInput[2].Get("type").Str)
+				assert.Equal(t, "call_shell", nativeInput[2].Get("call_id").Str)
 			} else {
 				assert.Equal(t, priorBadge, upstreamHistory)
+				nativeInput := gjson.GetBytes(provider.proxyBodies[0], "input").Array()
+				require.Len(t, nativeInput, 4)
+				assert.Equal(t, "message", nativeInput[2].Get("type").Str)
 			}
 			if tc.wantBadge {
 				assert.Contains(t, rec.Body.String(), "✦ **Weave Router** → gpt-5.6-terra · "+markerReasonBestPickForTest)
 				assert.NotEqual(t, native, rec.Body.String())
 			} else {
-				assert.Equal(t, native, rec.Body.String(), "suppressed and non-Codex clients retain byte identity")
+				assert.Equal(t, native, rec.Body.String(), "suppressed and non-terminal clients retain byte identity")
 			}
 		})
 	}
+}
+
+func TestService_ProxyOpenAIResponses_OpenCodeStripsTerminalArtifactsBeforeTranslation(t *testing.T) {
+	provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}}
+	fr := &fakeRouter{decision: router.Decision{Provider: providers.ProviderTogether, Model: "z-ai/glm-5.1", Reason: "test"}}
+	svc := proxy.NewService(fr, map[string]providers.Client{
+		providers.ProviderTogether:  provider,
+		providers.ProviderFireworks: provider,
+	}, nil, false, nil, nil, false, providers.ProviderOpenAI, "gpt-5.6-sol", nil)
+
+	ctx := context.WithValue(context.Background(), proxy.ClientIdentityContextKey{}, proxy.ClientIdentity{ClientApp: proxy.ClientAppOpencode})
+	body := []byte(`{"model":"auto","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"⁣⁠⁣⁠**Weave Router** — gpt-5.6-sol\n\nold answer\n\n_Weave Router feedback:_ /rf + good experience"}]},{"type":"message","role":"user","content":"continue"}]}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
+
+	require.NoError(t, svc.ProxyOpenAIResponses(ctx, body, rec, req))
+	require.Len(t, provider.proxyBodies, 1)
+	assert.Equal(t, "old answer", gjson.GetBytes(provider.proxyBodies[0], "messages.0.content").Str)
+}
+
+func TestService_ProxyOpenAIResponses_TranslatedMarkerOptOutPreservesStream(t *testing.T) {
+	const upstream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	together := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, upstream)
+	}}
+	fr := &fakeRouter{decision: router.Decision{
+		Provider: providers.ProviderTogether,
+		Model:    "z-ai/glm-5.1",
+		Reason:   "test",
+	}}
+	svc := proxy.NewService(fr, map[string]providers.Client{
+		providers.ProviderTogether: together,
+		providers.ProviderFireworks: &fakeProvider{
+			proxyResponse: together.proxyResponse,
+		},
+	}, nil, false, nil, nil, false, providers.ProviderOpenAI, "gpt-5.6-sol", nil)
+
+	ctx := context.WithValue(context.Background(), proxy.ClientIdentityContextKey{}, proxy.ClientIdentity{ClientApp: proxy.ClientAppCodex})
+	body := []byte(`{"model":"gpt-5.6-luna","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"say hello"}]}]}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
+	req.Header.Set("X-Weave-Routing-Marker", "off")
+
+	require.NoError(t, svc.ProxyOpenAIResponses(ctx, body, rec, req))
+	assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	assert.Equal(t, []string{"hello"}, responsesTextDeltas(t, rec.Body.Bytes()))
+	assert.NotContains(t, rec.Body.String(), "Weave Router")
+}
+
+func TestService_ProxyOpenAIResponses_NativeMarkerOptOutPreservesContentType(t *testing.T) {
+	terminal := "event: response.completed\n" +
+		`data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_1","status":"completed","model":"gpt-5.6-sol","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":120,"output_tokens":8}}}` + "\n\n"
+	openAI := &fakeProvider{proxyResponse: nativeResponsesStream(terminal)}
+	fr := &fakeRouter{decision: router.Decision{
+		Provider: providers.ProviderOpenAI,
+		Model:    "gpt-5.6-sol",
+		Reason:   "test",
+	}}
+	svc := proxy.NewService(fr, map[string]providers.Client{
+		providers.ProviderOpenAI: openAI,
+	}, nil, false, nil, nil, false, providers.ProviderOpenAI, "gpt-5.6-sol", nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"type":"reasoning","id":"rs_0","encrypted_content":"opaque"},{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
+	req.Header.Set("X-Weave-Routing-Marker", "off")
+
+	require.NoError(t, svc.ProxyOpenAIResponses(codexNativeResponsesCtx(), body, rec, req))
+	assert.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	assert.Contains(t, rec.Body.String(), `"type":"response.completed"`)
+	assert.NotContains(t, rec.Body.String(), "✦ **Weave Router**")
 }
 
 // A first Codex turn must show the marker even when the action is tool-call-only;
@@ -618,7 +728,7 @@ func responsesTextDeltas(t *testing.T, raw []byte) []string {
 func TestService_CodexRequestRoutesInfrastructureOpenAIModelWithoutOAuth(t *testing.T) {
 	provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[]}`)
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}`)
 	}}
 	fr := &fakeRouter{decision: router.Decision{
 		Provider: providers.ProviderOpenAI,
@@ -656,7 +766,7 @@ func TestService_CodexForcedModelUsesModelScopedCredential(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[]}`)
+				_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}]}`)
 			}}
 			store := newFakePinStore()
 			store.hasPin = true
@@ -812,7 +922,8 @@ func (f *fakeProvider) Passthrough(ctx context.Context, prep providers.PreparedR
 }
 
 func makeProxyService(decision router.Decision, p map[string]providers.Client) *proxy.Service {
-	return proxy.NewService(&fakeRouter{decision: decision}, p, nil, false, nil, nil, false, providers.ProviderAnthropic, "claude-haiku-4-5", nil)
+	return proxy.NewService(&fakeRouter{decision: decision}, p, nil, false, nil, nil, false, providers.ProviderAnthropic, "claude-haiku-4-5", nil).
+		WithRetrySleep(noRetrySleep)
 }
 
 // TestService_PassthroughToNamedProvider_ResolvesBYOKCredential: passthrough
@@ -1003,7 +1114,7 @@ func TestService_ProxyMessages_EmbedOnlyUserMessageFlag(t *testing.T) {
 		"messages":[
 			{"role":"user","content":"` + firstUserPrompt + `"},
 			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"go.mod"}}]},
-			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"module workweave/router\n\ngo 1.23\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n)"}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"module weave-os/router\n\ngo 1.23\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n)"}]},
 			{"role":"user","content":"` + secondUserPrompt + `"}
 		]
 	}`)
@@ -1236,6 +1347,7 @@ func TestService_ProxyOpenAIChatCompletion_NativeOpenAI(t *testing.T) {
 	})
 	err := svc.ProxyOpenAIChatCompletion(ctx, []byte(body), rec, httpReq)
 	require.NoError(t, err)
+	assertContextHeaders(t, rec.Header())
 
 	require.Len(t, provider.proxyBodies, 1)
 	assert.Equal(t, providers.EndpointChatCompletions, provider.proxyEndpoints[0])
@@ -1370,8 +1482,8 @@ func TestService_CodexPassthrough_RoutesFreelyWithBothSubs(t *testing.T) {
 	svc := proxy.NewService(fr, providerMap, nil, false, nil, nil, false, providers.ProviderAnthropic, "claude-sonnet-4-6", nil).
 		WithByokOnly(true)
 
-	// Both subscriptions presented via the dedicated headers (stashed on ctx by
-	// the auth middleware): a Codex sub (token + account-id) and a Claude sub.
+	// Both subscriptions presented on the authenticated request: a Codex sub
+	// (token + account-id) and a Claude sub.
 	ctx := context.WithValue(context.Background(), proxy.OpenAISubscriptionContextKey{}, "eyJhbGciOiJSUzI1NiJ9.codex.sig")
 	ctx = context.WithValue(ctx, proxy.OpenAIAccountIDContextKey{}, "acct-123")
 	ctx = context.WithValue(ctx, proxy.AnthropicSubscriptionContextKey{}, "sk-ant-oat01-subscription-token")
@@ -1521,4 +1633,56 @@ func TestService_ExcludedModelsThroughRequest(t *testing.T) {
 		assert.True(t, svc.HasExcludedModelsOverride())
 		assert.Equal(t, []string{"gpt-4o"}, svc.ExcludedModelsOverride())
 	})
+}
+
+// The native Responses body is dispatched verbatim, so the arm's level has to
+// be written onto it — otherwise an effort-qualified arm serves at whatever
+// level the caller sent.
+func TestService_ProxyOpenAIResponses_NativeDispatchAppliesArmEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		armEffort  string
+		wantEffort string
+	}{
+		{name: "arm level within the target's menu", armEffort: "low", wantEffort: "low"},
+		{name: "the top level reaches the wire unclamped", armEffort: "xhigh", wantEffort: "xhigh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &fakeProvider{proxyResponse: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+			}}
+			fr := &fakeRouter{decision: router.Decision{
+				Provider: providers.ProviderOpenAI,
+				Model:    "gpt-5.6-luna",
+				Effort:   tc.armEffort,
+				Reason:   "test",
+			}}
+			svc := proxy.NewService(fr, map[string]providers.Client{
+				providers.ProviderOpenAI: provider,
+			}, nil, false, nil, nil, false, providers.ProviderOpenAI, "gpt-5.6-sol", nil)
+
+			ctx := context.WithValue(context.Background(), proxy.ClientIdentityContextKey{}, proxy.ClientIdentity{ClientApp: proxy.ClientAppOpencode})
+			body := []byte(`{"model":"auto","input":"remove the router","reasoning":{"effort":"medium","summary":"auto"}}`)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
+
+			require.NoError(t, svc.ProxyOpenAIResponses(ctx, body, rec, req))
+			require.Len(t, provider.proxyBodies, 1)
+			assert.Equal(t, tc.wantEffort, gjson.GetBytes(provider.proxyBodies[0], "reasoning.effort").Str)
+			assert.Equal(t, "auto", gjson.GetBytes(provider.proxyBodies[0], "reasoning.summary").Str,
+				"unrelated native fields survive")
+			assert.Equal(t, "remove the router", gjson.GetBytes(provider.proxyBodies[0], "input").Str)
+		})
+	}
+}
+
+func assertContextHeaders(t *testing.T, headers http.Header) {
+	t.Helper()
+	require.Equal(t, "1", headers.Get(proxy.HeaderRouterContextVersion))
+	require.Equal(t, "approximate", headers.Get(proxy.HeaderRouterContextEstimateKind))
+	require.Equal(t, "8000", headers.Get(proxy.HeaderRouterContextReserve))
+	require.NotEmpty(t, headers.Get(proxy.HeaderRouterContextEstimate))
+	require.NotEqual(t, "0", headers.Get(proxy.HeaderRouterContextEstimate))
 }

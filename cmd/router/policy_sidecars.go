@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/policy"
 )
 
 const maxConfiguredPolicySidecars = 16
@@ -22,12 +22,15 @@ const maxConfiguredPolicySidecars = 16
 var configuredPolicyStrategyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
 var reservedPolicyStrategies = map[router.Strategy]struct{}{
-	router.StrategyCluster:      {},
-	router.StrategyRL:           {},
-	router.StrategyHMM:          {},
-	router.StrategyHMMEmbedding: {},
-	router.StrategyHMMBeta:      {},
-	router.StrategyBandit:       {},
+	router.StrategyLLMClassifier: {},
+	router.StrategyCluster:       {},
+	router.StrategyRL:            {},
+	router.StrategyHMM:           {},
+	router.StrategyHMMEmbedding:  {},
+	router.StrategyHMMBeta:       {},
+	router.StrategyHMMQwen:       {},
+	router.StrategyDecisionModel: {},
+	router.StrategyBandit:        {},
 }
 
 // buildConfiguredPolicySidecars turns a JSON strategy-to-URL map into policy.StrategySpec registrations; sidecars own model logic, the router owns candidate resolution and lifecycle.

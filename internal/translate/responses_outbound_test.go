@@ -1,6 +1,7 @@
 package translate_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,9 +27,9 @@ func gjsonStopReason(b []byte) string {
 	return s
 }
 
-func openAIReasoningTestSignature(t *testing.T, id, enc string) string {
+func openAIReasoningTestSignature(t *testing.T, id, enc, scope string) string {
 	t.Helper()
-	b, err := json.Marshal(map[string]any{"v": 1, "provider": "openai", "id": id, "enc": enc})
+	b, err := json.Marshal(map[string]any{"v": 1, "provider": "openai", "id": id, "enc": enc, "scope": scope})
 	require.NoError(t, err)
 	return base64.StdEncoding.EncodeToString(b)
 }
@@ -126,9 +127,121 @@ func TestPrepareOpenAIResponses_RequestShape(t *testing.T) {
 	assert.Equal(t, providers.EndpointResponses, prep.Endpoint)
 }
 
+// Unknown tool calls stay in Anthropic history for the client's feedback loop,
+// but OpenAI Responses only accepts the restricted function-name alphabet.
+func TestPrepareOpenAIResponses_SanitizesHistoricalToolName(t *testing.T) {
+	body := []byte(`{
+      "model":"claude-opus-5",
+      "messages":[
+        {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"dots schema search --scope all","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}
+      ]
+    }`)
+	env, err := translate.ParseAnthropic(body)
+	require.NoError(t, err)
+	prep, err := env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{
+		TargetModel:  "gpt-5.6-luna",
+		Capabilities: router.Lookup("gpt-5.6-luna"),
+	})
+	require.NoError(t, err)
+
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(prep.Body, &out))
+	input, _ := out["input"].([]any)
+	require.Len(t, input, 2)
+	call, _ := input[0].(map[string]any)
+	assert.Regexp(t, `^dots_schema_search_--scope_all_[0-9a-f]{10}$`, call["name"])
+	assert.Equal(t, "dots schema search --scope all", prep.ResponseToolNames[call["name"].(string)])
+}
+
+func topLevelResponsesFields(t *testing.T, body []byte) []string {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	token, err := decoder.Token()
+	require.NoError(t, err)
+	require.Equal(t, json.Delim('{'), token)
+
+	fields := make([]string, 0)
+	for decoder.More() {
+		token, err = decoder.Token()
+		require.NoError(t, err)
+		field, ok := token.(string)
+		require.True(t, ok, "top-level JSON key must be a string")
+		var value json.RawMessage
+		require.NoError(t, decoder.Decode(&value))
+		fields = append(fields, field)
+	}
+
+	token, err = decoder.Token()
+	require.NoError(t, err)
+	require.Equal(t, json.Delim('}'), token)
+	return fields
+}
+
+func responseFieldIndex(fields []string, want string) int {
+	for index, field := range fields {
+		if field == want {
+			return index
+		}
+	}
+	return -1
+}
+
+// The Responses body keeps static controls ahead of append-only conversation
+// input so those controls remain in the cacheable prefix across turns.
+func TestPrepareOpenAIResponses_StaticFieldsPrecedeInput(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		parse      func([]byte) (*translate.RequestEnvelope, error)
+		body       string
+		staticKeys []string
+	}{
+		{
+			name:  "Anthropic source",
+			parse: translate.ParseAnthropic,
+			body: `{"model":"claude-opus-4-8","max_tokens":1024,
+				"system":"You are helpful.",
+				"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"}}],
+				"tool_choice":{"type":"auto"},
+				"temperature":0.7,"top_p":0.9,
+				"messages":[{"role":"user","content":"hi"}]}`,
+			staticKeys: []string{"tools", "tool_choice", "max_output_tokens", "temperature", "top_p"},
+		},
+		{
+			name:  "OpenAI chat source",
+			parse: translate.ParseOpenAI,
+			body: `{"model":"gpt-4.1","max_tokens":1024,
+				"tools":[{"type":"function","function":{"name":"bash","description":"run","parameters":{"type":"object"}}}],
+				"tool_choice":"auto","parallel_tool_calls":false,
+				"temperature":0.7,"top_p":0.9,
+				"messages":[{"role":"user","content":"hi"}]}`,
+			staticKeys: []string{"tools", "tool_choice", "parallel_tool_calls", "max_output_tokens", "temperature", "top_p"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := tc.parse([]byte(tc.body))
+			require.NoError(t, err)
+			prepared, err := env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{
+				TargetModel:  "gpt-4.1",
+				Capabilities: router.Lookup("gpt-4.1"),
+			})
+			require.NoError(t, err)
+
+			fields := topLevelResponsesFields(t, prepared.Body)
+			inputIndex := responseFieldIndex(fields, "input")
+			require.NotEqual(t, -1, inputIndex, "Responses body must include input")
+			for _, key := range tc.staticKeys {
+				fieldIndex := responseFieldIndex(fields, key)
+				require.NotEqual(t, -1, fieldIndex, "Responses body must include %q", key)
+				assert.Less(t, fieldIndex, inputIndex, "%q must precede input", key)
+			}
+		})
+	}
+}
+
 // TestPrepareOpenAIResponses_ToolChoiceVariants covers the Anthropic ->
-// Responses tool_choice mapping for "any" and named-tool; "auto" is covered
-// by TestPrepareOpenAIResponses_RequestShape.
+// Responses tool_choice mapping for "any", "none", and named-tool; "auto" is
+// covered by TestPrepareOpenAIResponses_RequestShape.
 func TestPrepareOpenAIResponses_ToolChoiceVariants(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -136,6 +249,7 @@ func TestPrepareOpenAIResponses_ToolChoiceVariants(t *testing.T) {
 		want       any
 	}{
 		{"any", `{"type":"any"}`, "required"},
+		{"none", `{"type":"none"}`, "none"},
 		{"tool", `{"type":"tool","name":"bash"}`, map[string]any{"type": "function", "name": "bash"}},
 	}
 	for _, tc := range cases {
@@ -244,7 +358,7 @@ func TestPrepareOpenAIResponses_ClampsGeminiThoughtSignatureCallID(t *testing.T)
 }
 
 func TestPrepareOpenAIResponses_ReplaysSignedReasoning(t *testing.T) {
-	sig := openAIReasoningTestSignature(t, "rs_prev", "enc_prev")
+	sig := openAIReasoningTestSignature(t, "rs_prev", "enc_prev", "scope_a")
 	body := []byte(`{
 		"model":"claude-opus-4-8","max_tokens":1024,
 		"thinking":{"type":"enabled","budget_tokens":8192},
@@ -259,7 +373,7 @@ func TestPrepareOpenAIResponses_ReplaysSignedReasoning(t *testing.T) {
 	}`)
 	env, err := translate.ParseAnthropic(body)
 	require.NoError(t, err)
-	prep, err := env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{TargetModel: "gpt-5.5", Capabilities: router.Lookup("gpt-5.5"), ForceReasoningEffort: "high"})
+	prep, err := env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{TargetModel: "gpt-5.5", Capabilities: router.Lookup("gpt-5.5"), ForceReasoningEffort: "high", ReasoningReplayScope: "scope_a"})
 	require.NoError(t, err)
 
 	var out map[string]any
@@ -278,8 +392,74 @@ func TestPrepareOpenAIResponses_ReplaysSignedReasoning(t *testing.T) {
 	assert.Equal(t, "toolu_1", toolCall["call_id"])
 }
 
+func TestPrepareOpenAIResponses_ReplaysOnlyCurrentTurnReasoning(t *testing.T) {
+	prior := openAIReasoningTestSignature(t, "rs_prior", "enc_prior", "scope_a")
+	promptBLoop := openAIReasoningTestSignature(t, "rs_loop", "enc_loop", "scope_a")
+	current := openAIReasoningTestSignature(t, "rs_current", "enc_current", "scope_a")
+	priorCarrierID := "toolu_0__openai_reasoning__" + base64.RawURLEncoding.EncodeToString([]byte(prior))
+	head := `
+		{"role":"user","content":"prompt A"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"` + priorCarrierID + `","name":"Read","input":{"file_path":"a.go"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + priorCarrierID + `","content":"ok"}]},
+		{"role":"assistant","content":[{"type":"text","text":"answer A"}]},
+		{"role":"user","content":[{"type":"text","text":"prompt B"}]},
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"","signature":` + strconv.Quote(promptBLoop) + `},
+			{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"main.go"}}
+		]},`
+	tail := `,
+		{"role":"assistant","content":[
+			{"type":"thinking","thinking":"","signature":` + strconv.Quote(current) + `},
+			{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"go.mod"}}
+		]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"ok"}]}`
+
+	cases := []struct {
+		name        string
+		loopResults string
+		want        []any
+	}{
+		{
+			name:        "tool results continue the prompt B loop",
+			loopResults: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}`,
+			want:        []any{"rs_loop", "rs_current"},
+		},
+		{
+			name:        "injected reminder beside tool results continues the loop",
+			loopResults: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"},{"type":"text","text":"<system-reminder>todo list changed</system-reminder>"}]}`,
+			want:        []any{"rs_loop", "rs_current"},
+		},
+		{
+			name:        "typed prompt beside tool results starts a new turn",
+			loopResults: `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"},{"type":"text","text":"prompt C"}]}`,
+			want:        []any{"rs_current"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"claude-opus-4-8","max_tokens":1024,"messages":[` + head + tc.loopResults + tail + `]}`)
+			env, err := translate.ParseAnthropic(body)
+			require.NoError(t, err)
+			prep, err := env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{TargetModel: "gpt-5.5", Capabilities: router.Lookup("gpt-5.5"), ReasoningReplayScope: "scope_a"})
+			require.NoError(t, err)
+
+			var out struct {
+				Input []map[string]any `json:"input"`
+			}
+			require.NoError(t, json.Unmarshal(prep.Body, &out))
+			var replayed []any
+			for _, item := range out.Input {
+				if item["type"] == "reasoning" {
+					replayed = append(replayed, item["id"])
+				}
+			}
+			assert.Equal(t, tc.want, replayed)
+		})
+	}
+}
+
 func TestPrepareOpenAIResponses_ReplaysSignedReasoningAfterModelSwitch(t *testing.T) {
-	sig := openAIReasoningTestSignature(t, "rs_prev", "enc_prev")
+	sig := openAIReasoningTestSignature(t, "rs_prev", "enc_prev", "scope_a")
 	body := []byte(`{
 		"model":"claude-opus-4-8","max_tokens":1024,
 		"thinking":{"type":"enabled","budget_tokens":8192},
@@ -300,6 +480,7 @@ func TestPrepareOpenAIResponses_ReplaysSignedReasoningAfterModelSwitch(t *testin
 		Capabilities:         router.Lookup("gpt-5.5"),
 		ModelSwitched:        true,
 		ForceReasoningEffort: "high",
+		ReasoningReplayScope: "scope_a",
 	})
 	require.NoError(t, err)
 
@@ -313,6 +494,61 @@ func TestPrepareOpenAIResponses_ReplaysSignedReasoningAfterModelSwitch(t *testin
 	assert.Equal(t, "enc_prev", reasoning["encrypted_content"])
 	toolCall, _ := input[3].(map[string]any)
 	assert.Equal(t, "toolu_1", toolCall["call_id"])
+}
+
+// Encrypted reasoning is bound to the account+model that produced it: Cortex
+// answers "encrypted reasoning was created for a different account or model"
+// and the rejected turn ends the client session, so a turn dispatched
+// anywhere else drops the item instead of replaying it.
+func TestPrepareOpenAIResponses_DropsReasoningMintedOnAnotherAccount(t *testing.T) {
+	sig := openAIReasoningTestSignature(t, "rs_prev", "enc_prev", "scope_a")
+	// Claude Code drops the thinking block but echoes the tool_use id, so the
+	// envelope rides on both carriers and both must honor the scope.
+	carrierID := "toolu_1__openai_reasoning__" + base64.RawURLEncoding.EncodeToString([]byte(sig))
+	body := []byte(`{
+		"model":"claude-opus-4-8","max_tokens":1024,
+		"thinking":{"type":"enabled","budget_tokens":8192},
+		"messages":[
+			{"role":"user","content":"continue"},
+			{"role":"assistant","content":[
+				{"type":"text","text":"I'll inspect it."},
+				{"type":"thinking","thinking":"summary","signature":` + strconv.Quote(sig) + `},
+				{"type":"tool_use","id":` + strconv.Quote(carrierID) + `,"name":"Read","input":{"file_path":"main.go"}}
+			]}
+		]
+	}`)
+	env, err := translate.ParseAnthropic(body)
+	require.NoError(t, err)
+
+	for name, scope := range map[string]string{
+		"another account or model": "scope_b",
+		"unknown target":           "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			prep, err := env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{
+				TargetModel:          "gpt-5.5",
+				Capabilities:         router.Lookup("gpt-5.5"),
+				ForceReasoningEffort: "high",
+				ReasoningReplayScope: scope,
+			})
+			require.NoError(t, err)
+
+			var out map[string]any
+			require.NoError(t, json.Unmarshal(prep.Body, &out))
+			input, _ := out["input"].([]any)
+			var toolCall map[string]any
+			for _, item := range input {
+				m, _ := item.(map[string]any)
+				require.NotEqual(t, "reasoning", m["type"], "foreign encrypted reasoning must not be replayed")
+				if m["type"] == "function_call" {
+					toolCall = m
+				}
+			}
+			// The turn still goes out; only the undecryptable item is dropped.
+			require.NotNil(t, toolCall)
+			assert.Equal(t, "toolu_1", toolCall["call_id"])
+		})
+	}
 }
 
 // Explicit levels retain their client-selected value; GPT-5 no longer promotes
@@ -345,7 +581,7 @@ func TestResponsesToAnthropicResponse(t *testing.T) {
       ],
       "usage":{"input_tokens":1200,"output_tokens":340,"output_tokens_details":{"reasoning_tokens":256},"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":256}}
     }`)
-	out, err := translate.ResponsesToAnthropicResponse(body, "gpt-5.5")
+	out, err := translate.ResponsesToAnthropicResponse(body, "gpt-5.5", "scope_a")
 	require.NoError(t, err)
 	var msg map[string]any
 	require.NoError(t, json.Unmarshal(out, &msg))
@@ -386,16 +622,16 @@ func TestResponsesToAnthropicResponse(t *testing.T) {
 func TestResponsesToAnthropicResponse_StopReasons(t *testing.T) {
 	// max tokens
 	mx := []byte(`{"id":"r","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}],"usage":{"input_tokens":1,"output_tokens":2}}`)
-	out, err := translate.ResponsesToAnthropicResponse(mx, "gpt-5.5")
+	out, err := translate.ResponsesToAnthropicResponse(mx, "gpt-5.5", "scope_a")
 	require.NoError(t, err)
 	assert.Equal(t, "max_tokens", gjsonStopReason(out))
 	// plain end_turn
 	et := []byte(`{"id":"r","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":1,"output_tokens":2}}`)
-	out, err = translate.ResponsesToAnthropicResponse(et, "gpt-5.5")
+	out, err = translate.ResponsesToAnthropicResponse(et, "gpt-5.5", "scope_a")
 	require.NoError(t, err)
 	assert.Equal(t, "end_turn", gjsonStopReason(out))
 	filtered := []byte(`{"id":"r","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}`)
-	_, err = translate.ResponsesToAnthropicResponse(filtered, "gpt-5.5")
+	_, err = translate.ResponsesToAnthropicResponse(filtered, "gpt-5.5", "scope_a")
 	require.Error(t, err)
 }
 

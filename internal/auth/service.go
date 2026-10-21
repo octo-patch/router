@@ -5,14 +5,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
-	"workweave/router/internal/flags"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
+	"weave-os/router/internal/flags"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"golang.org/x/sync/singleflight"
 )
 
 // ErrUnknownModel is returned when a requested model ID is not in the caller-supplied allowed set.
@@ -51,6 +53,11 @@ var ErrInvalidEntraAuth = errors.New("auth: invalid Microsoft Entra auth")
 
 type Clock func() time.Time
 
+const (
+	blindExperimentFetchTimeout  = 5 * time.Second
+	blindExperimentFetchAttempts = 3
+)
+
 // InstallationChangeNotifier fans out installation-change events to peer replicas.
 // Fire-and-forget: implementations must not block the caller.
 type InstallationChangeNotifier interface {
@@ -65,19 +72,27 @@ func (NoOpInstallationChangeNotifier) NotifyInstallationChanged(string) {}
 
 // Service authenticates incoming bearer tokens. Identity only; routing/dispatch lives in proxy.Service.
 type Service struct {
-	installations         InstallationRepository
-	apiKeys               APIKeyRepository
-	externalKeys          ExternalAPIKeyRepository
-	users                 UserRepository
-	clusterModelLists     ClusterModelListRepository
-	userClusterModelLists UserClusterModelListRepository
-	cache                 APIKeyCache
-	userCache             UserCache
-	userClusterCache      UserClusterListCache
-	notifier              InstallationChangeNotifier
-	now                   Clock
-	encryptor             Encryptor
-	keypairTokens         *KeypairTokenCache
+	installations           InstallationRepository
+	apiKeys                 APIKeyRepository
+	credentialSubjects      CredentialSubjectLookup
+	externalKeys            ExternalAPIKeyRepository
+	users                   UserRepository
+	clusterModelLists       ClusterModelListRepository
+	userClusterModelLists   UserClusterModelListRepository
+	blindExperiments        BlindExperimentRepository
+	routingPolicies         RoutingPolicyRepository
+	routingPolicyCache      *RoutingPolicyCache
+	cache                   APIKeyCache
+	userCache               UserCache
+	userClusterCache        UserClusterListCache
+	blindExperimentCache    BlindExperimentCache
+	blindExperimentFetches  singleflight.Group
+	subscriptionAccounts    SubscriptionAccountRepository
+	codexEnrollmentVerifier CodexEnrollmentVerifier
+	notifier                InstallationChangeNotifier
+	now                     Clock
+	encryptor               Encryptor
+	keypairTokens           *KeypairTokenCache
 	// wifTokens is nil unless the deployment runs with a workload identity;
 	// WIF keys are then dropped rather than sent without a credential.
 	wifTokens WIFTokenSource
@@ -99,6 +114,37 @@ type Service struct {
 	// adminLoginFailures throttles per-IP brute-force login attempts.
 	adminLoginFailures *expirable.LRU[string, int]
 	adminLoginMu       sync.Mutex
+
+	onboarding OnboardingObserver
+}
+
+// WithSubscriptionAccounts wires encrypted server-side subscription storage.
+func (s *Service) WithSubscriptionAccounts(repo SubscriptionAccountRepository) *Service {
+	s.subscriptionAccounts = repo
+	return s
+}
+
+// WithCodexEnrollmentVerifier verifies provider identity before account storage.
+func (s *Service) WithCodexEnrollmentVerifier(verifier CodexEnrollmentVerifier) *Service {
+	s.codexEnrollmentVerifier = verifier
+	return s
+}
+
+// WithCredentialSubjectLookup wires the current eligibility projection used by read-only key checks.
+func (s *Service) WithCredentialSubjectLookup(lookup CredentialSubjectLookup) *Service {
+	s.credentialSubjects = lookup
+	return s
+}
+
+// WithOnboardingObserver attaches an optional observer before serving requests.
+func (s *Service) WithOnboardingObserver(observer OnboardingObserver) *Service {
+	s.onboarding = observer
+	return s
+}
+
+// CurrentTime returns the service clock's current time.
+func (s *Service) CurrentTime() time.Time {
+	return s.now()
 }
 
 func NewService(
@@ -114,17 +160,19 @@ func NewService(
 		userCache = NoOpUserCache{}
 	}
 	return &Service{
-		installations:    installations,
-		apiKeys:          apiKeys,
-		externalKeys:     externalKeys,
-		users:            users,
-		cache:            cache,
-		userCache:        userCache,
-		userClusterCache: NoOpUserClusterListCache{},
-		notifier:         NoOpInstallationChangeNotifier{},
-		now:              now,
-		encryptor:        NoOpEncryptor{},
-		keypairTokens:    NewKeypairTokenCache(now),
+		installations:        installations,
+		apiKeys:              apiKeys,
+		externalKeys:         externalKeys,
+		users:                users,
+		cache:                cache,
+		userCache:            userCache,
+		userClusterCache:     NoOpUserClusterListCache{},
+		blindExperimentCache: NoOpBlindExperimentCache{},
+		routingPolicyCache:   NewRoutingPolicyCache(5 * time.Minute),
+		notifier:             NoOpInstallationChangeNotifier{},
+		now:                  now,
+		encryptor:            NoOpEncryptor{},
+		keypairTokens:        NewKeypairTokenCache(now),
 	}
 }
 
@@ -166,6 +214,91 @@ func (s *Service) WithUserClusterModelLists(repo UserClusterModelListRepository,
 	return s
 }
 
+// WithBlindExperiments wires the control-plane-owned experiment assignment
+// repository and its installation-invalidated cache.
+func (s *Service) WithBlindExperiments(repo BlindExperimentRepository, cache BlindExperimentCache) *Service {
+	s.blindExperiments = repo
+	if cache == nil {
+		cache = NoOpBlindExperimentCache{}
+	}
+	s.blindExperimentCache = cache
+	return s
+}
+
+// WithRoutingPolicies wires generic installation policy and user-assignment reads.
+func (s *Service) WithRoutingPolicies(repo RoutingPolicyRepository, cache *RoutingPolicyCache) *Service {
+	s.routingPolicies = repo
+	if cache != nil {
+		s.routingPolicyCache = cache
+	}
+	return s
+}
+
+// WithRoutingPolicy loads the policy even when the request has no user identity.
+func (s *Service) WithRoutingPolicy(ctx context.Context, installationID string) (context.Context, error) {
+	if s.routingPolicies == nil {
+		return ctx, nil
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		generation := s.routingPolicyCache.generation(installationID)
+		policy, found := s.routingPolicyCache.policy(installationID, generation)
+		if !found {
+			var err error
+			policy, err = s.routingPolicies.GetPolicy(ctx, installationID)
+			if err != nil {
+				return ctx, fmt.Errorf("load installation routing policy: %w: %w", err, ErrRoutingPolicyUnavailable)
+			}
+			if !s.routingPolicyCache.setPolicy(installationID, generation, policy) {
+				continue
+			}
+		}
+		if policy.Mode != RoutingPolicyInherit && policy.Mode != RoutingPolicyPassthrough && policy.Mode != RoutingPolicyAssigned {
+			return ctx, fmt.Errorf("unrecognized installation routing mode %q: %w", policy.Mode, ErrRoutingPolicyUnavailable)
+		}
+		if s.routingPolicyCache.generation(installationID) == generation {
+			ctx = context.WithValue(ctx, routingPolicyGenerationContextKey{}, generation)
+			return context.WithValue(ctx, routingPolicyContextKey{}, policy), nil
+		}
+	}
+	return ctx, ErrRoutingPolicyUnavailable
+}
+
+// WithRoutingAssignment treats a successfully read missing assignment as passthrough.
+func (s *Service) WithRoutingAssignment(ctx context.Context, installationID, routerUserID string) (context.Context, error) {
+	policy := RoutingPolicyFrom(ctx)
+	for attempt := 0; attempt < 3; attempt++ {
+		generation := s.routingPolicyCache.generation(installationID)
+		admittedGeneration, _ := ctx.Value(routingPolicyGenerationContextKey{}).(uint64)
+		if admittedGeneration != generation {
+			var err error
+			ctx, err = s.WithRoutingPolicy(ctx, installationID)
+			if err != nil {
+				return ctx, err
+			}
+			policy = RoutingPolicyFrom(ctx)
+			continue
+		}
+		if policy.Mode != RoutingPolicyAssigned || routerUserID == "" {
+			return ctx, nil
+		}
+		routerOn, found := s.routingPolicyCache.assignment(installationID, routerUserID, policy.Revision, generation)
+		if !found {
+			var err error
+			routerOn, err = s.routingPolicies.HasAssignment(ctx, installationID, routerUserID, policy.Revision)
+			if err != nil {
+				return ctx, fmt.Errorf("load installation routing assignment: %w: %w", err, ErrRoutingPolicyUnavailable)
+			}
+			if !s.routingPolicyCache.setAssignment(installationID, routerUserID, policy.Revision, generation, routerOn) {
+				continue
+			}
+		}
+		if s.routingPolicyCache.generation(installationID) == generation {
+			return context.WithValue(ctx, routingDecisionContextKey{}, routerOn), nil
+		}
+	}
+	return ctx, ErrRoutingPolicyUnavailable
+}
+
 // WithInstallationChangeNotifier wires a cross-replica fanout. Pass nil to disable.
 func (s *Service) WithInstallationChangeNotifier(n InstallationChangeNotifier) *Service {
 	if n == nil {
@@ -197,7 +330,14 @@ func (s *Service) invalidateInstallation(installationID string) {
 		return
 	}
 	s.cache.InvalidateInstallation(installationID)
+	s.routingPolicyCache.InvalidateInstallation(installationID)
 	s.notifier.NotifyInstallationChanged(installationID)
+}
+
+// InvalidateInstallation makes a committed control-plane configuration change
+// visible to subsequent requests on this replica and its peers.
+func (s *Service) InvalidateInstallation(installationID string) {
+	s.invalidateInstallation(installationID)
 }
 
 // IssueAPIKey creates a new routing (data-plane) API key and returns the raw token.
@@ -256,6 +396,9 @@ func (s *Service) RotateAPIKey(ctx context.Context, installationID, keyID string
 	}
 	if target == nil {
 		return nil, "", ErrAPIKeyNotFound
+	}
+	if target.CredentialSubjectID != "" {
+		return nil, "", ErrPersonalCredentialRequired
 	}
 	n, err := s.apiKeys.SoftDelete(ctx, installationID, target.ID)
 	if err != nil {
@@ -338,6 +481,17 @@ func (s *Service) UpsertExternalAPIKey(ctx context.Context, installationID strin
 	}
 	baggageHeader, err := NormalizeBaggageHeader(params.BaggageHeader)
 	if err != nil {
+		return nil, err
+	}
+	baggageName := ""
+	if baggageHeader != nil {
+		baggageName = *baggageHeader
+	}
+	identityName := ""
+	if identityHeader != nil {
+		identityName = *identityHeader
+	}
+	if err := ValidateForwardingHeaderConfiguration(forwardedHeaders, baggageName, identityName); err != nil {
 		return nil, err
 	}
 	authType, authAccount, authUser, err := NormalizeAuthType(params.AuthType, params.AuthAccount, params.AuthUser)
@@ -594,6 +748,14 @@ func (s *Service) SetInstallationHideTerminalSurfaces(ctx context.Context, exter
 	return nil
 }
 
+func (s *Service) SetInstallationShowModelSelectionReasoning(ctx context.Context, externalID, installationID string, show bool) error {
+	if err := s.installations.UpdateShowModelSelectionReasoning(ctx, externalID, installationID, show); err != nil {
+		return err
+	}
+	s.invalidateInstallation(installationID)
+	return nil
+}
+
 // ErrInvalidCaptureMode is returned for a content-capture mode outside the
 // off/hashed/full set.
 var ErrInvalidCaptureMode = errors.New("auth: invalid content capture mode")
@@ -649,6 +811,16 @@ func (s *Service) SetInstallationFlagOverrides(ctx context.Context, externalID, 
 // ClusterModelList slice carries the key's per-cluster ordered allowlists, or
 // nil when none are configured.
 func (s *Service) VerifyAPIKey(ctx context.Context, rawToken string) (*Installation, *APIKey, []*ExternalAPIKey, []ClusterModelList, error) {
+	return s.verifyAPIKey(ctx, rawToken, true)
+}
+
+// VerifyPlatformAPIKey preserves key restrictions without reading or decrypting provider credentials.
+func (s *Service) VerifyPlatformAPIKey(ctx context.Context, rawToken string) (*Installation, *APIKey, []ClusterModelList, error) {
+	installation, key, _, lists, err := s.verifyAPIKey(ctx, rawToken, false)
+	return installation, key, lists, err
+}
+
+func (s *Service) verifyAPIKey(ctx context.Context, rawToken string, includeUpstreamKeys bool) (*Installation, *APIKey, []*ExternalAPIKey, []ClusterModelList, error) {
 	if !HasAPIKeyPrefix(rawToken) {
 		return nil, nil, nil, nil, ErrInvalidPrefix
 	}
@@ -663,8 +835,11 @@ func (s *Service) VerifyAPIKey(ctx context.Context, rawToken string) (*Installat
 			if cached.APIKey.Scope.Normalized() != ScopeRouting {
 				return nil, nil, nil, nil, ErrWrongKeyScope
 			}
-			s.fireMarkUsed(cached.APIKey.ID)
+			s.fireMarkUsed(cached.APIKey, cached.Installation)
 			s.fireMarkFirstRequestServed(cached.APIKey.InstallationID)
+			if !includeUpstreamKeys {
+				return cached.Installation, cached.APIKey, nil, cached.ClusterModelLists, nil
+			}
 			return cached.Installation, cached.APIKey, s.resolveUpstreamSecrets(ctx, cached.ExternalKeys), cached.ClusterModelLists, nil
 		}
 		// Malformed positive entry (nil APIKey): fall through to DB lookup.
@@ -686,7 +861,7 @@ func (s *Service) VerifyAPIKey(ctx context.Context, rawToken string) (*Installat
 	}
 
 	var externalKeys []*ExternalAPIKey
-	if s.externalKeys != nil {
+	if includeUpstreamKeys && s.externalKeys != nil {
 		externalKeys, err = s.externalKeys.GetForInstallation(ctx, apiKey.InstallationID)
 		if err != nil {
 			// Non-fatal: proceed without external keys.
@@ -708,10 +883,10 @@ func (s *Service) VerifyAPIKey(ctx context.Context, rawToken string) (*Installat
 		}
 	}
 
-	if clusterModelListsFetchOK {
+	if clusterModelListsFetchOK && includeUpstreamKeys {
 		s.cache.Set(keyHash, CachedKey{APIKey: apiKey, Installation: installation, ExternalKeys: externalKeys, ClusterModelLists: clusterModelLists})
 	}
-	s.fireMarkUsed(apiKey.ID)
+	s.fireMarkUsed(apiKey, installation)
 	s.fireMarkFirstRequestServed(apiKey.InstallationID)
 	return installation, apiKey, s.resolveUpstreamSecrets(ctx, externalKeys), clusterModelLists, nil
 }
@@ -735,7 +910,7 @@ func (s *Service) ResolveAndStashUser(ctx context.Context, installationID, email
 	identityKey := userIdentityKey(email, claudeAccountUUID)
 	if cached, ok := s.userCache.Get(installationID, identityKey); ok {
 		log.Debug("ResolveAndStashUser cache hit", "installation_id", installationID, "user_id", cached)
-		return s.withUserClusterLists(ctx, installationID, cached)
+		return s.withUserSettings(ctx, installationID, cached)
 	}
 
 	var namePtr *string
@@ -774,7 +949,15 @@ func (s *Service) ResolveAndStashUser(ctx context.Context, installationID, email
 	}
 	s.userCache.Set(installationID, identityKey, user.ID)
 	log.Debug("ResolveAndStashUser upsert ok", "installation_id", installationID, "user_id", user.ID)
-	return s.withUserClusterLists(ctx, installationID, user.ID)
+	return s.withUserSettings(ctx, installationID, user.ID)
+}
+
+func (s *Service) withUserSettings(ctx context.Context, installationID, routerUserID string) context.Context {
+	ctx = s.withUserClusterLists(ctx, installationID, routerUserID)
+	if RoutingPolicyFrom(ctx).Mode != "" && RoutingPolicyFrom(ctx).Mode != RoutingPolicyInherit {
+		return ctx
+	}
+	return s.withBlindExperiment(ctx, installationID, routerUserID)
 }
 
 // withUserClusterLists stashes the router user ID and per-cluster selections on
@@ -813,6 +996,90 @@ func (s *Service) withUserClusterLists(ctx context.Context, installationID, rout
 	return context.WithValue(ctx, UserClusterModelListsContextKey{}, overrides)
 }
 
+func (s *Service) withBlindExperiment(ctx context.Context, installationID, routerUserID string) context.Context {
+	if s.blindExperiments == nil || routerUserID == "" {
+		return ctx
+	}
+	var (
+		state                BlindExperimentState
+		hasFetched, resolved bool
+		generation           uint64
+	)
+	for attempt := 0; attempt < blindExperimentFetchAttempts && !resolved; attempt++ {
+		generation = s.blindExperimentCache.InstallationGeneration(installationID)
+		if cached, found := s.blindExperimentCache.GetAtGeneration(installationID, routerUserID, generation); found {
+			state, resolved = cached, true
+			break
+		}
+		fetched, ok := s.fetchBlindExperiment(ctx, installationID, routerUserID, generation)
+		if !ok {
+			break
+		}
+		state, hasFetched = fetched, true
+		// A no-op cache deliberately has no entry, so its fetched state is
+		// authoritative for this request.
+		if !s.blindExperimentCache.Enabled() {
+			resolved = true
+			break
+		}
+		if current, found := s.blindExperimentCache.GetAtGeneration(installationID, routerUserID, generation); found {
+			state, resolved = current, true
+		}
+	}
+	if !resolved {
+		if !hasFetched || ctx.Err() != nil {
+			return ctx
+		}
+		// Invalidations here are usually unchanged-config fanout. Dropping the
+		// arm would route a passthrough experiment, so serve the last read
+		// without caching it.
+		observability.FromContext(ctx).Warn("Blind router experiment assignment could not be confirmed after invalidation; using the last read uncached", "installation_id", installationID, "router_user_id", routerUserID, "fetch_generation", generation, "current_generation", s.blindExperimentCache.InstallationGeneration(installationID))
+	}
+	state = state.AtTime(s.now())
+	if !state.Active && state.CohortExperimentID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, BlindExperimentContextKey{}, state)
+}
+
+// fetchBlindExperiment reads one assignment at a cache generation. The
+// generation is part of the singleflight key so a retry after invalidation
+// never joins a read that started before it.
+func (s *Service) fetchBlindExperiment(ctx context.Context, installationID, routerUserID string, generation uint64) (BlindExperimentState, bool) {
+	fetchKey := installationID + "\x00" + routerUserID + "\x00" + strconv.FormatUint(generation, 10)
+	resultCh := s.blindExperimentFetches.DoChan(fetchKey, func() (any, error) {
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), blindExperimentFetchTimeout)
+		defer cancel()
+		// A concurrent request may have filled the cache while this request
+		// waited for the per-user refresh. Re-check before querying Postgres.
+		if cached, found := s.blindExperimentCache.GetAtGeneration(installationID, routerUserID, generation); found {
+			return cached, nil
+		}
+		record, fetchErr := s.blindExperiments.GetForUser(fetchCtx, installationID, routerUserID)
+		if fetchErr != nil {
+			// Fail open for the request, but cache the failure only for the
+			// cache's short retry window so an outage does not hammer the DB or
+			// permanently bias the experiment cohort after recovery.
+			s.blindExperimentCache.SetErrorAtGeneration(installationID, routerUserID, generation)
+			return nil, fetchErr
+		}
+		resolved := resolveBlindExperiment(record, routerUserID)
+		s.blindExperimentCache.SetAtGeneration(installationID, routerUserID, resolved, generation)
+		return resolved, nil
+	})
+	var result singleflight.Result
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		return BlindExperimentState{}, false
+	}
+	if result.Err != nil {
+		observability.FromContext(ctx).Warn("Failed to fetch blind router experiment assignment", "router_user_id", routerUserID, "err", result.Err)
+		return BlindExperimentState{}, false
+	}
+	return result.Val.(BlindExperimentState), true
+}
+
 func userIdentityKey(email, claudeAccountUUID string) string {
 	if email != "" {
 		return "email:" + email
@@ -822,11 +1089,25 @@ func userIdentityKey(email, claudeAccountUUID string) string {
 
 // fireMarkUsed runs the last_used_at update off the request path. Uses context.Background because
 // the parent ctx is often canceled (response written) before the UPDATE completes.
-func (s *Service) fireMarkUsed(apiKeyID string) {
-	log := observability.Get().With("api_key_id", apiKeyID)
+func (s *Service) fireMarkUsed(apiKey *APIKey, installation *Installation) {
+	if apiKey == nil {
+		return
+	}
+	log := observability.Get().With("api_key_id", apiKey.ID)
 	observability.SafeGo(log, 2*time.Second, "fireMarkUsed", func(ctx context.Context) {
-		if err := s.apiKeys.MarkUsed(ctx, apiKeyID); err != nil {
+		firstUse, err := s.apiKeys.MarkUsed(ctx, apiKey.ID)
+		if err != nil {
 			log.Warn("Failed to mark router api key used", "err", err)
+			return
+		}
+		if firstUse && s.onboarding != nil && installation != nil && apiKey.Scope.Normalized() == ScopeRouting {
+			s.onboarding.APIKeyFirstUsed(APIKeyFirstUsedEvent{
+				InstallationExternalID: installation.ExternalID,
+				CredentialSubjectID:    apiKey.CredentialSubjectID,
+				APIKeyID:               apiKey.ID,
+				Harness:                apiKey.Harness,
+				OccurredAt:             s.now(),
+			})
 		}
 	})
 }

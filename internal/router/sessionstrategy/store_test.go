@@ -4,16 +4,17 @@ import (
 	"errors"
 	"testing"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionstrategy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionstrategy"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestPreferenceValidateAcceptsOnlyHMMBeta(t *testing.T) {
+func TestPreferenceValidateAcceptsBetaClassifiers(t *testing.T) {
 	t.Parallel()
 
 	assert.NoError(t, (sessionstrategy.Preference{Strategy: router.StrategyHMMBeta}).Validate())
+	assert.NoError(t, (sessionstrategy.Preference{Strategy: router.StrategyHMMQwen}).Validate())
 	for _, strategy := range []router.Strategy{"", "stable", router.StrategyHMM, router.StrategyCluster} {
 		assert.ErrorIs(t, (sessionstrategy.Preference{Strategy: strategy}).Validate(), sessionstrategy.ErrInvalidStrategy)
 	}

@@ -2,9 +2,19 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
+
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/dispatch"
+	"weave-os/router/internal/inference"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/gitcontext"
+	"weave-os/router/internal/router/turntype"
 )
 
 // InstallationIDContextKey is the request-context key for the authenticated installation UUID.
@@ -25,9 +35,23 @@ type TelemetryRepository interface {
 	GetSessionCost(ctx context.Context, installationID, sessionID string) (SessionCost, error)
 }
 
+// InferenceAttemptStore persists the ordered upstream attempts of an inference
+// operation. Kept separate from TelemetryRepository so the executor can be
+// wired with attempt persistence without depending on the dashboard queries.
+type InferenceAttemptStore interface {
+	InsertInferenceAttempt(ctx context.Context, p InsertInferenceAttemptParams) error
+}
+
+// InsertInferenceAttemptParams mirrors one model_router_inference_attempts row.
+type InsertInferenceAttemptParams struct {
+	InstallationID string
+	Event          inference.AttemptEvent
+}
+
 // Costs are USD micros ($1.00 = 1,000,000) summed as integers so no float rounding accumulates.
 // Actual = router's chosen binding; Requested = client's originally-requested model.
 type SessionCost struct {
+	ContextSnapshot        *ContextSnapshot
 	SessionID              string
 	RequestCount           int64
 	ActualCostUSDMicros    int64
@@ -41,20 +65,31 @@ type SessionCost struct {
 
 // InsertTelemetryParams mirrors one router.upstream span row.
 type InsertTelemetryParams struct {
-	InstallationID string
+	ContextSnapshot []byte
+	InstallationID  string
 	// APIKeyID attributes the row to the authenticating api key (per-key spend
 	// audit). Empty leaves the column NULL.
-	APIKeyID             string
-	RequestID            string
-	SpanType             string
-	TraceID              string
-	Timestamp            time.Time
-	RequestedModel       string
-	DecisionModel        string
-	DecisionProvider     string
-	DecisionReason       string
-	EstimatedInputTokens int32
-	StickyHit            bool
+	APIKeyID                        string
+	RequestID                       string
+	SpanType                        string
+	TraceID                         string
+	Timestamp                       time.Time
+	RequestedModel                  string
+	DecisionModel                   string
+	DecisionProvider                string
+	DecisionReason                  string
+	BlindExperimentArm              auth.BlindExperimentArm
+	BlindExperimentAssignmentSource auth.BlindExperimentAssignmentSource
+	BlindExperimentSubjectKey       string
+	CohortExperimentID              string
+	CohortGroupID                   *int16
+	CohortPhaseIndex                *int16
+	CohortRevision                  *int32
+	CohortScheduledArm              auth.BlindExperimentArm
+	CohortTreatmentApplied          *bool
+	CohortBypassReason              auth.CohortBypassReason
+	EstimatedInputTokens            int32
+	StickyHit                       bool
 	// PinTier is the actual served-path turn-loop tier. Empty leaves the column NULL.
 	PinTier                string
 	EmbedInput             string
@@ -85,23 +120,53 @@ type InsertTelemetryParams struct {
 	RouteID string
 	// Policy fields mirror the versioned sidecar contract. They remain generic
 	// so a future strategy is collected without adding a strategy-specific row.
-	PolicyRouteKey       string
-	PolicyArtifactID     string
-	PolicyArtifactSHA256 string
-	RosterVersion        string
-	SidecarSchemaVersion string
-	TrainingAllowed      bool
-	CaptureMode          string
+	PolicyRouteKey           string
+	PolicyArtifactID         string
+	PolicyArtifactSHA256     string
+	RosterVersion            string
+	ClassifierArtifactID     string
+	ClassifierArtifactSHA256 string
+	ClassifierPredictedLabel string
+	ClassifierClassOrder     []string
+	ClassifierProbabilities  []byte
+	SelectionPolicyReleaseID string
+	SelectionPolicySHA256    string
+	SelectionHeadGeneration  *int64
+	SelectionTrace           []byte
+	SidecarSchemaVersion     string
+	TrainingAllowed          bool
+	CaptureMode              string
 	// DebugRef is populated only when authorized policy debug mode is enabled.
 	DebugRef            string
 	TTFTMs              *int64
 	CacheCreationTokens *int32
-	CacheReadTokens     *int32
-	DeviceID            string
-	SessionID           string
-	RouterUserID        string
-	ClientApp           string
-	TurnType            string
+	// CacheCreation1hTokens is the 1-hour-TTL share of CacheCreationTokens.
+	CacheCreation1hTokens *int32
+	CacheReadTokens       *int32
+	ReasoningTokens       *int32
+	// Speed and InferenceGeo are the provider-reported usage.speed and
+	// usage.inference_geo; empty when not reported.
+	Speed                 string
+	InferenceGeo          string
+	DeviceID              string
+	SessionID             string
+	RouterUserID          string
+	ClientApp             string
+	TurnType              string
+	SubscriberPlan        string
+	EntitlementVersion    *int64
+	CapacitySource        string
+	RetailUsageMicros     *int64
+	IncludedUsageMicros   *int64
+	LinkedUsageMicros     *int64
+	PrepaidUsageMicros    *int64
+	SettlementFailed      *bool
+	ServingProfileID      string
+	ServingProfileVersion string
+	ServingReleaseID      string
+	ServingBindingID      string
+	ServingTarget         string
+	BoostOptimizerVersion string
 	// RolloutID joins eval/training-harness rollout rewards onto decisions
 	// (x-weave-rollout-id header). Empty for normal traffic → NULL column.
 	RolloutID string
@@ -110,8 +175,27 @@ type InsertTelemetryParams struct {
 	StopReason            *string
 	ToolUseBlocks         *int32
 	InvalidToolArgsBlocks *int32
-	FailoverUsed          *bool
-	DegenerateShadow      *bool
+	// LastToolUseName + LastToolUseInputBytes describe the final tool_use block
+	// handed to the client on a turn that ended with stop_reason=tool_use.
+	// Empty / nil on every other turn. Observation-only.
+	LastToolUseName       string
+	LastToolUseInputBytes *int32
+	// ToolErrorCounts is pre-marshaled JSON {tool name: {calls, errors}} over
+	// the request's resolved tool calls. nil when the history has none.
+	ToolErrorCounts []byte
+	// AutonomyAppendFired is set when the router appended AutonomySystemText
+	// to the outgoing system prompt; nil otherwise.
+	AutonomyAppendFired *bool
+	// WorkspaceAppendFired is set when the served attempt carried
+	// WorkspaceSystemText (cross-vendor emitters only); nil otherwise.
+	WorkspaceAppendFired *bool
+	// FailoverUsed marks a turn a failover served; FailoverAttempted marks any
+	// turn on which one was dispatched, including a failover that also failed.
+	FailoverUsed       *bool
+	FailoverAttempted  *bool
+	DegenerateShadow   *bool
+	PolicyPinRequested *bool
+	PolicyPinHonoured  *bool
 
 	// SessionKey + Role are the offline join key to spiral_shadow_events and
 	// session_pins (16-byte digest + roleForTier of the requested model). Nil /
@@ -138,9 +222,14 @@ type InsertTelemetryParams struct {
 	// client). Empty on deployment-key turns, leaving the columns NULL. Equal
 	// prefix/suffix values across distinct RouterUserIDs reveal one subscription
 	// paying for many seats.
-	CredentialKeyPrefix string
-	CredentialKeySuffix string
-	CredentialSource    string
+	CredentialKeyPrefix   string
+	CredentialKeySuffix   string
+	CredentialSource      string
+	SubscriptionAccountID string
+	SubscriptionOwnerID   string
+	SubscriptionTier      auth.SubscriptionTier
+	IntendedModelFamily   string
+	FinalModelFamily      string
 
 	// UnifiedLimitHeaders is the verbatim anthropic-ratelimit-unified-* header
 	// set, pre-marshaled JSON. Phase 0 instrumentation — nil on non-subscription
@@ -194,6 +283,131 @@ type InsertTelemetryParams struct {
 	// caller sent, before intersection with the installation allowlist. Nil
 	// (NULL) when the header was absent.
 	RequestedAllowedModels []string
+
+	// Inference is the policy provenance of the operation this row summarizes.
+	// Nil on paths not yet dispatched through the executor, leaving every
+	// provenance column NULL.
+	Inference *inference.OperationSummary
+
+	// ClientGit* is the client-reported starting tree, parsed from the Claude
+	// Code gitStatus system block on a trial-mode session's first turn only.
+	// Nullable group: nil/empty on every other turn and on parse failure.
+	ClientGitHeadSHA string
+	ClientGitBranch  string
+	ClientGitDirty   *bool
+
+	// Effort* is the per-turn effort resolution the dispatch actually used.
+	// Empty across the group when the target expresses no effort, leaving the
+	// columns NULL rather than recording "" as a resolved level.
+	EffortArm      string
+	EffortSelected string
+	EffortSent     string
+	EffortSource   string
+
+	// UserPrompt reports whether the trailing input is text a person typed.
+	// Nil on paths that do not assess it, leaving the column NULL.
+	UserPrompt *bool
+	// UserPromptGapMs and UserPromptGapPriorModel are filled by fireTelemetry
+	// from the session turn clock, never by the call site.
+	UserPromptGapMs         *int64
+	UserPromptGapPriorModel string
+	// ErrorClass is empty on a normal completion.
+	ErrorClass TurnErrorClass
+	// LatestToolCallCounts is pre-marshaled JSON {tool name: {calls, errors}}
+	// over incoming Anthropic tool results. {} marks an observed empty result;
+	// nil means outcomes were not collected, including unsupported input formats.
+	LatestToolCallCounts []byte
+}
+
+// applyClientGitContextTelemetry stamps the ClientGit* group when the
+// installation is in trial mode and this is the session's first turn. The
+// parse is pure and fail-open: a miss logs at debug and leaves the group null.
+func applyClientGitContextTelemetry(ctx context.Context, params *InsertTelemetryParams, firstTurn bool, systemBlocks []string) {
+	if params == nil || !firstTurn || !trialCaptureEnabledFromContext(ctx) {
+		return
+	}
+	gc, ok := gitcontext.Parse(systemBlocks)
+	if !ok {
+		observability.FromContext(ctx).Debug("router.client_git_context_unparsed", "system_blocks", len(systemBlocks))
+		return
+	}
+	params.ClientGitHeadSHA = gc.HeadSHA
+	params.ClientGitBranch = gc.Branch
+	params.ClientGitDirty = &gc.Dirty
+}
+
+func trialCaptureEnabledFromContext(ctx context.Context) bool {
+	enabled, _ := ctx.Value(InstallationTrialCaptureContextKey{}).(bool)
+	return enabled
+}
+
+// applyPolicyPinTelemetry records whether an x-weave-policy-pin header reached
+// the router and whether the served decision came from exactly the pinned
+// artifact and roster. Both stay nil when no pin was requested.
+func applyPolicyPinTelemetry(ctx context.Context, params *InsertTelemetryParams, metadata *router.RoutingMetadata) {
+	request, requested := router.PolicyPinRequestFrom(ctx)
+	if params == nil || !requested {
+		return
+	}
+	honoured := request.Authorized && metadata != nil && metadata.PolicyPinHonoured
+	params.PolicyPinRequested = &requested
+	params.PolicyPinHonoured = &honoured
+}
+
+func applyBlindExperimentTelemetry(ctx context.Context, params *InsertTelemetryParams, routed *turnLoopResult) {
+	state, present := auth.BlindExperimentStatusFrom(ctx)
+	if params == nil || !present {
+		return
+	}
+	if state.CohortExperimentID != "" {
+		params.CohortExperimentID = state.CohortExperimentID
+		if state.CohortGroupID > 0 {
+			groupID := int16(state.CohortGroupID)
+			params.CohortGroupID = &groupID
+		}
+		revision := int32(state.CohortRevision)
+		params.CohortRevision = &revision
+		if !state.Enabled {
+			params.CohortBypassReason = auth.CohortBypassDisabled
+		} else if state.CohortGroupID == 0 {
+			params.CohortBypassReason = auth.CohortBypassUnassigned
+		} else if !state.Active {
+			params.CohortBypassReason = auth.CohortBypassOutsideWindow
+		}
+	}
+	if !state.Active {
+		return
+	}
+	params.BlindExperimentArm = state.Arm
+	params.BlindExperimentAssignmentSource = state.AssignmentSource
+	params.BlindExperimentSubjectKey = state.CanonicalSubjectKey
+	if state.CohortExperimentID != "" {
+		phaseIndex := int16(state.CohortPhaseIndex)
+		params.CohortPhaseIndex = &phaseIndex
+		params.CohortScheduledArm = state.ScheduledArm
+		applied := false
+		switch {
+		case routed == nil || routed.Decision.Model == "":
+			params.CohortBypassReason = auth.CohortBypassNotDispatched
+		case routed.UsageBypass:
+			params.CohortBypassReason = auth.CohortBypassUsageBypass
+		case isUserForcedReason(routed.Decision.Reason):
+			params.CohortBypassReason = auth.CohortBypassForceModel
+		case routed.HardPinned:
+			params.CohortBypassReason = auth.CohortBypassHardPin
+		case state.Arm == auth.BlindExperimentArmPassthrough:
+			applied = routed.CallerModelPassthrough
+			if !applied {
+				params.CohortBypassReason = auth.CohortBypassNotDispatched
+			}
+		default:
+			applied = true
+		}
+		params.CohortTreatmentApplied = &applied
+	}
+	if state.Arm == auth.BlindExperimentArmPassthrough {
+		params.TrainingAllowed = false
+	}
 }
 
 // TelemetrySummary holds aggregated totals for the dashboard cards.
@@ -279,6 +493,19 @@ func applyPlannerTelemetry(p *InsertTelemetryParams, res turnLoopResult) {
 	}
 }
 
+// applyEffortTelemetry copies the dispatched effort resolution onto p. No-ops
+// when nothing resolved, so a target that expresses no effort leaves the
+// columns NULL instead of claiming an empty level was sent.
+func applyEffortTelemetry(p *InsertTelemetryParams, e effortResolution) {
+	if p == nil || e.Source == "" {
+		return
+	}
+	p.EffortArm = e.Arm
+	p.EffortSelected = e.Selected
+	p.EffortSent = e.Sent
+	p.EffortSource = e.Source
+}
+
 // applyAuthorityShadowTelemetry copies the authority-turn cache-gate shadow onto
 // p. No-ops unless the shadow ran, keeping all AuthorityShadow* columns NULL
 // rather than zero (zero would read as a computed verdict). These never describe
@@ -360,4 +587,78 @@ func applyTurnSignalTelemetry(
 
 func int32Ptr(v int32) *int32 {
 	return &v
+}
+
+// attemptSink persists executor attempt events for the installation in
+// context. Persistence failures are logged, never surfaced to dispatch.
+type attemptSink struct {
+	store  InferenceAttemptStore
+	logger *slog.Logger
+}
+
+func (s attemptSink) RecordAttempt(ctx context.Context, event inference.AttemptEvent) {
+	if s.store == nil {
+		return
+	}
+	installationID, _ := ctx.Value(InstallationIDContextKey{}).(string)
+	if installationID == "" {
+		return
+	}
+	if err := s.store.InsertInferenceAttempt(context.WithoutCancel(ctx), InsertInferenceAttemptParams{
+		InstallationID: installationID,
+		Event:          event,
+	}); err != nil && s.logger != nil {
+		s.logger.Warn("inference attempt persist failed",
+			"operation_id", event.OperationID,
+			"attempt_index", event.AttemptIndex,
+			"error", err)
+	}
+}
+
+// NewAttemptSink returns the dispatch attempt sink backed by store.
+func NewAttemptSink(store InferenceAttemptStore, logger *slog.Logger) dispatch.AttemptSink {
+	return attemptSink{store: store, logger: logger}
+}
+
+// DecisionReasonPolicyPinUnservable marks a telemetry row for a turn that was
+// refused because its policy pin could not be served; no upstream was called.
+const DecisionReasonPolicyPinUnservable = router.PolicyPinUnavailableReason
+
+// DecisionReasonRoutingFailed marks a pinned turn refused by routing for a
+// reason other than the pin itself.
+const DecisionReasonRoutingFailed = "routing_failed"
+
+// recordPolicyPinRouteFailure persists the routing refusal for a turn that
+// carried an honoured policy pin, so replay analysis sees requested=true,
+// honoured=false even though no upstream dispatch happened. Unauthorized pins
+// and other routing failures write no row.
+func (s *Service) recordPolicyPinRouteFailure(ctx context.Context, requestID string, requestStart time.Time, requestedModel string, turnType turntype.TurnType, userPrompt bool, routeErr error) {
+	if _, honoured := router.HonouredPolicyPin(ctx); !honoured {
+		return
+	}
+	installationID := installationIDFromContext(ctx)
+	if installationID == uuid.Nil {
+		return
+	}
+	params := InsertTelemetryParams{
+		InstallationID: installationID.String(),
+		APIKeyID:       apiKeyIDFromContext(ctx),
+		RequestID:      requestID,
+		SpanType:       "router.upstream",
+		TraceID:        requestID,
+		Timestamp:      requestStart,
+		RequestedModel: requestedModel,
+		TurnType:       string(turnType),
+		DecisionReason: DecisionReasonPolicyPinUnservable,
+		ErrorClass:     TurnErrorRoutingRefused,
+		UserPrompt:     &userPrompt,
+		Strategy:       string(router.StrategyFromContext(ctx)),
+		RouterUserID:   auth.UserIDFrom(ctx),
+	}
+	if !errors.Is(routeErr, router.ErrPolicyPinUnavailable) {
+		params.DecisionReason = DecisionReasonRoutingFailed
+	}
+	applyBlindExperimentTelemetry(ctx, &params, nil)
+	applyPolicyPinTelemetry(ctx, &params, nil)
+	s.fireTelemetry(params)
 }

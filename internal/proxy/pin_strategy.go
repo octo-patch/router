@@ -3,8 +3,8 @@ package proxy
 import (
 	"context"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
 )
 
 // pinMatchesEffectiveStrategy reports whether a stored pin belongs to the
@@ -18,7 +18,7 @@ func pinMatchesEffectiveStrategy(ctx context.Context, pin sessionpin.Pin) bool {
 	if pin.Strategy == expected {
 		return true
 	}
-	return pin.Strategy == "" && expected != router.StrategyHMMBeta
+	return pin.Strategy == "" && !router.IsBetaStrategy(expected)
 }
 
 func strategyContext(strategy router.Strategy) context.Context {

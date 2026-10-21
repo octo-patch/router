@@ -9,6 +9,110 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type RouterBlindRouterExperimentAssignment struct {
+	RouterUserID        uuid.UUID
+	InstallationID      uuid.UUID
+	OrganizationID      string
+	CanonicalSubjectKey string
+	AutomaticArm        string
+	ManualOverride      *string
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
+}
+
+type RouterBlindRouterExperimentConfiguration struct {
+	InstallationID     uuid.UUID
+	OrganizationID     string
+	Enabled            bool
+	RouterOnPercentage int16
+	Seed               uuid.UUID
+	CreatedAt          pgtype.Timestamptz
+	UpdatedAt          pgtype.Timestamptz
+	CohortExperimentID pgtype.UUID
+	CohortStartsAt     pgtype.Timestamptz
+	CohortEndsAt       pgtype.Timestamptz
+	CohortTimezone     *string
+	CohortRevision     *int32
+}
+
+type RouterBlindRouterExperimentEmergencyOverride struct {
+	ID                  uuid.UUID
+	InstallationID      uuid.UUID
+	ExperimentID        uuid.UUID
+	CanonicalSubjectKey string
+	Arm                 string
+	StartsAt            pgtype.Timestamptz
+	EndsAt              pgtype.Timestamptz
+	Reason              string
+	CreatedBy           string
+	CreatedAt           pgtype.Timestamptz
+	RevokedAt           pgtype.Timestamptz
+	RevokedBy           *string
+	RevocationReason    *string
+}
+
+type RouterBlindRouterExperimentGroup struct {
+	InstallationID uuid.UUID
+	ExperimentID   uuid.UUID
+	GroupID        int16
+	Label          string
+}
+
+type RouterBlindRouterExperimentGroupMembership struct {
+	InstallationID      uuid.UUID
+	ExperimentID        uuid.UUID
+	CanonicalSubjectKey string
+	GroupID             int16
+}
+
+type RouterBlindRouterExperimentSchedule struct {
+	InstallationID uuid.UUID
+	ExperimentID   uuid.UUID
+	Revision       int32
+	GroupID        int16
+	PhaseIndex     int16
+	StartsAt       pgtype.Timestamptz
+	EndsAt         pgtype.Timestamptz
+	Arm            string
+}
+
+type RouterBlindRouterExperimentSubjectOverride struct {
+	InstallationID      uuid.UUID
+	OrganizationID      string
+	CanonicalSubjectKey string
+	ManualOverride      string
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
+}
+
+type RouterClassifierPrediction struct {
+	ThreadID               uuid.UUID
+	TurnDigest             string
+	RootTurnDigest         string
+	UserMessageCount       int32
+	ToolCallCount          int32
+	ToolErrorCount         int32
+	CompletedResponseCount int32
+	Complexity             int16
+	Probabilities          []float64
+	CreatedAt              pgtype.Timestamptz
+	InputMessageCount      int32
+}
+
+type RouterClassifierThread struct {
+	ThreadID              uuid.UUID
+	InstallationID        uuid.UUID
+	CredentialSha256      []byte
+	RequestID             uuid.UUID
+	Release               string
+	ReleaseSha256         string
+	SelectionPolicySha256 string
+	ExpiresAt             pgtype.Timestamptz
+	CreatedAt             pgtype.Timestamptz
+	PrefixMessageCount    int32
+	PrefixDigest          string
+}
+
 type RouterClusterModelList struct {
 	ID             uuid.UUID
 	OrganizationID string
@@ -17,6 +121,76 @@ type RouterClusterModelList struct {
 	Models         []string
 	CreatedAt      pgtype.Timestamptz
 	UpdatedAt      pgtype.Timestamptz
+}
+
+// Opaque account-owned identity projection; no private account table dependency
+type RouterCredentialSubject struct {
+	ID                   uuid.UUID
+	ProjectionComplete   bool
+	InternalEnrolled     bool
+	EnrollmentGeneration int64
+	CreatedAt            pgtype.Timestamptz
+	RevokedAt            pgtype.Timestamptz
+}
+
+// Email to credential subject per installation; lets a shared routing key serve each caller their own subscriptions and allowance
+type RouterCredentialSubjectIdentity struct {
+	SubjectID      uuid.UUID
+	InstallationID uuid.UUID
+	Email          string
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	RevokedAt      pgtype.Timestamptz
+}
+
+type RouterCredentialSubjectInstallation struct {
+	SubjectID      uuid.UUID
+	InstallationID uuid.UUID
+	AccessEnabled  bool
+}
+
+type RouterEscalationCheckpoint struct {
+	Scope      []byte
+	Boundary   []byte
+	Checkpoint []byte
+}
+
+type RouterEscalationContinuation struct {
+	Activation     []byte
+	ResponseDigest []byte
+	Scope          []byte
+	History        []byte
+}
+
+type RouterEscalationDashboardSnapshot struct {
+	ID                              uuid.UUID
+	CapturedAt                      pgtype.Timestamptz
+	ExpiresAt                       pgtype.Timestamptz
+	Summary                         []byte
+	OutcomeBreakdown                []byte
+	ProgressDistribution            []byte
+	FirstRecommendationDistribution []byte
+	FloorDistribution               []byte
+	Organizations                   []byte
+	MatchingSessions                int32
+}
+
+type RouterEscalationDashboardSnapshotSession struct {
+	SnapshotID uuid.UUID
+	Position   int32
+	Session    []byte
+}
+
+type RouterEscalationSession struct {
+	Scope            []byte
+	InstallationID   uuid.UUID
+	Ordinal          int64
+	SessionState     []byte
+	LeaseToken       pgtype.UUID
+	LeaseUntil       pgtype.Timestamptz
+	LeaseBoundary    []byte
+	ContinuityBroken bool
+	ExpiresAt        pgtype.Timestamptz
 }
 
 // Published mirror of internal/flags.Registry, upserted by the router at boot. Read by the Weave control plane to render the per-org flag override admin UI. Never read on the request path.
@@ -44,6 +218,96 @@ type RouterGlobalAutomaticRoutingExclusion struct {
 	CreatedAt pgtype.Timestamp
 	// Opaque external identifier of the Weave account that disabled the model.
 	CreatedBy *string
+}
+
+type RouterInstallationLaneEnrollment struct {
+	InstallationID       uuid.UUID
+	InternalEnrolled     bool
+	EnrollmentGeneration int64
+	UpdatedAt            pgtype.Timestamptz
+}
+
+// Assignment keys only; exact active revisions are owned by GCS selection sets
+type RouterInstallationProfileAssignment struct {
+	InstallationID       uuid.UUID
+	ProfileKey           pgtype.UUID
+	AssignmentGeneration int64
+	UpdatedAt            pgtype.Timestamptz
+}
+
+type RouterInstallationRoutingAssignment struct {
+	InstallationID uuid.UUID
+	RouterUserID   uuid.UUID
+	Revision       int64
+}
+
+type RouterInstallationRoutingPolicy struct {
+	InstallationID uuid.UUID
+	Mode           string
+	Revision       int64
+	UpdatedAt      pgtype.Timestamptz
+}
+
+type RouterInternalTestBudget struct {
+	SubjectID        uuid.UUID
+	InstallationID   uuid.UUID
+	Label            string
+	BalanceUsdMicros int64
+	Enabled          bool
+	CreatedAt        pgtype.Timestamptz
+}
+
+type RouterInternalTestCreditLedger struct {
+	ID              uuid.UUID
+	SubjectID       uuid.UUID
+	DeltaUsdMicros  int64
+	RouterRequestID string
+	RouterModel     string
+	APIKeyID        uuid.UUID
+	CreatedAt       pgtype.Timestamptz
+}
+
+type RouterInternalTestPlanLaunch struct {
+	ID             uuid.UUID
+	TokenSha256    string
+	SubjectID      uuid.UUID
+	InstallationID uuid.UUID
+	Launch         []byte
+	SessionID      pgtype.UUID
+	CreatedAt      pgtype.Timestamptz
+	ExpiresAt      pgtype.Timestamptz
+	RevokedAt      pgtype.Timestamptz
+}
+
+type RouterLlmEscalationCompletion struct {
+	Lifetime uuid.UUID
+	Boundary []byte
+}
+
+type RouterLlmEscalationContinuation struct {
+	Activation     []byte
+	ResponseDigest []byte
+	Lifetime       uuid.UUID
+	History        []byte
+}
+
+type RouterLlmEscalationJob struct {
+	ID         uuid.UUID
+	Lifetime   uuid.UUID
+	Generation int64
+	Checkpoint int64
+	Status     string
+	LeaseUntil pgtype.Timestamptz
+	Job        []byte
+}
+
+type RouterLlmEscalationSession struct {
+	Scope          []byte
+	Lifetime       uuid.UUID
+	InstallationID uuid.UUID
+	State          []byte
+	ExpiresAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
 }
 
 // Cyclic tool-call loop detections: ops signal and (session, looping_model) -> looped training labels
@@ -82,7 +346,12 @@ type RouterModelRouterAPIKey struct {
 	SpendCapUsdMicros *int64
 	SpentUsdMicros    int64
 	// routing = rk_ data-plane key (can proxy and spend); analytics_read = ra_ export key (read-only, non-billable)
-	Scope string
+	Scope               string
+	CredentialSubjectID pgtype.UUID
+	// Optional onboarding harness id (claude_code, codex, opencode, pi). Null for keys minted outside harness onboarding.
+	Harness                           *string
+	SharedSubscriptionAccess          bool
+	PaidFallbackOnSubscriptionRefusal bool
 }
 
 // Customer-owned provider API keys for BYOK routing
@@ -125,6 +394,34 @@ type RouterModelRouterExternalAPIKey struct {
 	BaggageHeader *string
 }
 
+// Ordered upstream attempts per inference operation; joins to model_router_request_telemetry on (installation_id, request_id)
+type RouterModelRouterInferenceAttempt struct {
+	ID                 uuid.UUID
+	CreatedAt          pgtype.Timestamptz
+	InstallationID     uuid.UUID
+	RequestID          string
+	OperationID        string
+	AttemptIndex       int32
+	Purpose            string
+	PolicyID           string
+	RegistryRevision   string
+	PolicyRevision     string
+	Model              string
+	Provider           string
+	BindingIndex       int32
+	Outcome            string
+	FailureReason      *string
+	UpstreamStatusCode *int32
+	LatencyMs          *int64
+	// FALSE when the upstream reported no usage; token and cost columns are then unmeasured rather than zero
+	UsageKnown          bool
+	InputTokens         *int32
+	OutputTokens        *int32
+	CacheCreationTokens *int32
+	CacheReadTokens     *int32
+	CostUsdMicros       *int64
+}
+
 // Customer router installations; owns API keys
 type RouterModelRouterInstallation struct {
 	ID                          uuid.UUID
@@ -164,8 +461,17 @@ type RouterModelRouterInstallation struct {
 	// Optional model allowlist while the caller subscription is active; empty means no conditional restriction.
 	ModelsWhenSubscriptionActive []string
 	// Optional model allowlist while the caller subscription is exhausted; empty means no conditional restriction.
-	ModelsWhenSubscriptionInactive []string
-	FastModeModels                 []string
+	ModelsWhenSubscriptionInactive         []string
+	FastModeModels                         []string
+	TrialCaptureEnabled                    bool
+	TrialEnrollmentID                      pgtype.UUID
+	TrialShadowSampleRate                  pgtype.Numeric
+	TrialShadowDailyCeilingUsdMicros       *int64
+	ShowModelSelectionReasoning            bool
+	SubscriptionSharingEnabled             bool
+	SubscriptionStateModelsEnabled         bool
+	ModelsExcludedWhenSubscriptionActive   []string
+	ModelsExcludedWhenSubscriptionInactive []string
 }
 
 type RouterModelRouterRequestTelemetry struct {
@@ -315,8 +621,117 @@ type RouterModelRouterRequestTelemetry struct {
 	// Whether the session has attempted any edit yet; qualifies spiral_steps_since_progress
 	SpiralEditAttempted *bool
 	// Signal classes whose thresholds this turn crossed (err_streak, same_file_thrash, repetition, monologue, ping_pong, no_progress); empty array when the snapshot was recorded and nothing fired
-	SpiralReasons          []string
-	RequestedAllowedModels []string
+	SpiralReasons                   []string
+	RequestedAllowedModels          []string
+	InferencePurpose                *string
+	InferencePolicyID               *string
+	InferenceRegistryRevision       *string
+	InferencePolicyRevision         *string
+	PlanModel                       *string
+	PlanProvider                    *string
+	FallbackReason                  *string
+	AccountingOutcome               *string
+	UsageKnown                      *bool
+	BlindExperimentArm              *string
+	BlindExperimentAssignmentSource *string
+	BlindExperimentSubjectKey       *string
+	ClientGitHeadSha                *string
+	ClientGitBranch                 *string
+	ClientGitDirty                  *bool
+	PolicyPinRequested              *bool
+	PolicyPinHonoured               *bool
+	ClassifierArtifactID            *string
+	ClassifierArtifactSha256        *string
+	ClassifierPredictedLabel        *string
+	ClassifierClassOrder            []string
+	ClassifierProbabilities         []byte
+	SelectionPolicyReleaseID        *string
+	SelectionPolicySha256           *string
+	SelectionHeadGeneration         *int64
+	SelectionTrace                  []byte
+	// Name of the final tool_use block on a turn that ended with stop_reason = tool_use. NULL on every other turn.
+	LastToolUseName *string
+	// Byte length of the final tool_use block's input JSON as sent to the client, on a turn that ended with stop_reason = tool_use. NULL on every other turn.
+	LastToolUseInputBytes *int32
+	// JSON object of tool name to {calls, errors}: resolved tool calls on this request and how many of their results errored. NULL when the history has no resolved tool call.
+	ToolErrorCounts []byte
+	// TRUE when the router appended the autonomy operating instruction to the outgoing system prompt on this request. NULL when it did not.
+	AutonomyAppendFired *bool
+	// TRUE when the served attempt carried the workspace-inspection instruction appended by the router (cross-vendor emitters only). NULL when it did not.
+	WorkspaceAppendFired *bool
+	// Effort level the policy arm is labelled with. NULL when the arm carries none.
+	EffortArm *string
+	// Effort level that won precedence (user > escalation > arm > model policy), pre-clamp.
+	EffortSelected *string
+	// Effort level written on the wire after the target menu clamp (xhigh -> max -> high). NULL when nothing was sent.
+	EffortSent *string
+	// Precedence branch that produced the level: user, escalation, arm, model_policy. NULL when no effort resolved.
+	EffortSource            *string
+	SubscriberPlan          *string
+	EntitlementVersion      *int64
+	CapacitySource          *string
+	RetailUsageUsdMicros    *int64
+	IncludedUsageUsdMicros  *int64
+	LinkedUsageUsdMicros    *int64
+	PrepaidUsageUsdMicros   *int64
+	SettlementFailed        *bool
+	ServingProfileID        *string
+	ServingProfileVersion   *string
+	ServingReleaseID        *string
+	ServingBindingID        *string
+	BoostOptimizerVersion   *string
+	CohortExperimentID      pgtype.UUID
+	CohortGroupID           *int16
+	CohortPhaseIndex        *int16
+	CohortRevision          *int32
+	CohortScheduledArm      *string
+	CohortTreatmentApplied  *bool
+	CohortBypassReason      *string
+	UserPrompt              *bool
+	UserPromptGapMs         *int64
+	UserPromptGapPriorModel *string
+	ErrorClass              *string
+	LatestToolCallCounts    []byte
+	ServingTarget           *string
+	ReasoningTokens         *int32
+	SubscriptionAccountID   pgtype.UUID
+	SubscriptionOwnerID     pgtype.UUID
+	SubscriptionTier        *string
+	IntendedModelFamily     *string
+	FinalModelFamily        *string
+	CacheCreation1hTokens   *int32
+	Speed                   *string
+	InferenceGeo            *string
+	FailoverAttempted       *bool
+	ContextSnapshot         []byte
+}
+
+type RouterModelRouterSubscriptionAccount struct {
+	ID                     uuid.UUID
+	APIKeyID               pgtype.UUID
+	Provider               string
+	ExternalAccountID      string
+	RefreshTokenCiphertext []byte
+	Enabled                bool
+	CooldownUntil          pgtype.Timestamp
+	CreatedAt              pgtype.Timestamp
+	UpdatedAt              pgtype.Timestamp
+	AccessTokenCiphertext  []byte
+	AccessTokenExpiresAt   pgtype.Timestamp
+	TokenRefreshLeaseUntil pgtype.Timestamp
+	TokenRefreshLeaseID    pgtype.UUID
+	TokenRefreshVersion    int64
+	SubscriberID           pgtype.UUID
+	HealthState            string
+	// Provider-supplied human-readable account label; never used for identity or deduplication.
+	DisplayName    *string
+	ProviderUserID *string
+}
+
+type RouterModelRouterSubscriptionAccountInstallation struct {
+	InstallationID        uuid.UUID
+	SubscriptionAccountID uuid.UUID
+	CreatedAt             pgtype.Timestamptz
 }
 
 // End-user identities seen on inbound requests, scoped to an installation. Replaces the per-user API key pattern.
@@ -553,6 +968,15 @@ type RouterRouterFeedback struct {
 	RouteID *string
 }
 
+type RouterServingRequestAttribution struct {
+	RequestID      string
+	InstallationID uuid.UUID
+	APIKeyID       uuid.UUID
+	Scope          []byte
+	Binding        []byte
+	AdmittedAt     pgtype.Timestamptz
+}
+
 // Session-sticky routing pins; sliding 1h TTL matching Anthropic prompt cache
 type RouterSessionPin struct {
 	// 16-byte digest derived from api_key_id + (metadata.user_id | system+first-user hashes)
@@ -582,6 +1006,39 @@ type RouterSessionPin struct {
 	PolicyGroup               string
 	RoutingStrategy           string
 	PinnedEffort              string
+	DemotedModels             []string
+	ConsecutiveDowngradeVotes int32
+	LastOutputLimitAt         pgtype.Timestamptz
+	ConsecutiveUpgradeVotes   int32
+	DemotionCooldowns         []byte
+	TurnStrikes               []string
+	ForcedThreadKey           string
+}
+
+type RouterSessionPinRecoveryProbeLease struct {
+	SessionKey []byte
+	Model      string
+	LeaseToken uuid.UUID
+	LeaseUntil pgtype.Timestamptz
+}
+
+// Conversation release pins; admission transactions lock installation, key, subject, then conversation
+type RouterSessionReleaseBinding struct {
+	InstallationID        uuid.UUID
+	CredentialScope       string
+	ConversationDigest    []byte
+	Target                string
+	ActivationID          uuid.UUID
+	ReleaseSha256         string
+	BindingSha256         string
+	ProfileKey            pgtype.UUID
+	ProfileRevisionSha256 *string
+	EnrollmentGeneration  int64
+	AssignmentGeneration  int64
+	BindingGeneration     int64
+	Binding               []byte
+	CreatedAt             pgtype.Timestamptz
+	LastAdmittedAt        pgtype.Timestamptz
 }
 
 // Explicit per-session router strategy preferences
@@ -590,6 +1047,14 @@ type RouterSessionStrategyPreference struct {
 	SessionKey     []byte
 	Strategy       string
 	Enabled        bool
+}
+
+type RouterSessionTurnClock struct {
+	InstallationID      uuid.UUID
+	SessionKey          []byte
+	LastResponseEndedAt pgtype.Timestamptz
+	LastServedModel     string
+	UpdatedAt           pgtype.Timestamptz
 }
 
 // Shadow-mode spiral (death-march) detections: log-only fire-rate corpus measured on live traffic before escalation is armed
@@ -649,4 +1114,132 @@ type RouterStruggleShadowEvent struct {
 	WallSeconds         int64
 	SessionEverSwitched bool
 	EstInputTokens      int32
+}
+
+type RouterSubscriberAllowanceAction struct {
+	ActionID           string
+	RouterRequestID    string
+	SubscriberID       uuid.UUID
+	EntitlementVersion int64
+	Plan               string
+	BillingPeriodStart pgtype.Timestamptz
+	BillingPeriodEnd   pgtype.Timestamptz
+	SixHourPeriodStart pgtype.Timestamptz
+	SixHourPeriodEnd   pgtype.Timestamptz
+	APIKeyID           uuid.UUID
+	ClientSessionID    *string
+	RequestedModel     string
+	ServedModel        *string
+	ReservedUsdMicros  int64
+	RetailUsdMicros    *int64
+	CapacitySource     string
+	State              string
+	ReservedAt         pgtype.Timestamptz
+	FinalizedAt        pgtype.Timestamptz
+	ReleasedAt         pgtype.Timestamptz
+	CreatedAt          pgtype.Timestamptz
+	UpdatedAt          pgtype.Timestamptz
+	WeeklyPeriodStart  pgtype.Timestamptz
+	WeeklyPeriodEnd    pgtype.Timestamptz
+}
+
+type RouterSubscriberAllowancePeriod struct {
+	SubscriberID       uuid.UUID
+	PeriodKind         string
+	PeriodStart        pgtype.Timestamptz
+	PeriodEnd          pgtype.Timestamptz
+	EntitlementVersion int64
+	Plan               string
+	LimitUsdMicros     int64
+	ReservedUsdMicros  int64
+	FinalizedUsdMicros int64
+	CreatedAt          pgtype.Timestamptz
+	UpdatedAt          pgtype.Timestamptz
+}
+
+type RouterSubscriberAutopayConfig struct {
+	SubscriberID                uuid.UUID
+	Enabled                     bool
+	ThresholdUsdMicros          int64
+	RechargeUsdMicros           int64
+	HasPaymentMethod            bool
+	State                       string
+	ConsecutiveFailures         int32
+	CheckoutID                  pgtype.UUID
+	LastAttemptID               pgtype.UUID
+	LastAttemptAt               pgtype.Timestamptz
+	LastSuccessAt               pgtype.Timestamptz
+	CooldownUntil               pgtype.Timestamptz
+	MonthlyRechargeCapUsdMicros *int64
+	RechargedMonth              pgtype.Date
+	RechargedMonthUsdMicros     int64
+	CreatedBy                   *string
+	CreatedAt                   pgtype.Timestamptz
+	UpdatedAt                   pgtype.Timestamptz
+}
+
+type RouterSubscriberCreditBalance struct {
+	SubscriberID         uuid.UUID
+	BalanceUsdMicros     int64
+	LowBalanceNotifiedAt pgtype.Timestamptz
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+}
+
+type RouterSubscriberCreditLedger struct {
+	ID                    uuid.UUID
+	SubscriberID          uuid.UUID
+	DeltaUsdMicros        int64
+	NotionalCostMicros    int64
+	BalanceAfterMicros    int64
+	EntryType             string
+	StripePaymentIntentID *string
+	RouterRequestID       *string
+	RouterModel           *string
+	Memo                  *string
+	CreatedAt             pgtype.Timestamptz
+	AuthorizationActionID *string
+	ActionID              *string
+	CapacitySource        *string
+}
+
+type RouterSubscriberCreditReservation struct {
+	ActionID          string
+	SubscriberID      uuid.UUID
+	RouterRequestID   string
+	APIKeyID          *string
+	RequestedModel    string
+	ReservedUsdMicros int64
+	SettledUsdMicros  int64
+	State             string
+	CapacitySource    string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+}
+
+type RouterSubscriberEntitlement struct {
+	SubscriberID                     uuid.UUID
+	Version                          int64
+	Plan                             string
+	Status                           string
+	BillingPeriodStart               pgtype.Timestamptz
+	BillingPeriodEnd                 pgtype.Timestamptz
+	EffectiveAt                      pgtype.Timestamptz
+	MonthlyAllowanceUsdMicros        int64
+	NominalMonthlyAllowanceUsdMicros int64
+	SixHourAllowanceUsdMicros        int64
+	AutoTopUpEnabled                 bool
+	ProjectedAt                      pgtype.Timestamptz
+	CreatedAt                        pgtype.Timestamptz
+	UpdatedAt                        pgtype.Timestamptz
+}
+
+type RouterTaskDomainProfile struct {
+	ConversationKey string
+	RootSha256      string
+	ReleaseSha256   string
+	EvidenceSha256  string
+	Outcome         []byte
+	ExpiresAt       pgtype.Timestamptz
+	RetryAfter      pgtype.Timestamptz
 }

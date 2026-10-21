@@ -2,36 +2,25 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/observability"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router/turntype"
 )
 
-// ClientIdentity holds per-request user identification signals, persisted to
-// router.model_router_users (Email, DisplayName).
-type ClientIdentity struct {
-	DeviceID    string
-	AccountID   string
-	SessionID   string
-	Email       string
-	DisplayName string
-	UserAgent   string
-	ClientApp   string
-	// RolloutID is the x-weave-rollout-id eval/training-harness correlation
-	// id; joins a sandbox rollout's graded reward to its routing decisions.
-	RolloutID string
-}
+// ClientIdentity holds per-request user identification signals; defined in
+// internal/requestcontext so provider adapters can read it.
+type ClientIdentity = requestcontext.ClientIdentity
 
 // ClientIdentityContextKey is the request-context key for client identity.
-type ClientIdentityContextKey struct{}
+type ClientIdentityContextKey = requestcontext.ClientIdentityContextKey
 
 // ClientIdentityFrom reads the ClientIdentity stashed on ctx.
 func ClientIdentityFrom(ctx context.Context) ClientIdentity {
-	id, _ := ctx.Value(ClientIdentityContextKey{}).(ClientIdentity)
-	return id
+	return requestcontext.ClientIdentityFrom(ctx)
 }
 
 // ClientIdentityFromHeaders builds a ClientIdentity from the headers common
@@ -40,31 +29,42 @@ func ClientIdentityFrom(ctx context.Context) ClientIdentity {
 // metadata.user_id body field carries them; callers with a body (see
 // anthropic.stashClientIdentity) overlay those after calling this.
 func ClientIdentityFromHeaders(h http.Header) ClientIdentity {
-	return ClientIdentity{
-		SessionID:   sessionIDFromHeaders(h),
+	xApp, eval := splitEvalClientApp(h.Get("X-App"))
+	id := ClientIdentity{
+		SessionID:   requestcontext.SessionIDFromHeaders(h),
 		Email:       NormalizeEmail(h.Get("X-Weave-User-Email")),
 		DisplayName: NormalizeDisplayName(h.Get("X-Weave-User-Name")),
 		UserAgent:   h.Get("User-Agent"),
-		ClientApp:   NormalizeClientApp(h.Get("X-App"), h.Get("User-Agent")),
+		ClientApp:   NormalizeClientApp(xApp, h.Get("User-Agent")),
+		Eval:        eval,
 		RolloutID:   NormalizeRolloutID(h.Get(RolloutIDHeader)),
 	}
-}
-
-// sessionIDFromHeaders picks the first usable client session id. Claude Code
-// sends X-Claude-Code-Session-Id; Codex 0.149+ sends Session-Id (and Thread-Id
-// with the same value on the main thread). First match wins so a mixed
-// client cannot have Claude Code's header overwritten by Codex leftovers.
-func sessionIDFromHeaders(h http.Header) string {
-	for _, key := range [...]string{
-		ClaudeCodeSessionHeader,
-		"Session-Id",
-		"Thread-Id",
-	} {
-		if id := NormalizeClientIdentifier(h.Get(key)); id != "" {
-			return id
+	if id.ClientApp == ClientAppOpencode {
+		id.OpenCodeSubagent = requestcontext.IsOpenCodeSubagent(h)
+		if id.SessionID == "" {
+			id.SessionID = requestcontext.OpenCodeSessionIDFromHeaders(h)
 		}
 	}
-	return ""
+	return id
+}
+
+func openCodeCaller(id ClientIdentity) turntype.OpenCodeCaller {
+	isClient := id.ClientApp == ClientAppOpencode
+	return turntype.OpenCodeCaller{IsClient: isClient, IsSubagent: isClient && id.OpenCodeSubagent}
+}
+
+// EvalClientAppPrefix is re-exported for callers building identities by hand.
+const EvalClientAppPrefix = requestcontext.EvalClientAppPrefix
+
+// splitEvalClientApp peels the eval-harness prefix off a raw X-App value so
+// "weave-eval-codex" resolves to the codex harness with Eval set, rather than
+// to an unknown client that falls off every codex-keyed code path.
+func splitEvalClientApp(xApp string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(xApp))
+	if !strings.HasPrefix(trimmed, EvalClientAppPrefix) || len(trimmed) > MaxClientAppLen {
+		return xApp, false
+	}
+	return strings.TrimPrefix(trimmed, EvalClientAppPrefix), true
 }
 
 // ResolveUserFromContext dispatches identity signals from ctx to
@@ -72,6 +72,9 @@ func sessionIDFromHeaders(h http.Header) string {
 // and account_uuid are empty — Claude CLI v2.1.x sends account_uuid only, so
 // gating on email alone would break that path.
 func ResolveUserFromContext(ctx context.Context, authSvc *auth.Service, installation *auth.Installation) context.Context {
+	if _, ok := requestcontext.InternalTestIdentityFrom(ctx); ok {
+		return ctx
+	}
 	log := observability.FromContext(ctx)
 	if authSvc == nil || installation == nil {
 		log.Info("ResolveUserFromContext bailout",
@@ -82,6 +85,7 @@ func ResolveUserFromContext(ctx context.Context, authSvc *auth.Service, installa
 		return ctx
 	}
 	id := ClientIdentityFrom(ctx)
+	ctx = observability.WithClientSessionID(ctx, id.SessionID)
 	if id.Email == "" && id.AccountID == "" {
 		log.Info("ResolveUserFromContext bailout",
 			"reason", "no_identity_signal",
@@ -98,26 +102,31 @@ func ResolveUserFromContext(ctx context.Context, authSvc *auth.Service, installa
 	return authSvc.ResolveAndStashUser(ctx, installation.ID, id.Email, id.AccountID, id.DisplayName)
 }
 
+// ResolveRoutingAssignment applies generic per-user policy after the identity has been resolved.
+// A request carrying an identity that could not be resolved must not silently inherit routing.
+func ResolveRoutingAssignment(ctx context.Context, authSvc *auth.Service, installation *auth.Installation) (context.Context, error) {
+	if _, ok := requestcontext.InternalTestIdentityFrom(ctx); ok {
+		return ctx, nil
+	}
+	if authSvc == nil || installation == nil || auth.RoutingPolicyFrom(ctx).Mode != auth.RoutingPolicyAssigned {
+		return ctx, nil
+	}
+	identity := ClientIdentityFrom(ctx)
+	routerUserID, _ := ctx.Value(auth.UserIDContextKey{}).(string)
+	if routerUserID == "" && (identity.Email != "" || identity.AccountID != "") {
+		return ctx, auth.ErrRoutingPolicyUnavailable
+	}
+	return authSvc.WithRoutingAssignment(ctx, installation.ID, routerUserID)
+}
+
 // ClaudeCodeMetadata mirrors the JSON Claude Code encodes into
 // metadata.user_id. Email is promoted to router.model_router_users.
-type ClaudeCodeMetadata struct {
-	DeviceID  string `json:"device_id"`
-	AccountID string `json:"account_uuid"`
-	SessionID string `json:"session_id"`
-	Email     string `json:"email"`
-}
+type ClaudeCodeMetadata = requestcontext.ClaudeCodeMetadata
 
 // ParseClaudeCodeMetadata extracts identity fields from the JSON in
 // metadata.user_id. Best-effort: returns zero on parse failure.
 func ParseClaudeCodeMetadata(raw string) ClaudeCodeMetadata {
-	if raw == "" {
-		return ClaudeCodeMetadata{}
-	}
-	var meta ClaudeCodeMetadata
-	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
-		return ClaudeCodeMetadata{}
-	}
-	return meta
+	return requestcontext.ParseClaudeCodeMetadata(raw)
 }
 
 // MaxEmailLen caps email length per RFC 5321 §4.5.3.1.3 (256 bytes).
@@ -125,15 +134,12 @@ const MaxEmailLen = 254
 
 // MaxClientIdentifierLen bounds caller-controlled opaque identifiers.
 // Claude Code emits ~36-char UUIDs; 128 leaves flood-protection headroom.
-const MaxClientIdentifierLen = 128
+const MaxClientIdentifierLen = requestcontext.MaxClientIdentifierLen
 
 // NormalizeClientIdentifier returns s unchanged if within bounds, else "".
 // Rejects rather than truncates: a truncated id looks valid but no longer correlates.
 func NormalizeClientIdentifier(s string) string {
-	if len(s) > MaxClientIdentifierLen {
-		return ""
-	}
-	return s
+	return requestcontext.NormalizeClientIdentifier(s)
 }
 
 // RolloutIDHeader carries the eval/training-harness rollout correlation id.
@@ -181,6 +187,27 @@ const (
 	ClientAppGeminiCLI  = "gemini-cli"
 	ClientAppOpencode   = "opencode"
 )
+
+func supportsResponsesTerminalSurfaces(clientApp string) bool {
+	return clientApp == ClientAppCodex || clientApp == ClientAppOpencode
+}
+
+// directivePrefix returns the sigil a client's user has to type to reach the
+// router. Codex reserves a leading "/" for its own built-ins: it answers
+// "Unrecognized command" and never forwards the line, so a hint naming the
+// slash form there sends the user down a dead end. Every other client passes
+// "/" through untouched.
+//
+// Ingress accepts both spellings from every client regardless (see
+// translate.parseForceModelCommand) -- this only decides which one we print
+// back. Unknown clients get "/", the form the docs and every non-Codex client
+// use.
+func directivePrefix(clientApp string) string {
+	if clientApp == ClientAppCodex {
+		return "$"
+	}
+	return "/"
+}
 
 // clientAppAliases maps the raw X-App values some clients send to their
 // canonical client_app. Claude Code sends "cli", which would otherwise store

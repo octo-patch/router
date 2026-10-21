@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/api/admin"
-	"workweave/router/internal/auth"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router/cluster"
+	"weave-os/router/internal/api/admin"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router/cluster"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -66,7 +66,7 @@ func (f *fakeAPIKeyRepository) ListForInstallation(_ context.Context, installati
 	return out, nil
 }
 
-func (f *fakeAPIKeyRepository) MarkUsed(context.Context, string) error { return nil }
+func (f *fakeAPIKeyRepository) MarkUsed(context.Context, string) (bool, error) { return false, nil }
 
 func (f *fakeAPIKeyRepository) SoftDelete(_ context.Context, installationID, id string) (int64, error) {
 	f.mu.Lock()
@@ -588,6 +588,26 @@ func TestUpsertExternalKeyHandler_RejectsReservedIdentityHeader(t *testing.T) {
 	assert.Equal(t, 0, repo.created)
 	assert.Equal(t, 0, repo.softDeletedByProvider,
 		"a rejected upsert must not take out the working key it would have replaced")
+}
+
+func TestUpsertExternalKeyHandler_RejectsCollidingHeaderDestinationsBeforeReplacement(t *testing.T) {
+	t.Setenv(providers.APIKeyEnvVar(providers.ProviderAnthropic), "")
+
+	repo := &fakeExternalAPIKeyRepo{}
+	body, err := json.Marshal(map[string]any{
+		"provider":                 providers.ProviderAnthropic,
+		"key":                      "sk-test-key",
+		"forwarded_client_headers": []string{"X-Correlation-ID"},
+		"identity_header":          "x-correlation-id",
+		"identity_header_format":   auth.IdentityFormatEmail,
+	})
+	require.NoError(t, err)
+	rec := postProviderKeyBody(upsertKeyEngine(newUpsertKeyService(repo)), body)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Zero(t, repo.created)
+	assert.Zero(t, repo.softDeletedByProvider,
+		"invalid effective configuration must leave the active key untouched")
 }
 
 func aliasUpdateEngine(svc *auth.Service, models admin.DeployedModelsSource) *gin.Engine {

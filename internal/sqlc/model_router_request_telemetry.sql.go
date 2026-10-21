@@ -79,6 +79,7 @@ SELECT
     t.request_id,
     t.trace_id,
     t.session_id,
+    t.rollout_id,
     t.device_id,
     t.client_app,
     t.turn_type,
@@ -88,9 +89,25 @@ SELECT
     t.requested_model,
     t.decision_model,
     t.decision_provider,
+    t.route_id,
+    t.strategy,
+    t.policy_route_key,
+    t.cluster_router_version,
     t.candidate_models,
     t.chosen_score,
     t.decision_reason,
+    t.blind_experiment_arm,
+    t.blind_experiment_assignment_source,
+    t.blind_experiment_subject_key,
+    t.cohort_experiment_id,
+    t.cohort_group_id,
+    t.cohort_phase_index,
+    t.cohort_revision,
+    t.cohort_scheduled_arm,
+    t.cohort_treatment_applied,
+    t.cohort_bypass_reason,
+    t.policy_pin_requested,
+    t.policy_pin_honoured,
     t.sticky_hit,
     t.failover_used,
     t.cross_format,
@@ -99,12 +116,32 @@ SELECT
     t.output_tokens,
     t.cache_creation_tokens,
     t.cache_read_tokens,
-    -- The turn ran on the caller's own Claude/Codex subscription, so its
-    -- quota already paid for it and the export reports $0 against the real
-    -- token counts. credential_source itself stays internal.
+    t.cache_creation_1h_tokens,
+    t.reasoning_tokens,
+    t.speed,
+    t.inference_geo,
+    -- A Claude response with the plain overage claim used paid credits, even though the caller's
+    -- OAuth credential served it. Historical rows retain that evidence in
+    -- unified_limit_headers; newer rows also use subscription_overage source.
     -- COALESCE because credential_source is NULL on deployment-key turns, and
     -- NULL IN (...) is NULL, which cannot scan into the generated bool.
-    COALESCE(t.credential_source IN ('subscription', 'codex_subscription'), false)::boolean AS subscription_served,
+    COALESCE(
+        t.credential_source IN ('subscription', 'codex_subscription')
+        -- Successful rows recorded before status capture carry 0 and no error class.
+        AND ((t.upstream_status_code >= 200 AND t.upstream_status_code < 300)
+             OR (t.upstream_status_code = 0 AND t.error_class IS NULL))
+        AND (
+            t.unified_limit_headers->>'anthropic-ratelimit-unified-representative-claim' = 'overage'
+            AND t.unified_limit_headers->>'anthropic-ratelimit-unified-overage-in-use' = 'true'
+        ) IS DISTINCT FROM true,
+        false
+    )::boolean AS subscription_served,
+    t.credential_source,
+    t.subscription_account_id,
+    t.subscription_owner_id,
+    t.subscription_tier,
+    t.intended_model_family,
+    t.final_model_family,
     t.actual_input_cost_usd,
     t.actual_output_cost_usd,
     t.route_latency_ms,
@@ -115,7 +152,29 @@ SELECT
     t.upstream_finish_reason,
     t.stop_reason,
     t.tool_use_blocks,
-    t.invalid_tool_args_blocks
+    t.invalid_tool_args_blocks,
+    t.subscriber_plan,
+    t.entitlement_version,
+    t.capacity_source,
+    t.retail_usage_usd_micros,
+    t.included_usage_usd_micros,
+    t.linked_usage_usd_micros,
+    t.prepaid_usage_usd_micros,
+    t.settlement_failed,
+    t.serving_profile_id,
+    t.serving_profile_version,
+    t.serving_release_id,
+    t.serving_binding_id,
+    t.serving_target,
+    t.boost_optimizer_version,
+    t.policy_artifact_id,
+    t.policy_artifact_sha256,
+    t.roster_version,
+    t.selection_policy_release_id,
+    t.selection_policy_sha256,
+    t.client_git_head_sha,
+    t.client_git_branch,
+    t.client_git_dirty
 FROM router.model_router_request_telemetry t
 LEFT JOIN router.model_router_users u
     ON u.id = t.router_user_id
@@ -142,44 +201,93 @@ type GetRoutingDecisionsForExportParams struct {
 }
 
 type GetRoutingDecisionsForExportRow struct {
-	ID                    uuid.UUID
-	CreatedAt             pgtype.Timestamptz
-	Timestamp             pgtype.Timestamptz
-	RequestID             string
-	TraceID               string
-	SessionID             *string
-	DeviceID              *string
-	ClientApp             *string
-	TurnType              *string
-	RouterUserID          pgtype.UUID
-	UserEmail             *string
-	UserAccountUUID       pgtype.UUID
-	RequestedModel        *string
-	DecisionModel         *string
-	DecisionProvider      *string
-	CandidateModels       []string
-	ChosenScore           *float64
-	DecisionReason        *string
-	StickyHit             *bool
-	FailoverUsed          *bool
-	CrossFormat           *bool
-	EstimatedInputTokens  *int32
-	InputTokens           *int32
-	OutputTokens          *int32
-	CacheCreationTokens   *int32
-	CacheReadTokens       *int32
-	SubscriptionServed    bool
-	ActualInputCostUsd    *int64
-	ActualOutputCostUsd   *int64
-	RouteLatencyMs        *int64
-	UpstreamLatencyMs     *int64
-	TotalLatencyMs        *int64
-	TtftMs                *int64
-	UpstreamStatusCode    *int32
-	UpstreamFinishReason  *string
-	StopReason            *string
-	ToolUseBlocks         *int32
-	InvalidToolArgsBlocks *int32
+	ID                              uuid.UUID
+	CreatedAt                       pgtype.Timestamptz
+	Timestamp                       pgtype.Timestamptz
+	RequestID                       string
+	TraceID                         string
+	SessionID                       *string
+	RolloutID                       *string
+	DeviceID                        *string
+	ClientApp                       *string
+	TurnType                        *string
+	RouterUserID                    pgtype.UUID
+	UserEmail                       *string
+	UserAccountUUID                 pgtype.UUID
+	RequestedModel                  *string
+	DecisionModel                   *string
+	DecisionProvider                *string
+	RouteID                         *string
+	Strategy                        *string
+	PolicyRouteKey                  *string
+	ClusterRouterVersion            *string
+	CandidateModels                 []string
+	ChosenScore                     *float64
+	DecisionReason                  *string
+	BlindExperimentArm              *string
+	BlindExperimentAssignmentSource *string
+	BlindExperimentSubjectKey       *string
+	CohortExperimentID              pgtype.UUID
+	CohortGroupID                   *int16
+	CohortPhaseIndex                *int16
+	CohortRevision                  *int32
+	CohortScheduledArm              *string
+	CohortTreatmentApplied          *bool
+	CohortBypassReason              *string
+	PolicyPinRequested              *bool
+	PolicyPinHonoured               *bool
+	StickyHit                       *bool
+	FailoverUsed                    *bool
+	CrossFormat                     *bool
+	EstimatedInputTokens            *int32
+	InputTokens                     *int32
+	OutputTokens                    *int32
+	CacheCreationTokens             *int32
+	CacheReadTokens                 *int32
+	CacheCreation1hTokens           *int32
+	ReasoningTokens                 *int32
+	Speed                           *string
+	InferenceGeo                    *string
+	SubscriptionServed              bool
+	CredentialSource                *string
+	SubscriptionAccountID           pgtype.UUID
+	SubscriptionOwnerID             pgtype.UUID
+	SubscriptionTier                *string
+	IntendedModelFamily             *string
+	FinalModelFamily                *string
+	ActualInputCostUsd              *int64
+	ActualOutputCostUsd             *int64
+	RouteLatencyMs                  *int64
+	UpstreamLatencyMs               *int64
+	TotalLatencyMs                  *int64
+	TtftMs                          *int64
+	UpstreamStatusCode              *int32
+	UpstreamFinishReason            *string
+	StopReason                      *string
+	ToolUseBlocks                   *int32
+	InvalidToolArgsBlocks           *int32
+	SubscriberPlan                  *string
+	EntitlementVersion              *int64
+	CapacitySource                  *string
+	RetailUsageUsdMicros            *int64
+	IncludedUsageUsdMicros          *int64
+	LinkedUsageUsdMicros            *int64
+	PrepaidUsageUsdMicros           *int64
+	SettlementFailed                *bool
+	ServingProfileID                *string
+	ServingProfileVersion           *string
+	ServingReleaseID                *string
+	ServingBindingID                *string
+	ServingTarget                   *string
+	BoostOptimizerVersion           *string
+	PolicyArtifactID                *string
+	PolicyArtifactSha256            *string
+	RosterVersion                   *string
+	SelectionPolicyReleaseID        *string
+	SelectionPolicySha256           *string
+	ClientGitHeadSha                *string
+	ClientGitBranch                 *string
+	ClientGitDirty                  *bool
 }
 
 // Returns raw routing decisions for the analytics export, one row per upstream
@@ -189,8 +297,8 @@ type GetRoutingDecisionsForExportRow struct {
 // so only ingest order can guarantee "resume here and miss nothing".
 // cursor_created_at / cursor_id are NULL on the first page and carry the last
 // row of the previous page thereafter. The columns selected are the tier-b
-// export set; scorer internals (cluster_ids, candidate_scores, propensity,
-// alpha_breakdown, policy artifacts) and credential fragments are withheld.
+// export set; immutable policy and roster identities are included for benchmark
+// joins, while scorer internals and credential fragments remain withheld.
 //
 //	SELECT
 //	    t.id,
@@ -199,6 +307,7 @@ type GetRoutingDecisionsForExportRow struct {
 //	    t.request_id,
 //	    t.trace_id,
 //	    t.session_id,
+//	    t.rollout_id,
 //	    t.device_id,
 //	    t.client_app,
 //	    t.turn_type,
@@ -208,9 +317,25 @@ type GetRoutingDecisionsForExportRow struct {
 //	    t.requested_model,
 //	    t.decision_model,
 //	    t.decision_provider,
+//	    t.route_id,
+//	    t.strategy,
+//	    t.policy_route_key,
+//	    t.cluster_router_version,
 //	    t.candidate_models,
 //	    t.chosen_score,
 //	    t.decision_reason,
+//	    t.blind_experiment_arm,
+//	    t.blind_experiment_assignment_source,
+//	    t.blind_experiment_subject_key,
+//	    t.cohort_experiment_id,
+//	    t.cohort_group_id,
+//	    t.cohort_phase_index,
+//	    t.cohort_revision,
+//	    t.cohort_scheduled_arm,
+//	    t.cohort_treatment_applied,
+//	    t.cohort_bypass_reason,
+//	    t.policy_pin_requested,
+//	    t.policy_pin_honoured,
 //	    t.sticky_hit,
 //	    t.failover_used,
 //	    t.cross_format,
@@ -219,12 +344,32 @@ type GetRoutingDecisionsForExportRow struct {
 //	    t.output_tokens,
 //	    t.cache_creation_tokens,
 //	    t.cache_read_tokens,
-//	    -- The turn ran on the caller's own Claude/Codex subscription, so its
-//	    -- quota already paid for it and the export reports $0 against the real
-//	    -- token counts. credential_source itself stays internal.
+//	    t.cache_creation_1h_tokens,
+//	    t.reasoning_tokens,
+//	    t.speed,
+//	    t.inference_geo,
+//	    -- A Claude response with the plain overage claim used paid credits, even though the caller's
+//	    -- OAuth credential served it. Historical rows retain that evidence in
+//	    -- unified_limit_headers; newer rows also use subscription_overage source.
 //	    -- COALESCE because credential_source is NULL on deployment-key turns, and
 //	    -- NULL IN (...) is NULL, which cannot scan into the generated bool.
-//	    COALESCE(t.credential_source IN ('subscription', 'codex_subscription'), false)::boolean AS subscription_served,
+//	    COALESCE(
+//	        t.credential_source IN ('subscription', 'codex_subscription')
+//	        -- Successful rows recorded before status capture carry 0 and no error class.
+//	        AND ((t.upstream_status_code >= 200 AND t.upstream_status_code < 300)
+//	             OR (t.upstream_status_code = 0 AND t.error_class IS NULL))
+//	        AND (
+//	            t.unified_limit_headers->>'anthropic-ratelimit-unified-representative-claim' = 'overage'
+//	            AND t.unified_limit_headers->>'anthropic-ratelimit-unified-overage-in-use' = 'true'
+//	        ) IS DISTINCT FROM true,
+//	        false
+//	    )::boolean AS subscription_served,
+//	    t.credential_source,
+//	    t.subscription_account_id,
+//	    t.subscription_owner_id,
+//	    t.subscription_tier,
+//	    t.intended_model_family,
+//	    t.final_model_family,
 //	    t.actual_input_cost_usd,
 //	    t.actual_output_cost_usd,
 //	    t.route_latency_ms,
@@ -235,7 +380,29 @@ type GetRoutingDecisionsForExportRow struct {
 //	    t.upstream_finish_reason,
 //	    t.stop_reason,
 //	    t.tool_use_blocks,
-//	    t.invalid_tool_args_blocks
+//	    t.invalid_tool_args_blocks,
+//	    t.subscriber_plan,
+//	    t.entitlement_version,
+//	    t.capacity_source,
+//	    t.retail_usage_usd_micros,
+//	    t.included_usage_usd_micros,
+//	    t.linked_usage_usd_micros,
+//	    t.prepaid_usage_usd_micros,
+//	    t.settlement_failed,
+//	    t.serving_profile_id,
+//	    t.serving_profile_version,
+//	    t.serving_release_id,
+//	    t.serving_binding_id,
+//	    t.serving_target,
+//	    t.boost_optimizer_version,
+//	    t.policy_artifact_id,
+//	    t.policy_artifact_sha256,
+//	    t.roster_version,
+//	    t.selection_policy_release_id,
+//	    t.selection_policy_sha256,
+//	    t.client_git_head_sha,
+//	    t.client_git_branch,
+//	    t.client_git_dirty
 //	FROM router.model_router_request_telemetry t
 //	LEFT JOIN router.model_router_users u
 //	    ON u.id = t.router_user_id
@@ -273,6 +440,7 @@ func (q *Queries) GetRoutingDecisionsForExport(ctx context.Context, arg GetRouti
 			&i.RequestID,
 			&i.TraceID,
 			&i.SessionID,
+			&i.RolloutID,
 			&i.DeviceID,
 			&i.ClientApp,
 			&i.TurnType,
@@ -282,9 +450,25 @@ func (q *Queries) GetRoutingDecisionsForExport(ctx context.Context, arg GetRouti
 			&i.RequestedModel,
 			&i.DecisionModel,
 			&i.DecisionProvider,
+			&i.RouteID,
+			&i.Strategy,
+			&i.PolicyRouteKey,
+			&i.ClusterRouterVersion,
 			&i.CandidateModels,
 			&i.ChosenScore,
 			&i.DecisionReason,
+			&i.BlindExperimentArm,
+			&i.BlindExperimentAssignmentSource,
+			&i.BlindExperimentSubjectKey,
+			&i.CohortExperimentID,
+			&i.CohortGroupID,
+			&i.CohortPhaseIndex,
+			&i.CohortRevision,
+			&i.CohortScheduledArm,
+			&i.CohortTreatmentApplied,
+			&i.CohortBypassReason,
+			&i.PolicyPinRequested,
+			&i.PolicyPinHonoured,
 			&i.StickyHit,
 			&i.FailoverUsed,
 			&i.CrossFormat,
@@ -293,7 +477,17 @@ func (q *Queries) GetRoutingDecisionsForExport(ctx context.Context, arg GetRouti
 			&i.OutputTokens,
 			&i.CacheCreationTokens,
 			&i.CacheReadTokens,
+			&i.CacheCreation1hTokens,
+			&i.ReasoningTokens,
+			&i.Speed,
+			&i.InferenceGeo,
 			&i.SubscriptionServed,
+			&i.CredentialSource,
+			&i.SubscriptionAccountID,
+			&i.SubscriptionOwnerID,
+			&i.SubscriptionTier,
+			&i.IntendedModelFamily,
+			&i.FinalModelFamily,
 			&i.ActualInputCostUsd,
 			&i.ActualOutputCostUsd,
 			&i.RouteLatencyMs,
@@ -305,6 +499,28 @@ func (q *Queries) GetRoutingDecisionsForExport(ctx context.Context, arg GetRouti
 			&i.StopReason,
 			&i.ToolUseBlocks,
 			&i.InvalidToolArgsBlocks,
+			&i.SubscriberPlan,
+			&i.EntitlementVersion,
+			&i.CapacitySource,
+			&i.RetailUsageUsdMicros,
+			&i.IncludedUsageUsdMicros,
+			&i.LinkedUsageUsdMicros,
+			&i.PrepaidUsageUsdMicros,
+			&i.SettlementFailed,
+			&i.ServingProfileID,
+			&i.ServingProfileVersion,
+			&i.ServingReleaseID,
+			&i.ServingBindingID,
+			&i.ServingTarget,
+			&i.BoostOptimizerVersion,
+			&i.PolicyArtifactID,
+			&i.PolicyArtifactSha256,
+			&i.RosterVersion,
+			&i.SelectionPolicyReleaseID,
+			&i.SelectionPolicySha256,
+			&i.ClientGitHeadSha,
+			&i.ClientGitBranch,
+			&i.ClientGitDirty,
 		); err != nil {
 			return nil, err
 		}
@@ -328,7 +544,15 @@ SELECT
     COALESCE(SUM(t.output_tokens), 0)::bigint AS output_tokens,
     COALESCE(SUM(t.cache_creation_tokens), 0)::bigint AS cache_creation_tokens,
     COALESCE(SUM(t.cache_read_tokens), 0)::bigint AS cache_read_tokens,
-    MAX(t.created_at)::timestamptz AS last_recorded_at
+    MAX(t.created_at)::timestamptz AS last_recorded_at,
+    (SELECT latest.context_snapshot
+     FROM router.model_router_request_telemetry latest
+     WHERE latest.installation_id = $1::uuid
+       AND latest.session_id = $2::varchar
+       AND latest.span_type = 'router.upstream'
+       AND latest.turn_type IN ('main_loop', 'tool_result', 'compaction')
+     ORDER BY latest.timestamp DESC, latest.created_at DESC
+     LIMIT 1) AS context_snapshot
 FROM router.model_router_request_telemetry t
 WHERE t.installation_id = $1::uuid
   AND t.session_id = $2::varchar
@@ -353,6 +577,7 @@ type GetSessionCostRow struct {
 	CacheCreationTokens    int64
 	CacheReadTokens        int64
 	LastRecordedAt         pgtype.Timestamptz
+	ContextSnapshot        []byte
 }
 
 // Committed cost of one client session for this installation. Includes
@@ -371,7 +596,15 @@ type GetSessionCostRow struct {
 //	    COALESCE(SUM(t.output_tokens), 0)::bigint AS output_tokens,
 //	    COALESCE(SUM(t.cache_creation_tokens), 0)::bigint AS cache_creation_tokens,
 //	    COALESCE(SUM(t.cache_read_tokens), 0)::bigint AS cache_read_tokens,
-//	    MAX(t.created_at)::timestamptz AS last_recorded_at
+//	    MAX(t.created_at)::timestamptz AS last_recorded_at,
+//	    (SELECT latest.context_snapshot
+//	     FROM router.model_router_request_telemetry latest
+//	     WHERE latest.installation_id = $1::uuid
+//	       AND latest.session_id = $2::varchar
+//	       AND latest.span_type = 'router.upstream'
+//	       AND latest.turn_type IN ('main_loop', 'tool_result', 'compaction')
+//	     ORDER BY latest.timestamp DESC, latest.created_at DESC
+//	     LIMIT 1) AS context_snapshot
 //	FROM router.model_router_request_telemetry t
 //	WHERE t.installation_id = $1::uuid
 //	  AND t.session_id = $2::varchar
@@ -392,6 +625,7 @@ func (q *Queries) GetSessionCost(ctx context.Context, arg GetSessionCostParams) 
 		&i.CacheCreationTokens,
 		&i.CacheReadTokens,
 		&i.LastRecordedAt,
+		&i.ContextSnapshot,
 	)
 	return i, err
 }
@@ -1743,24 +1977,53 @@ INSERT INTO router.model_router_request_telemetry (
     policy_artifact_id,
     policy_artifact_sha256,
     roster_version,
+    classifier_artifact_id,
+    classifier_artifact_sha256,
+    classifier_predicted_label,
+    classifier_class_order,
+    classifier_probabilities,
+    selection_policy_release_id,
+    selection_policy_sha256,
+    selection_head_generation,
+    selection_trace,
     sidecar_schema_version,
     training_allowed,
     capture_mode,
     debug_ref,
     ttft_ms,
     cache_creation_tokens,
+    cache_creation_1h_tokens,
     cache_read_tokens,
+    reasoning_tokens,
+    speed,
+    inference_geo,
     device_id,
     session_id,
     router_user_id,
     client_app,
+    blind_experiment_arm,
+    blind_experiment_assignment_source,
+    blind_experiment_subject_key,
+    cohort_experiment_id,
+    cohort_group_id,
+    cohort_phase_index,
+    cohort_revision,
+    cohort_scheduled_arm,
+    cohort_treatment_applied,
+    cohort_bypass_reason,
     turn_type,
     rollout_id,
     upstream_finish_reason,
     stop_reason,
     tool_use_blocks,
     invalid_tool_args_blocks,
+    last_tool_use_name,
+    last_tool_use_input_bytes,
+    tool_error_counts,
+    autonomy_append_fired,
+    workspace_append_fired,
     failover_used,
+    failover_attempted,
     degenerate_shadow,
     session_key,
     role,
@@ -1771,7 +2034,14 @@ INSERT INTO router.model_router_request_telemetry (
     credential_key_prefix,
     credential_key_suffix,
     credential_source,
+    subscription_account_id,
+    subscription_owner_id,
+    subscription_tier,
+    intended_model_family,
+    final_model_family,
     unified_limit_headers,
+    policy_pin_requested,
+    policy_pin_honoured,
     planner_outcome,
     planner_reason,
     planner_pin_model,
@@ -1806,7 +2076,43 @@ INSERT INTO router.model_router_request_telemetry (
     spiral_steps_since_progress,
     spiral_edit_attempted,
     spiral_reasons,
-    requested_allowed_models
+    requested_allowed_models,
+    inference_purpose,
+    inference_policy_id,
+    inference_registry_revision,
+    inference_policy_revision,
+    plan_model,
+    plan_provider,
+    fallback_reason,
+    accounting_outcome,
+    usage_known,
+    client_git_head_sha,
+    client_git_branch,
+    client_git_dirty,
+    effort_arm,
+    effort_selected,
+    effort_sent,
+    effort_source,
+    subscriber_plan,
+    entitlement_version,
+    capacity_source,
+    retail_usage_usd_micros,
+    included_usage_usd_micros,
+    linked_usage_usd_micros,
+    prepaid_usage_usd_micros,
+    settlement_failed,
+    serving_profile_id,
+    serving_profile_version,
+    serving_release_id,
+    serving_binding_id,
+    serving_target,
+    boost_optimizer_version,
+    user_prompt,
+    user_prompt_gap_ms,
+    user_prompt_gap_prior_model,
+    error_class,
+    latest_tool_call_counts,
+    context_snapshot
 ) VALUES (
     $1::uuid,
     $2::uuid,
@@ -1847,69 +2153,141 @@ INSERT INTO router.model_router_request_telemetry (
     $37::varchar,
     $38::varchar,
     $39::varchar,
-    $40::boolean,
+    $40::varchar,
     $41::varchar,
-    $42::varchar,
-    $43::bigint,
-    $44::int,
-    $45::int,
-    $46::varchar,
-    $47::varchar,
-    $48::uuid,
-    $49::text,
+    $42::varchar[],
+    $43::jsonb,
+    $44::varchar,
+    $45::varchar,
+    $46::bigint,
+    $47::jsonb,
+    $48::varchar,
+    $49::boolean,
     $50::varchar,
     $51::varchar,
-    $52::text,
-    $53::text,
+    $52::bigint,
+    $53::int,
     $54::int,
     $55::int,
-    $56::boolean,
-    $57::boolean,
-    $58::bytea,
+    $56::int,
+    $57::text,
+    $58::text,
     $59::varchar,
     $60::varchar,
-    $61::jsonb,
-    $62::bigint,
-    $63::int,
+    $61::uuid,
+    $62::text,
+    $63::varchar,
     $64::varchar,
     $65::varchar,
-    $66::varchar,
-    $67::jsonb,
-    $68::varchar,
-    $69::varchar,
+    $66::uuid,
+    $67::smallint,
+    $68::smallint,
+    $69::integer,
     $70::varchar,
-    $71::varchar,
-    $72::bigint,
-    $73::bigint,
-    $74::boolean,
-    $75::varchar,
-    $76::bigint,
-    $77::varchar,
-    $78::boolean,
+    $71::boolean,
+    $72::varchar,
+    $73::varchar,
+    $74::varchar,
+    $75::text,
+    $76::text,
+    $77::int,
+    $78::int,
     $79::varchar,
-    $80::varchar,
-    $81::varchar,
-    $82::bigint,
-    $83::bigint,
+    $80::int,
+    $81::jsonb,
+    $82::boolean,
+    $83::boolean,
     $84::boolean,
-    $85::varchar,
-    $86::bigint,
-    $87::double precision,
-    $88::double precision,
-    $89::int,
-    $90::int,
-    $91::int,
+    $85::boolean,
+    $86::boolean,
+    $87::bytea,
+    $88::varchar,
+    $89::varchar,
+    $90::jsonb,
+    $91::bigint,
     $92::int,
     $93::varchar,
-    $94::double precision,
-    $95::int,
-    $96::int,
-    $97::int,
-    $98::int,
-    $99::int,
-    $100::boolean,
-    $101::varchar[],
-    $102::varchar[]
+    $94::varchar,
+    $95::varchar,
+    $96::uuid,
+    $97::uuid,
+    $98::varchar,
+    $99::varchar,
+    $100::varchar,
+    $101::jsonb,
+    $102::boolean,
+    $103::boolean,
+    $104::varchar,
+    $105::varchar,
+    $106::varchar,
+    $107::varchar,
+    $108::bigint,
+    $109::bigint,
+    $110::boolean,
+    $111::varchar,
+    $112::bigint,
+    $113::varchar,
+    $114::boolean,
+    $115::varchar,
+    $116::varchar,
+    $117::varchar,
+    $118::bigint,
+    $119::bigint,
+    $120::boolean,
+    $121::varchar,
+    $122::bigint,
+    $123::double precision,
+    $124::double precision,
+    $125::int,
+    $126::int,
+    $127::int,
+    $128::int,
+    $129::varchar,
+    $130::double precision,
+    $131::int,
+    $132::int,
+    $133::int,
+    $134::int,
+    $135::int,
+    $136::boolean,
+    $137::varchar[],
+    $138::varchar[],
+    $139::varchar,
+    $140::varchar,
+    $141::varchar,
+    $142::varchar,
+    $143::varchar,
+    $144::varchar,
+    $145::varchar,
+    $146::varchar,
+    $147::boolean,
+    $148::varchar,
+    $149::varchar,
+    $150::boolean,
+    $151::varchar,
+    $152::varchar,
+    $153::varchar,
+    $154::varchar,
+    $155::varchar,
+    $156::bigint,
+    $157::varchar,
+    $158::bigint,
+    $159::bigint,
+    $160::bigint,
+    $161::bigint,
+    $162::boolean,
+    $163::varchar,
+    $164::varchar,
+    $165::varchar,
+    $166::varchar,
+    $167::varchar,
+    $168::varchar,
+    $169::boolean,
+    $170::bigint,
+    $171::varchar,
+    $172::varchar,
+    $173::jsonb,
+    $174::jsonb
 )
 ON CONFLICT (installation_id, request_id, span_type) DO NOTHING
 `
@@ -1953,24 +2331,53 @@ type InsertRequestTelemetryParams struct {
 	PolicyArtifactID                         *string
 	PolicyArtifactSha256                     *string
 	RosterVersion                            *string
+	ClassifierArtifactID                     *string
+	ClassifierArtifactSha256                 *string
+	ClassifierPredictedLabel                 *string
+	ClassifierClassOrder                     []string
+	ClassifierProbabilities                  []byte
+	SelectionPolicyReleaseID                 *string
+	SelectionPolicySha256                    *string
+	SelectionHeadGeneration                  *int64
+	SelectionTrace                           []byte
 	SidecarSchemaVersion                     *string
 	TrainingAllowed                          bool
 	CaptureMode                              string
 	DebugRef                                 *string
 	TtftMs                                   *int64
 	CacheCreationTokens                      *int32
+	CacheCreation1hTokens                    *int32
 	CacheReadTokens                          *int32
+	ReasoningTokens                          *int32
+	Speed                                    *string
+	InferenceGeo                             *string
 	DeviceID                                 *string
 	SessionID                                *string
 	RouterUserID                             pgtype.UUID
 	ClientApp                                *string
+	BlindExperimentArm                       *string
+	BlindExperimentAssignmentSource          *string
+	BlindExperimentSubjectKey                *string
+	CohortExperimentID                       pgtype.UUID
+	CohortGroupID                            *int16
+	CohortPhaseIndex                         *int16
+	CohortRevision                           *int32
+	CohortScheduledArm                       *string
+	CohortTreatmentApplied                   *bool
+	CohortBypassReason                       *string
 	TurnType                                 string
 	RolloutID                                *string
 	UpstreamFinishReason                     *string
 	StopReason                               *string
 	ToolUseBlocks                            *int32
 	InvalidToolArgsBlocks                    *int32
+	LastToolUseName                          *string
+	LastToolUseInputBytes                    *int32
+	ToolErrorCounts                          []byte
+	AutonomyAppendFired                      *bool
+	WorkspaceAppendFired                     *bool
 	FailoverUsed                             *bool
+	FailoverAttempted                        *bool
 	DegenerateShadow                         *bool
 	SessionKey                               []byte
 	Role                                     *string
@@ -1981,7 +2388,14 @@ type InsertRequestTelemetryParams struct {
 	CredentialKeyPrefix                      *string
 	CredentialKeySuffix                      *string
 	CredentialSource                         *string
+	SubscriptionAccountID                    pgtype.UUID
+	SubscriptionOwnerID                      pgtype.UUID
+	SubscriptionTier                         *string
+	IntendedModelFamily                      *string
+	FinalModelFamily                         *string
 	UnifiedLimitHeaders                      []byte
+	PolicyPinRequested                       *bool
+	PolicyPinHonoured                        *bool
 	PlannerOutcome                           *string
 	PlannerReason                            *string
 	PlannerPinModel                          *string
@@ -2017,6 +2431,42 @@ type InsertRequestTelemetryParams struct {
 	SpiralEditAttempted                      *bool
 	SpiralReasons                            []string
 	RequestedAllowedModels                   []string
+	InferencePurpose                         *string
+	InferencePolicyID                        *string
+	InferenceRegistryRevision                *string
+	InferencePolicyRevision                  *string
+	PlanModel                                *string
+	PlanProvider                             *string
+	FallbackReason                           *string
+	AccountingOutcome                        *string
+	UsageKnown                               *bool
+	ClientGitHeadSha                         *string
+	ClientGitBranch                          *string
+	ClientGitDirty                           *bool
+	EffortArm                                *string
+	EffortSelected                           *string
+	EffortSent                               *string
+	EffortSource                             *string
+	SubscriberPlan                           *string
+	EntitlementVersion                       *int64
+	CapacitySource                           *string
+	RetailUsageUsdMicros                     *int64
+	IncludedUsageUsdMicros                   *int64
+	LinkedUsageUsdMicros                     *int64
+	PrepaidUsageUsdMicros                    *int64
+	SettlementFailed                         *bool
+	ServingProfileID                         *string
+	ServingProfileVersion                    *string
+	ServingReleaseID                         *string
+	ServingBindingID                         *string
+	ServingTarget                            *string
+	BoostOptimizerVersion                    *string
+	UserPrompt                               *bool
+	UserPromptGapMs                          *int64
+	UserPromptGapPriorModel                  *string
+	ErrorClass                               *string
+	LatestToolCallCounts                     []byte
+	ContextSnapshot                          []byte
 }
 
 // Records a completed proxied request for the dashboard UI and routing
@@ -2025,7 +2475,7 @@ type InsertRequestTelemetryParams struct {
 // cluster_router_version, ttft_ms, cache_*_tokens, device_id, session_id) are
 // nullable; non-cluster decisions and pinned-route turns leave them NULL.
 // turn_type is the turntype classification (main_loop, tool_result, probe,
-// title_gen, compaction, classifier, sub_agent_dispatch); NULL only on rows
+// title_gen, compaction, classifier, recap, sub_agent_dispatch); NULL only on rows
 // written before the column existed.
 // rollout_id is the client-supplied x-weave-rollout-id correlation id used by
 // eval/training harnesses to join graded rollout rewards onto decisions; NULL
@@ -2052,6 +2502,30 @@ type InsertRequestTelemetryParams struct {
 // set observed on this turn (Claude Code cost-observing-proxy Phase 0
 // instrumentation). NULL on non-subscription turns and on rows written before
 // the column existed. Nothing reads it yet.
+// inference_* / plan_* / fallback_reason / accounting_outcome / usage_known are
+// the inference-policy provenance of the operation (purpose, policy entry and
+// revisions, policy-selected target, why the served target differs, how usage
+// was accounted). NULL on rows written before the columns existed and on paths
+// not yet migrated to the executor.
+// client_git_head_sha / client_git_branch / client_git_dirty are the git
+// context parsed from the Claude Code system prompt on a trial-mode session's
+// first turn. NULL on every other turn and whenever the block was absent or
+// unparseable; never read on the routing path.
+// effort_* columns persist the per-turn effort resolution: the arm's own
+// level, the level that won precedence, the level written on the wire after
+// the target menu clamp, and which precedence branch produced it. NULL when
+// the target expresses no effort.
+// user_prompt marks a turn whose trailing input is text a person typed rather
+// than a tool result or harness notice; user_prompt_gap_ms is how long after
+// the session's previous response finished that prompt arrived, and
+// user_prompt_gap_prior_model is the model that served that response. The gap
+// is NULL on the session's first prompt and when the previous response
+// overlapped this one. error_class buckets how the turn failed (NULL on a
+// normal completion). latest_tool_call_counts is {tool: {calls, errors}} over
+// only the tool results this request delivered, unlike tool_error_counts,
+// which re-counts the whole history on every turn.
+// failover_used marks a turn a rescue served; failover_attempted marks any turn
+// on which a rescue was dispatched, whether or not it served.
 //
 //	INSERT INTO router.model_router_request_telemetry (
 //	    installation_id,
@@ -2092,24 +2566,53 @@ type InsertRequestTelemetryParams struct {
 //	    policy_artifact_id,
 //	    policy_artifact_sha256,
 //	    roster_version,
+//	    classifier_artifact_id,
+//	    classifier_artifact_sha256,
+//	    classifier_predicted_label,
+//	    classifier_class_order,
+//	    classifier_probabilities,
+//	    selection_policy_release_id,
+//	    selection_policy_sha256,
+//	    selection_head_generation,
+//	    selection_trace,
 //	    sidecar_schema_version,
 //	    training_allowed,
 //	    capture_mode,
 //	    debug_ref,
 //	    ttft_ms,
 //	    cache_creation_tokens,
+//	    cache_creation_1h_tokens,
 //	    cache_read_tokens,
+//	    reasoning_tokens,
+//	    speed,
+//	    inference_geo,
 //	    device_id,
 //	    session_id,
 //	    router_user_id,
 //	    client_app,
+//	    blind_experiment_arm,
+//	    blind_experiment_assignment_source,
+//	    blind_experiment_subject_key,
+//	    cohort_experiment_id,
+//	    cohort_group_id,
+//	    cohort_phase_index,
+//	    cohort_revision,
+//	    cohort_scheduled_arm,
+//	    cohort_treatment_applied,
+//	    cohort_bypass_reason,
 //	    turn_type,
 //	    rollout_id,
 //	    upstream_finish_reason,
 //	    stop_reason,
 //	    tool_use_blocks,
 //	    invalid_tool_args_blocks,
+//	    last_tool_use_name,
+//	    last_tool_use_input_bytes,
+//	    tool_error_counts,
+//	    autonomy_append_fired,
+//	    workspace_append_fired,
 //	    failover_used,
+//	    failover_attempted,
 //	    degenerate_shadow,
 //	    session_key,
 //	    role,
@@ -2120,7 +2623,14 @@ type InsertRequestTelemetryParams struct {
 //	    credential_key_prefix,
 //	    credential_key_suffix,
 //	    credential_source,
+//	    subscription_account_id,
+//	    subscription_owner_id,
+//	    subscription_tier,
+//	    intended_model_family,
+//	    final_model_family,
 //	    unified_limit_headers,
+//	    policy_pin_requested,
+//	    policy_pin_honoured,
 //	    planner_outcome,
 //	    planner_reason,
 //	    planner_pin_model,
@@ -2155,7 +2665,43 @@ type InsertRequestTelemetryParams struct {
 //	    spiral_steps_since_progress,
 //	    spiral_edit_attempted,
 //	    spiral_reasons,
-//	    requested_allowed_models
+//	    requested_allowed_models,
+//	    inference_purpose,
+//	    inference_policy_id,
+//	    inference_registry_revision,
+//	    inference_policy_revision,
+//	    plan_model,
+//	    plan_provider,
+//	    fallback_reason,
+//	    accounting_outcome,
+//	    usage_known,
+//	    client_git_head_sha,
+//	    client_git_branch,
+//	    client_git_dirty,
+//	    effort_arm,
+//	    effort_selected,
+//	    effort_sent,
+//	    effort_source,
+//	    subscriber_plan,
+//	    entitlement_version,
+//	    capacity_source,
+//	    retail_usage_usd_micros,
+//	    included_usage_usd_micros,
+//	    linked_usage_usd_micros,
+//	    prepaid_usage_usd_micros,
+//	    settlement_failed,
+//	    serving_profile_id,
+//	    serving_profile_version,
+//	    serving_release_id,
+//	    serving_binding_id,
+//	    serving_target,
+//	    boost_optimizer_version,
+//	    user_prompt,
+//	    user_prompt_gap_ms,
+//	    user_prompt_gap_prior_model,
+//	    error_class,
+//	    latest_tool_call_counts,
+//	    context_snapshot
 //	) VALUES (
 //	    $1::uuid,
 //	    $2::uuid,
@@ -2196,69 +2742,141 @@ type InsertRequestTelemetryParams struct {
 //	    $37::varchar,
 //	    $38::varchar,
 //	    $39::varchar,
-//	    $40::boolean,
+//	    $40::varchar,
 //	    $41::varchar,
-//	    $42::varchar,
-//	    $43::bigint,
-//	    $44::int,
-//	    $45::int,
-//	    $46::varchar,
-//	    $47::varchar,
-//	    $48::uuid,
-//	    $49::text,
+//	    $42::varchar[],
+//	    $43::jsonb,
+//	    $44::varchar,
+//	    $45::varchar,
+//	    $46::bigint,
+//	    $47::jsonb,
+//	    $48::varchar,
+//	    $49::boolean,
 //	    $50::varchar,
 //	    $51::varchar,
-//	    $52::text,
-//	    $53::text,
+//	    $52::bigint,
+//	    $53::int,
 //	    $54::int,
 //	    $55::int,
-//	    $56::boolean,
-//	    $57::boolean,
-//	    $58::bytea,
+//	    $56::int,
+//	    $57::text,
+//	    $58::text,
 //	    $59::varchar,
 //	    $60::varchar,
-//	    $61::jsonb,
-//	    $62::bigint,
-//	    $63::int,
+//	    $61::uuid,
+//	    $62::text,
+//	    $63::varchar,
 //	    $64::varchar,
 //	    $65::varchar,
-//	    $66::varchar,
-//	    $67::jsonb,
-//	    $68::varchar,
-//	    $69::varchar,
+//	    $66::uuid,
+//	    $67::smallint,
+//	    $68::smallint,
+//	    $69::integer,
 //	    $70::varchar,
-//	    $71::varchar,
-//	    $72::bigint,
-//	    $73::bigint,
-//	    $74::boolean,
-//	    $75::varchar,
-//	    $76::bigint,
-//	    $77::varchar,
-//	    $78::boolean,
+//	    $71::boolean,
+//	    $72::varchar,
+//	    $73::varchar,
+//	    $74::varchar,
+//	    $75::text,
+//	    $76::text,
+//	    $77::int,
+//	    $78::int,
 //	    $79::varchar,
-//	    $80::varchar,
-//	    $81::varchar,
-//	    $82::bigint,
-//	    $83::bigint,
+//	    $80::int,
+//	    $81::jsonb,
+//	    $82::boolean,
+//	    $83::boolean,
 //	    $84::boolean,
-//	    $85::varchar,
-//	    $86::bigint,
-//	    $87::double precision,
-//	    $88::double precision,
-//	    $89::int,
-//	    $90::int,
-//	    $91::int,
+//	    $85::boolean,
+//	    $86::boolean,
+//	    $87::bytea,
+//	    $88::varchar,
+//	    $89::varchar,
+//	    $90::jsonb,
+//	    $91::bigint,
 //	    $92::int,
 //	    $93::varchar,
-//	    $94::double precision,
-//	    $95::int,
-//	    $96::int,
-//	    $97::int,
-//	    $98::int,
-//	    $99::int,
-//	    $100::boolean,
-//	    $101::varchar[],
-//	    $102::varchar[]
+//	    $94::varchar,
+//	    $95::varchar,
+//	    $96::uuid,
+//	    $97::uuid,
+//	    $98::varchar,
+//	    $99::varchar,
+//	    $100::varchar,
+//	    $101::jsonb,
+//	    $102::boolean,
+//	    $103::boolean,
+//	    $104::varchar,
+//	    $105::varchar,
+//	    $106::varchar,
+//	    $107::varchar,
+//	    $108::bigint,
+//	    $109::bigint,
+//	    $110::boolean,
+//	    $111::varchar,
+//	    $112::bigint,
+//	    $113::varchar,
+//	    $114::boolean,
+//	    $115::varchar,
+//	    $116::varchar,
+//	    $117::varchar,
+//	    $118::bigint,
+//	    $119::bigint,
+//	    $120::boolean,
+//	    $121::varchar,
+//	    $122::bigint,
+//	    $123::double precision,
+//	    $124::double precision,
+//	    $125::int,
+//	    $126::int,
+//	    $127::int,
+//	    $128::int,
+//	    $129::varchar,
+//	    $130::double precision,
+//	    $131::int,
+//	    $132::int,
+//	    $133::int,
+//	    $134::int,
+//	    $135::int,
+//	    $136::boolean,
+//	    $137::varchar[],
+//	    $138::varchar[],
+//	    $139::varchar,
+//	    $140::varchar,
+//	    $141::varchar,
+//	    $142::varchar,
+//	    $143::varchar,
+//	    $144::varchar,
+//	    $145::varchar,
+//	    $146::varchar,
+//	    $147::boolean,
+//	    $148::varchar,
+//	    $149::varchar,
+//	    $150::boolean,
+//	    $151::varchar,
+//	    $152::varchar,
+//	    $153::varchar,
+//	    $154::varchar,
+//	    $155::varchar,
+//	    $156::bigint,
+//	    $157::varchar,
+//	    $158::bigint,
+//	    $159::bigint,
+//	    $160::bigint,
+//	    $161::bigint,
+//	    $162::boolean,
+//	    $163::varchar,
+//	    $164::varchar,
+//	    $165::varchar,
+//	    $166::varchar,
+//	    $167::varchar,
+//	    $168::varchar,
+//	    $169::boolean,
+//	    $170::bigint,
+//	    $171::varchar,
+//	    $172::varchar,
+//	    $173::jsonb,
+//	    $174::jsonb
 //	)
 //	ON CONFLICT (installation_id, request_id, span_type) DO NOTHING
 func (q *Queries) InsertRequestTelemetry(ctx context.Context, arg InsertRequestTelemetryParams) error {
@@ -2301,24 +2919,53 @@ func (q *Queries) InsertRequestTelemetry(ctx context.Context, arg InsertRequestT
 		arg.PolicyArtifactID,
 		arg.PolicyArtifactSha256,
 		arg.RosterVersion,
+		arg.ClassifierArtifactID,
+		arg.ClassifierArtifactSha256,
+		arg.ClassifierPredictedLabel,
+		arg.ClassifierClassOrder,
+		arg.ClassifierProbabilities,
+		arg.SelectionPolicyReleaseID,
+		arg.SelectionPolicySha256,
+		arg.SelectionHeadGeneration,
+		arg.SelectionTrace,
 		arg.SidecarSchemaVersion,
 		arg.TrainingAllowed,
 		arg.CaptureMode,
 		arg.DebugRef,
 		arg.TtftMs,
 		arg.CacheCreationTokens,
+		arg.CacheCreation1hTokens,
 		arg.CacheReadTokens,
+		arg.ReasoningTokens,
+		arg.Speed,
+		arg.InferenceGeo,
 		arg.DeviceID,
 		arg.SessionID,
 		arg.RouterUserID,
 		arg.ClientApp,
+		arg.BlindExperimentArm,
+		arg.BlindExperimentAssignmentSource,
+		arg.BlindExperimentSubjectKey,
+		arg.CohortExperimentID,
+		arg.CohortGroupID,
+		arg.CohortPhaseIndex,
+		arg.CohortRevision,
+		arg.CohortScheduledArm,
+		arg.CohortTreatmentApplied,
+		arg.CohortBypassReason,
 		arg.TurnType,
 		arg.RolloutID,
 		arg.UpstreamFinishReason,
 		arg.StopReason,
 		arg.ToolUseBlocks,
 		arg.InvalidToolArgsBlocks,
+		arg.LastToolUseName,
+		arg.LastToolUseInputBytes,
+		arg.ToolErrorCounts,
+		arg.AutonomyAppendFired,
+		arg.WorkspaceAppendFired,
 		arg.FailoverUsed,
+		arg.FailoverAttempted,
 		arg.DegenerateShadow,
 		arg.SessionKey,
 		arg.Role,
@@ -2329,7 +2976,14 @@ func (q *Queries) InsertRequestTelemetry(ctx context.Context, arg InsertRequestT
 		arg.CredentialKeyPrefix,
 		arg.CredentialKeySuffix,
 		arg.CredentialSource,
+		arg.SubscriptionAccountID,
+		arg.SubscriptionOwnerID,
+		arg.SubscriptionTier,
+		arg.IntendedModelFamily,
+		arg.FinalModelFamily,
 		arg.UnifiedLimitHeaders,
+		arg.PolicyPinRequested,
+		arg.PolicyPinHonoured,
 		arg.PlannerOutcome,
 		arg.PlannerReason,
 		arg.PlannerPinModel,
@@ -2365,6 +3019,42 @@ func (q *Queries) InsertRequestTelemetry(ctx context.Context, arg InsertRequestT
 		arg.SpiralEditAttempted,
 		arg.SpiralReasons,
 		arg.RequestedAllowedModels,
+		arg.InferencePurpose,
+		arg.InferencePolicyID,
+		arg.InferenceRegistryRevision,
+		arg.InferencePolicyRevision,
+		arg.PlanModel,
+		arg.PlanProvider,
+		arg.FallbackReason,
+		arg.AccountingOutcome,
+		arg.UsageKnown,
+		arg.ClientGitHeadSha,
+		arg.ClientGitBranch,
+		arg.ClientGitDirty,
+		arg.EffortArm,
+		arg.EffortSelected,
+		arg.EffortSent,
+		arg.EffortSource,
+		arg.SubscriberPlan,
+		arg.EntitlementVersion,
+		arg.CapacitySource,
+		arg.RetailUsageUsdMicros,
+		arg.IncludedUsageUsdMicros,
+		arg.LinkedUsageUsdMicros,
+		arg.PrepaidUsageUsdMicros,
+		arg.SettlementFailed,
+		arg.ServingProfileID,
+		arg.ServingProfileVersion,
+		arg.ServingReleaseID,
+		arg.ServingBindingID,
+		arg.ServingTarget,
+		arg.BoostOptimizerVersion,
+		arg.UserPrompt,
+		arg.UserPromptGapMs,
+		arg.UserPromptGapPriorModel,
+		arg.ErrorClass,
+		arg.LatestToolCallCounts,
+		arg.ContextSnapshot,
 	)
 	return err
 }

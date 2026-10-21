@@ -49,7 +49,7 @@ var RouterFeedbackLabels = map[string]struct{}{
 // usage guidance. Returns (zero, false) when no command is present.
 func (env *RequestEnvelope) ExtractRouterFeedbackCommand() (RouterFeedbackResult, bool) {
 	var res RouterFeedbackResult
-	found, fromToolResult := env.extractLeadingCommandWithSource(func(text string) (bool, string) {
+	found, fromToolResult := env.extractLeadingCommandWithSource(func(text string, _ bool) (bool, string) {
 		r, ok, stripped := parseRouterFeedbackCommand(text)
 		if ok {
 			res = r
@@ -74,13 +74,21 @@ func (env *RequestEnvelope) StripRouterFeedbackArtifacts() int {
 		return 0
 	}
 
+	all := msgs.Array()
 	lastUserIdx := -1
-	msgs.ForEach(func(key, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			lastUserIdx = int(key.Int())
+	for i := range all {
+		if all[i].Get("role").String() != "user" {
+			continue
 		}
-		return true
-	})
+		// Codex appends the invoked skill's SKILL.md as its own user message
+		// after the typed directive. Counting that attachment as the trailing
+		// user turn makes the directive itself look like a prior one, so it gets
+		// stripped here before ExtractRouterFeedbackCommand ever sees it.
+		if isSkillAttachment(all, i) {
+			continue
+		}
+		lastUserIdx = i
+	}
 
 	removed := 0
 	rebuilt := make([]string, 0, len(msgs.Array()))

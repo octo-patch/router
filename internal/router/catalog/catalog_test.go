@@ -3,7 +3,7 @@ package catalog
 import (
 	"testing"
 
-	"workweave/router/internal/providers"
+	"weave-os/router/internal/providers"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,6 +31,7 @@ func TestCatalog_BindingsReferenceCanonicalProviders(t *testing.T) {
 		providers.ProviderGoogle:           {},
 		providers.ProviderOpenRouter:       {},
 		providers.ProviderFireworks:        {},
+		providers.ProviderDeepInfra:        {},
 		providers.ProviderBedrock:          {},
 		providers.ProviderMakora:           {},
 		providers.ProviderMiniMax:          {},
@@ -50,11 +51,28 @@ func TestCatalog_BindingsReferenceCanonicalProviders(t *testing.T) {
 	}
 }
 
+func TestCatalog_CodexSubscriptionModelsUseOpenAI(t *testing.T) {
+	for _, model := range Models {
+		if !model.CodexSubscription {
+			continue
+		}
+		require.NotEmpty(t, model.Providers, "Codex subscription model %q has no provider", model.ID)
+		assert.Equal(t, providers.ProviderOpenAI, model.Providers[0].Provider,
+			"Codex subscription model %q must resolve through native OpenAI", model.ID)
+	}
+}
+
 func TestCatalog_BindingsHavePositivePrice(t *testing.T) {
 	for _, m := range Models {
 		for i, b := range m.Providers {
 			assert.Greaterf(t, b.Price.InputUSDPer1M, 0.0, "%s binding %d (%s) has non-positive InputUSDPer1M", m.ID, i, b.Provider)
 			assert.Greaterf(t, b.Price.OutputUSDPer1M, 0.0, "%s binding %d (%s) has non-positive OutputUSDPer1M", m.ID, i, b.Provider)
+			if b.Price.LongContext != nil {
+				assert.Greaterf(t, b.Price.LongContext.ThresholdTokens, 0, "%s binding %d (%s) has non-positive long-context threshold", m.ID, i, b.Provider)
+				assert.Greaterf(t, b.Price.LongContext.InputUSDPer1M, 0.0, "%s binding %d (%s) has non-positive long-context input price", m.ID, i, b.Provider)
+				assert.Greaterf(t, b.Price.LongContext.OutputUSDPer1M, 0.0, "%s binding %d (%s) has non-positive long-context output price", m.ID, i, b.Provider)
+				assert.Lessf(t, b.Price.LongContext.ThresholdTokens, ContextWindowFor(m.ID), "%s binding %d (%s) long-context threshold must be below its context window", m.ID, i, b.Provider)
+			}
 		}
 	}
 }
@@ -81,6 +99,21 @@ func TestByID_OpenAIDashedDateStrippedFallback(t *testing.T) {
 func TestByID_UnknownReturnsFalse(t *testing.T) {
 	_, ok := ByID("definitely-not-a-model")
 	assert.False(t, ok)
+}
+
+func TestCodexSubscriptionCoverageComesFromCatalog(t *testing.T) {
+	assert.ElementsMatch(t, []string{
+		"gpt-5.6-luna",
+		"gpt-5.6-sol",
+		"gpt-5.6-terra",
+		"gpt-6-luna",
+		"gpt-6-sol",
+		"gpt-6.1-sol",
+	}, CodexSubscriptionModels())
+	assert.True(t, CodexSubscriptionCoversModel("gpt-6-luna"))
+	assert.False(t, CodexSubscriptionCoversModel("gpt-5.4-nano"))
+	assert.False(t, CodexSubscriptionCoversModel("gpt-5.6-luna-pro"))
+	assert.False(t, CodexSubscriptionCoversModel("gpt-6-luna-2026-10-01"))
 }
 
 func TestPriceFor_UnknownProviderForKnownModel(t *testing.T) {
@@ -154,7 +187,7 @@ func TestResolveBinding_MiniMaxUsesNativeModelIDs(t *testing.T) {
 		cacheReadMultiplier float64
 	}{
 		{model: "minimax/minimax-m3.1-flash", upstreamID: "MiniMax-M3.1-Flash", inputPrice: 0.150, outputPrice: 0.600, cacheReadMultiplier: 0.10},
-		{model: "minimax/minimax-m3", upstreamID: "MiniMax-M3", inputPrice: 0.600, outputPrice: 2.400, cacheReadMultiplier: 0.20},
+		{model: "minimax/minimax-m3", upstreamID: "MiniMax-M3", inputPrice: 0.300, outputPrice: 1.200, cacheReadMultiplier: 0.20},
 		{model: "minimax/minimax-m2.7", upstreamID: "MiniMax-M2.7", inputPrice: 0.300, outputPrice: 1.200, cacheReadMultiplier: 0.20},
 	}
 
@@ -178,8 +211,8 @@ func TestGPT56ProCatalogRowsAreDirectOpenAIRoutable(t *testing.T) {
 		inputUSDPer1M  float64
 		outputUSDPer1M float64
 	}{
-		{"gpt-5.6-luna-pro", "gpt-5.6-luna", 1.00, 6.00},
-		{"gpt-5.6-sol-pro", "gpt-5.6-sol", 5.00, 30.00},
+		{"gpt-5.6-luna-pro", "gpt-5.6-luna", 0.20, 1.20},
+		{"gpt-5.6-sol-pro", "gpt-5.6-sol", 4.00, 20.00},
 	}
 
 	for _, tc := range cases {
@@ -197,8 +230,44 @@ func TestGPT56ProCatalogRowsAreDirectOpenAIRoutable(t *testing.T) {
 			assert.Equal(t, tc.inputUSDPer1M, binding.Price.InputUSDPer1M)
 			assert.Equal(t, tc.outputUSDPer1M, binding.Price.OutputUSDPer1M)
 			assert.Equal(t, 0.10, binding.Price.CacheReadMultiplier)
+			require.NotNil(t, binding.Price.LongContext)
+			assert.Equal(t, 272_000, binding.Price.LongContext.ThresholdTokens)
 		})
 	}
+}
+
+func TestGPT6AstraCatalogRow(t *testing.T) {
+	model, ok := ByID("gpt-6-astra")
+	require.True(t, ok)
+	assert.Equal(t, TierHigh, model.Tier)
+	assert.Equal(t, 1_050_000, model.ContextWindow)
+
+	binding, ok := ResolveBinding("gpt-6-astra", map[string]struct{}{providers.ProviderOpenAI: {}})
+	require.True(t, ok)
+	assert.Equal(t, providers.ProviderOpenAI, binding.Provider)
+	assert.Equal(t, 10.00, binding.Price.InputUSDPer1M)
+	assert.Equal(t, 50.00, binding.Price.OutputUSDPer1M)
+	assert.Equal(t, 0.10, binding.Price.CacheReadMultiplier)
+	assert.Equal(t, 1.25, binding.Price.CacheWriteMultiplier)
+
+	fast, ok := FastPriceFor(providers.ProviderOpenAI, "gpt-6-astra")
+	require.True(t, ok)
+	assert.Equal(t, 20.00, fast.InputUSDPer1M)
+	assert.Equal(t, 100.00, fast.OutputUSDPer1M)
+	assert.Equal(t, 0.10, fast.CacheReadMultiplier)
+	assert.Equal(t, 1.25, fast.CacheWriteMultiplier)
+}
+
+func TestGemini4ArgonCatalogRow(t *testing.T) {
+	model, ok := ByID(ModelIDGemini4Argon.String())
+	require.True(t, ok)
+	assert.Equal(t, TierUnknown, model.Tier, "Argon is a beta HMM target, not a default cluster arm")
+	assert.True(t, model.HMMTarget)
+	require.Len(t, model.Providers, 1)
+	assert.Equal(t, providers.ProviderGoogle, model.Providers[0].Provider)
+	available := map[string]struct{}{providers.ProviderGoogle: {}}
+	assert.Contains(t, HMMRoutingTargetSet(available), model.ID)
+	assert.NotContains(t, RoutingTargetSet(available), model.ID)
 }
 
 func TestRoutingTargetSet_FiltersByTierAndRegisteredProviders(t *testing.T) {
@@ -214,6 +283,24 @@ func TestRoutingTargetSet_AcceptsAnyRegisteredFallbackBinding(t *testing.T) {
 
 	assert.Contains(t, targets, "qwen/qwen3-coder-next", "a registered fallback binding makes the model dispatchable")
 	assert.NotContains(t, targets, "gpt-5.6-terra", "models with no registered binding stay unavailable")
+}
+
+func TestResolveBinding_UsesFireworksForTogetherDedicatedEndpointModels(t *testing.T) {
+	for _, id := range []string{
+		"deepseek/deepseek-v4-pro",
+		"deepseek/deepseek-v4-pro-0813",
+		"moonshotai/kimi-k2.7",
+		"z-ai/glm-5.1",
+	} {
+		t.Run(id, func(t *testing.T) {
+			_, ok := ResolveBinding(id, map[string]struct{}{providers.ProviderTogether: {}})
+			assert.False(t, ok, "model must not resolve through an unavailable binding")
+
+			binding, ok := ResolveBinding(id, map[string]struct{}{providers.ProviderFireworks: {}})
+			require.True(t, ok, "Fireworks remains a routable binding")
+			assert.Equal(t, providers.ProviderFireworks, binding.Provider)
+		})
+	}
 }
 
 func TestHMMRoutingTargetSetIncludesHMMOnlyTargets(t *testing.T) {
@@ -355,6 +442,10 @@ func TestContextWindowFor_KnownModels(t *testing.T) {
 	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-5.6-terra"))
 	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-5.6-luna"))
 	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-5.6-luna-pro"))
+	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-6-astra"))
+	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-6-sol"))
+	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-6.1-sol"))
+	assert.Equal(t, 1_050_000, ContextWindowFor("gpt-6-luna"))
 	// GPT-4.1 family has 1M context.
 	assert.Equal(t, 1_047_576, ContextWindowFor("gpt-4.1"))
 	// Gemini models have 1M context.
@@ -377,6 +468,18 @@ func TestContextWindowFor_KnownModels(t *testing.T) {
 	assert.Equal(t, DefaultContextWindow, ContextWindowFor("not-a-real-model"))
 }
 
+func TestGPT61SolCachedAndLongContextPricing(t *testing.T) {
+	price, ok := PriceFor(providers.ProviderOpenAI, "gpt-6.1-sol")
+	require.True(t, ok)
+	assert.Equal(t, 0.05, price.CacheReadMultiplier)
+	require.NotNil(t, price.LongContext)
+	assert.Equal(t, 272_000, price.LongContext.ThresholdTokens)
+	assert.Equal(t, 4.0, price.LongContext.InputUSDPer1M)
+	assert.Equal(t, 15.0, price.LongContext.OutputUSDPer1M)
+
+	assert.True(t, SupportsFastMode("gpt-6.1-sol"))
+}
+
 func TestValidateDeployed_FlagsMissingAndUntiered(t *testing.T) {
 	err := ValidateDeployed([]string{"claude-opus-4-7"})
 	assert.NoError(t, err)
@@ -395,8 +498,14 @@ func TestValidateDeployed_FlagsMissingAndUntiered(t *testing.T) {
 // Wafer only resolves when the earlier providers are absent, so a deploy with
 // Makora/Together/Fireworks wired never displaces them onto Wafer.
 func TestResolveBinding_WaferTrailingBindings(t *testing.T) {
-	// glm-5.3-flash: Makora leads; Together and Wafer trail it, Fireworks last.
-	b, ok := ResolveBinding("z-ai/glm-5.3-flash", map[string]struct{}{
+	// glm-5.3-flash: DeepInfra leads; Makora, Together, and Wafer trail it,
+	// with Fireworks last.
+	b, ok := ResolveBinding("z-ai/glm-5.3-flash", map[string]struct{}{providers.ProviderDeepInfra: {}})
+	require.True(t, ok)
+	assert.Equal(t, providers.ProviderDeepInfra, b.Provider)
+	assert.Equal(t, "zai-org/GLM-5.3-Flash", b.UpstreamID)
+
+	b, ok = ResolveBinding("z-ai/glm-5.3-flash", map[string]struct{}{
 		providers.ProviderMakora: {}, providers.ProviderTogether: {}, providers.ProviderFireworks: {},
 	})
 	require.True(t, ok)
@@ -478,7 +587,7 @@ func TestResolveBinding_WaferTrailingBindings(t *testing.T) {
 }
 
 func TestGLM53FlashProviderPricing(t *testing.T) {
-	for _, provider := range []string{providers.ProviderMakora, providers.ProviderFireworks} {
+	for _, provider := range []string{providers.ProviderDeepInfra, providers.ProviderMakora, providers.ProviderFireworks} {
 		t.Run(provider, func(t *testing.T) {
 			p, ok := PriceFor(provider, "z-ai/glm-5.3-flash")
 			require.True(t, ok)
@@ -487,6 +596,25 @@ func TestGLM53FlashProviderPricing(t *testing.T) {
 			assert.InDelta(t, 0.03/0.150, p.CacheReadMultiplier, 1e-9)
 		})
 	}
+}
+
+func TestMaxCandidateProviders(t *testing.T) {
+	for _, model := range []string{
+		"inclusionai/ling-3.0-flash",
+		"xiaomi/mimo-v2.6-flash",
+		"xiaomi/mimo-v2.6-pro",
+	} {
+		binding, ok := ResolveBinding(model, map[string]struct{}{providers.ProviderDeepInfra: {}})
+		require.True(t, ok, "DeepInfra should resolve %s", model)
+		assert.Equal(t, providers.ProviderDeepInfra, binding.Provider)
+	}
+
+	deepSeekBinding, ok := ResolveBinding("deepseek/deepseek-v4.1-flash", map[string]struct{}{
+		providers.ProviderDeepInfra: {}, providers.ProviderFireworks: {},
+	})
+	require.True(t, ok)
+	assert.Equal(t, providers.ProviderFireworks, deepSeekBinding.Provider,
+		"DeepSeek V4.1 Flash remains Fireworks-primary")
 }
 
 // TestWaferPricing pins the per-1M rates and cache multipliers as published on
@@ -525,8 +653,8 @@ func TestAnthropicGatewayPricesCacheReadsLikeDirectAnthropic(t *testing.T) {
 
 			assert.InDelta(t, 0.10, gateway.CacheReadMultiplier, 1e-9)
 			assert.InDelta(t,
-				EffectiveInputCost(0, 0, 1_000_000, direct.InputUSDPer1M, direct, providers.ProviderAnthropic),
-				EffectiveInputCost(0, 0, 1_000_000, gateway.InputUSDPer1M, gateway, providers.ProviderAnthropicGateway),
+				EffectiveInputCost(0, 0, 1_000_000, direct, providers.ProviderAnthropic, UsageModifiers{}),
+				EffectiveInputCost(0, 0, 1_000_000, gateway, providers.ProviderAnthropicGateway, UsageModifiers{}),
 				1e-9,
 			)
 		})

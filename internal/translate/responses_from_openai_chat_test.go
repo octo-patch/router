@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -99,6 +99,28 @@ func TestPrepareOpenAIResponses_FromChatCompletions_RequestShape(t *testing.T) {
 	assert.Equal(t, "function", tool["type"])
 	assert.Equal(t, "bash", tool["name"], "Responses tools are flat — no nested function wrapper")
 	assert.NotNil(t, tool["parameters"])
+}
+
+func TestPrepareOpenAIResponses_FromChatCompletions_ClosesNestedWorkflowArgsSchemas(t *testing.T) {
+	out := prepareChatOnResponses(t, `{
+	  "model":"copilot",
+	  "messages":[{"role":"user","content":"run workflow"}],
+	  "tools":[{"type":"function","function":{"name":"run_dynamic_workflow","parameters":{
+	    "type":"object",
+	    "properties":{"args":{"type":"object","properties":{"workflow":{"type":"string","oneOf":[{"type":"string"},{"type":"null"}]}},"required":["workflow"]}},
+	    "required":["args"]
+	  }}}]
+	}`, translate.EmitOptions{TargetModel: "gpt-6-luna", Capabilities: router.Lookup("gpt-6-luna")})
+
+	tools, _ := out["tools"].([]any)
+	require.Len(t, tools, 1)
+	tool, _ := tools[0].(map[string]any)
+	params, _ := tool["parameters"].(map[string]any)
+	require.NotNil(t, params)
+	assert.Equal(t, false, params["additionalProperties"])
+	args := params["properties"].(map[string]any)["args"].(map[string]any)
+	assert.Equal(t, false, args["additionalProperties"], "nested args objects must be closed for OpenAI")
+	assert.Equal(t, false, tool["strict"], "object unions stay non-strict when strictification cannot preserve their semantics")
 }
 
 // A mid-conversation system message must stay in place: hoisting it to the

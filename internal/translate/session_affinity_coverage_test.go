@@ -3,8 +3,8 @@ package translate_test
 import (
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +47,7 @@ var expectedSessionAffinityMechanism = map[string]sessionAffinityMechanism{
 // x-session-affinity header default is correct for them.
 var defaultMechanismProviders = map[string]struct{}{
 	providers.ProviderFireworks: {},
+	providers.ProviderDeepInfra: {},
 	providers.ProviderMakora:    {},
 	providers.ProviderMiniMax:   {},
 	providers.ProviderTogether:  {},

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,12 +18,76 @@ import (
 )
 
 func codexCtx(token, accountID string) context.Context {
-	return context.WithValue(context.Background(), proxy.CredentialsContextKey{}, &proxy.Credentials{
+	return context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, &requestcontext.Credentials{
 		APIKey:    []byte(token),
 		AccountID: []byte(accountID),
 		Source:    "codex_subscription",
 		OAuth:     true,
 	})
+}
+
+func TestProxy_CodexOutOfRosterModelPreservesSelectedWireID(t *testing.T) {
+	const model = "gpt-6-astra"
+	var receivedModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveSyntheticCodexQuota(w, r) {
+			return
+		}
+		assert.Equal(t, "/responses", r.URL.Path)
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		receivedModel = gjson.GetBytes(body, "model").String()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\\n\\n")
+	}))
+	defer upstream.Close()
+
+	client := NewClient("deployment-key", "https://api.openai.example.invalid")
+	client.SetCodexBaseURL(upstream.URL)
+	prepared := providers.PreparedRequest{
+		Body:     []byte(`{"model":"` + model + `","input":"hi","stream":true}`),
+		Endpoint: providers.EndpointResponses,
+		Headers:  make(http.Header),
+	}
+	err := client.Proxy(codexCtx("synthetic-codex-jwt", "synthetic-account"), router.Decision{
+		Model: model, Provider: providers.ProviderOpenAI,
+	}, prepared, httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	require.NoError(t, err)
+	assert.Equal(t, model, receivedModel)
+}
+
+func TestProxy_CodexLunaSubscriptionDispatch(t *testing.T) {
+	const model = "gpt-6-luna"
+	var receivedModel, receivedAccount, receivedAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveSyntheticCodexQuota(w, r) {
+			return
+		}
+		assert.Equal(t, "/responses", r.URL.Path)
+		receivedAccount = r.Header.Get(requestcontext.ChatGPTAccountIDHeader)
+		receivedAuth = r.Header.Get("Authorization")
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		receivedModel = gjson.GetBytes(body, "model").String()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	client := NewClient("deployment-key", "https://api.openai.example.invalid")
+	client.SetCodexBaseURL(upstream.URL)
+	prepared := providers.PreparedRequest{
+		Body:     []byte(`{"model":"` + model + `","input":"hi","stream":true}`),
+		Endpoint: providers.EndpointResponses,
+		Headers:  make(http.Header),
+	}
+	err := client.Proxy(codexCtx("synthetic-codex-jwt", "synthetic-account"), router.Decision{
+		Model: model, Provider: providers.ProviderOpenAI,
+	}, prepared, httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	require.NoError(t, err)
+	assert.Equal(t, model, receivedModel)
+	assert.Equal(t, "synthetic-account", receivedAccount)
+	assert.Equal(t, "Bearer synthetic-codex-jwt", receivedAuth)
 }
 
 // TestProxy_CodexSubscriptionDispatch verifies a Codex (ChatGPT) subscription
@@ -34,6 +98,9 @@ func TestProxy_CodexSubscriptionDispatch(t *testing.T) {
 	var gotPath, gotAuth, gotAccount, gotBeta, gotOriginator string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveSyntheticCodexQuota(w, r) {
+			return
+		}
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		gotAccount = r.Header.Get("ChatGPT-Account-ID")
@@ -74,6 +141,9 @@ func TestProxy_CodexSubscriptionDispatch(t *testing.T) {
 func TestProxy_CodexSubscriptionStripsUnsupportedParams(t *testing.T) {
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveSyntheticCodexQuota(w, r) {
+			return
+		}
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
@@ -130,35 +200,28 @@ func TestProxy_CodexSubscriptionCredentialRejectsInfrastructureModel(t *testing.
 	assert.Contains(t, err.Error(), "refusing Codex subscription credential")
 }
 
-// TestProxy_CodexCredOnChatEndpointDoesNotMisroute guards the Bugbot finding:
-// the Codex backend only accepts the Responses schema, so a chat-completions
-// prep that happens to resolve a Codex credential must NOT be posted to the
-// Codex /responses endpoint. The switch is gated on EndpointResponses.
-func TestProxy_CodexCredOnChatEndpointDoesNotMisroute(t *testing.T) {
-	var gotPath, gotAccount string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAccount = r.Header.Get("ChatGPT-Account-ID")
+// TestProxy_CodexCredOnChatEndpointIsRejected guards the credential boundary:
+// ChatGPT OAuth is accepted only by the Codex Responses endpoint.
+func TestProxy_CodexCredOnChatEndpointIsRejected(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	defer upstream.Close()
 
 	c := NewClient("deployment-key", upstream.URL)
-	c.codexBaseURL = "https://chatgpt.example.invalid" // must NOT be used for a chat body
+	c.codexBaseURL = "https://chatgpt.example.invalid"
 
-	// EndpointChatCompletions (zero value) — a chat-shaped body.
 	prep := providers.PreparedRequest{Body: []byte(`{"model":"gpt-5.6-sol","messages":[]}`), Headers: make(http.Header)}
 	rec := httptest.NewRecorder()
 	clientReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
 
 	ctx := codexCtx("eyJhbGciOiJ-codex-jwt", "acct-12345")
 	err := c.Proxy(ctx, router.Decision{Model: "gpt-5.6-sol", Provider: providers.ProviderOpenAI}, prep, rec, clientReq)
-	require.NoError(t, err)
-
-	assert.Equal(t, "/v1/chat/completions", gotPath,
-		"a chat-completions body must never be posted to the Codex /responses endpoint, even with a Codex credential")
-	assert.Empty(t, gotAccount, "the Codex account-id header must not be set on a non-Responses dispatch")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Codex subscription credentials require a Responses endpoint")
+	assert.Zero(t, requests, "Codex OAuth must never be sent to the public Chat Completions endpoint")
 }
 
 // TestProxy_NoCodexCredHitsOpenAI confirms the Codex switch is gated on the
@@ -167,6 +230,9 @@ func TestProxy_CodexCredOnChatEndpointDoesNotMisroute(t *testing.T) {
 func TestProxy_NoCodexCredHitsOpenAI(t *testing.T) {
 	var gotPath, gotAccount string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveSyntheticCodexQuota(w, r) {
+			return
+		}
 		gotPath = r.URL.Path
 		gotAccount = r.Header.Get("ChatGPT-Account-ID")
 		w.WriteHeader(http.StatusOK)
@@ -188,39 +254,49 @@ func TestProxy_NoCodexCredHitsOpenAI(t *testing.T) {
 	assert.Empty(t, gotAccount, "a non-subscription request must not send the Codex account-id header")
 }
 
-// TestProxy_ResponsesMaxEffortClampedWithoutCodexCred guards against the
-// api.openai.com 400 on "max" effort: without a Codex credential the request
-// lands on api.openai.com (not the Codex backend), which rejects "max".
-func TestProxy_ResponsesMaxEffortClampedWithoutCodexCred(t *testing.T) {
-	var gotPath string
-	var gotBody []byte
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotBody, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
-	}))
-	defer upstream.Close()
+// TestProxy_ResponsesMaxEffortMatchesPublicModelMenu guards the per-model
+// distinction: GPT-5.6 rejects max publicly, while GPT-6 Astra accepts it.
+func TestProxy_ResponsesMaxEffortMatchesPublicModelMenu(t *testing.T) {
+	for _, tc := range []struct {
+		model      string
+		wantEffort string
+	}{
+		{model: "gpt-5.6-sol", wantEffort: "xhigh"},
+		{model: "gpt-6-astra", wantEffort: "max"},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			var gotPath string
+			var gotBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveSyntheticCodexQuota(w, r) {
+					return
+				}
+				gotPath = r.URL.Path
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+			}))
+			defer upstream.Close()
 
-	c := NewClient("deployment-key", upstream.URL)
-	c.codexBaseURL = "https://chatgpt.example.invalid" // must NOT be used
+			c := NewClient("deployment-key", upstream.URL)
+			c.codexBaseURL = "https://chatgpt.example.invalid"
+			body := []byte(`{"model":"` + tc.model + `","input":"hi","stream":true,"reasoning":{"effort":"max","summary":"detailed"}}`)
+			prep := providers.PreparedRequest{Body: body, Endpoint: providers.EndpointResponses, Headers: make(http.Header)}
+			err := c.Proxy(
+				context.Background(),
+				router.Decision{Model: tc.model, Provider: providers.ProviderOpenAI},
+				prep,
+				httptest.NewRecorder(),
+				httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("")),
+			)
+			require.NoError(t, err)
 
-	body := []byte(`{"model":"gpt-5.6-sol","input":"hi","stream":true,"reasoning":{"effort":"max","summary":"detailed"}}`)
-	prep := providers.PreparedRequest{Body: body, Endpoint: providers.EndpointResponses, Headers: make(http.Header)}
-	rec := httptest.NewRecorder()
-	clientReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))
-
-	// No Codex subscription credential in ctx — mirrors a router-keyed /
-	// BYOK / deployment-key Codex turn.
-	err := c.Proxy(context.Background(), router.Decision{Model: "gpt-5.6-sol", Provider: providers.ProviderOpenAI}, prep, rec, clientReq)
-	require.NoError(t, err)
-
-	assert.Equal(t, "/v1/responses", gotPath, "must dispatch to the public Responses API, not the Codex backend")
-	assert.JSONEq(t,
-		`{"model":"gpt-5.6-sol","input":"hi","stream":true,"reasoning":{"effort":"xhigh","summary":"detailed"}}`,
-		string(gotBody),
-		"'max' must be clamped to 'xhigh' (the top public-API level) before reaching api.openai.com; nothing else in the body changes")
+			assert.Equal(t, "/v1/responses", gotPath)
+			assert.Equal(t, tc.wantEffort, gjson.GetBytes(gotBody, "reasoning.effort").String())
+			assert.Equal(t, "detailed", gjson.GetBytes(gotBody, "reasoning.summary").String())
+		})
+	}
 }
 
 // TestProxy_ResponsesMaxEffortUnchangedWithCodexCred confirms the clamp is
@@ -228,6 +304,9 @@ func TestProxy_ResponsesMaxEffortClampedWithoutCodexCred(t *testing.T) {
 func TestProxy_ResponsesMaxEffortUnchangedWithCodexCred(t *testing.T) {
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveSyntheticCodexQuota(w, r) {
+			return
+		}
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)

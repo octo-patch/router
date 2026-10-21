@@ -3,10 +3,20 @@ package translate
 import (
 	"strings"
 
-	"workweave/router/internal/websearch"
+	"weave-os/router/internal/websearch"
 
 	"github.com/tidwall/gjson"
 )
+
+// IsNativeWebSearchSubTurn reports whether this is Claude Code's isolated
+// one-message request to execute Anthropic's native web-search tool.
+func (e *RequestEnvelope) IsNativeWebSearchSubTurn() bool {
+	if e == nil || e.format != FormatAnthropic {
+		return false
+	}
+	_, ok := websearch.DetectSearchTurn(e.body)
+	return ok
+}
 
 // SearchToolUseRecency reports how many assistant turns have elapsed since the last actual
 // web-search/fetch tool invocation (not mere advertisement): 0 = current turn,
@@ -14,7 +24,7 @@ import (
 func (e *RequestEnvelope) SearchToolUseRecency() int {
 	switch e.format {
 	case FormatAnthropic:
-		if _, ok := websearch.DetectSearchTurn(e.body); ok {
+		if e.IsNativeWebSearchSubTurn() {
 			return 0
 		}
 		return searchUseRecency(gjson.GetBytes(e.body, "messages"), anthropicSearchUse)

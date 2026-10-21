@@ -3,13 +3,14 @@ package proxy
 import (
 	"context"
 	"encoding/binary"
+	"strings"
 	"time"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 )
@@ -87,6 +88,12 @@ var editToolNames = map[string]struct{}{
 	"Edit": {}, "Write": {}, "MultiEdit": {}, "NotebookEdit": {},
 }
 
+func isCodexPollingCall(args string) bool {
+	return strings.HasPrefix(args, "exec:") &&
+		strings.Contains(args, "write_stdin") &&
+		strings.Contains(args, `\"chars\":\"\"`)
+}
+
 // detectCyclicToolCallLoop reports a wide re-read cycle: cyclicLoopMinCalls+
 // calls with distinct-signature ratio below cyclicLoopMaxDistinctRatio and no
 // edit/write call in the window (the #271 false-positive guard — a healthy
@@ -101,9 +108,15 @@ func detectCyclicToolCallLoop(env *translate.RequestEnvelope) (looped bool, top 
 		start = len(sigs) - cyclicLoopWindowSize
 	}
 	window := sigs[start:]
+	args := env.AssistantToolCallArgsPreview(start, 200)
 	counts := make(map[string]int, len(window))
 	keys := make(map[string]translate.ToolCallSig, len(window))
-	for _, s := range window {
+	nonPollingCount := 0
+	for i, s := range window {
+		if i < len(args) && isCodexPollingCall(args[i]) {
+			continue
+		}
+		nonPollingCount++
 		if _, isEdit := editToolNames[s.Name]; isEdit {
 			// Real progress in the window — not a stuck loop.
 			return false, translate.ToolCallSig{}, 0, 0, len(window)
@@ -112,7 +125,10 @@ func detectCyclicToolCallLoop(env *translate.RequestEnvelope) (looped bool, top 
 		counts[key]++
 		keys[key] = s
 	}
-	distinctRatio = float64(len(counts)) / float64(len(window))
+	if nonPollingCount < cyclicLoopMinCalls {
+		return false, translate.ToolCallSig{}, 0, 0, len(window)
+	}
+	distinctRatio = float64(len(counts)) / float64(nonPollingCount)
 	if distinctRatio >= cyclicLoopMaxDistinctRatio {
 		return false, translate.ToolCallSig{}, 0, distinctRatio, len(window)
 	}
@@ -141,17 +157,23 @@ func (s *Service) handleLoopEscalation(
 	sessionKey [sessionpin.SessionKeyLen]byte,
 	role string,
 	routedModel string,
+	isSubagent bool,
 	forceModelSessionKeys ...[sessionpin.SessionKeyLen]byte,
 ) {
 	log := observability.FromContext(ctx)
 
 	loopingModel := routedModel
 	userForced := false
+	var forcePin sessionpin.Pin
+	var forceModelActive, forceModelCleared bool
+	if len(forceModelSessionKeys) > 0 {
+		forcePin, forceModelActive, forceModelCleared = s.loadForceModelSessionPin(ctx, forceModelSessionKeys[0], sessionKey, isSubagent)
+	}
 	if s.pinStore != nil && installationID != uuid.Nil {
 		existing, found, err := s.pinStore.Get(ctx, sessionKey, role)
 		if err != nil {
 			log.Error("loop-escalation: prior pin lookup failed", "err", err)
-		} else if found && pinMatchesEffectiveStrategy(ctx, existing) {
+		} else if found && pinMatchesEffectiveStrategy(ctx, existing) && !(forceModelCleared && isUserForcedReason(existing.Reason)) {
 			if existing.Reason == translate.ReasonLoopEscalation {
 				return // already rescued this session; don't re-pin or double-log
 			}
@@ -165,12 +187,10 @@ func (s *Service) handleLoopEscalation(
 			}
 		}
 	}
-	if len(forceModelSessionKeys) > 0 {
-		forcePin, active, _ := s.loadForceModelSessionPin(ctx, forceModelSessionKeys[0])
-		if active {
-			userForced = true
-			loopingModel = forcePin.Model
-		}
+
+	if forceModelActive {
+		userForced = true
+		loopingModel = forcePin.Model
 	}
 
 	// Once-per-session budget, durable past pin TTL expiry: covers sessions

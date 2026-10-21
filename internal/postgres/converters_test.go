@@ -3,10 +3,11 @@ package postgres
 import (
 	"testing"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/sqlc"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/sqlc"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -58,14 +59,51 @@ func TestToAuthInstallationPolicyRouting(t *testing.T) {
 	assert.True(t, inst.AITrainingAllowed)
 }
 
-func TestToAuthInstallationSubscriptionConditionalModels(t *testing.T) {
+func TestToAuthInstallationTrialMode(t *testing.T) {
+	enrollment := uuid.New()
 	inst := toAuthInstallation(sqlc.RouterModelRouterInstallation{
-		ID:                             uuid.New(),
-		ExternalID:                     "org-conditional",
-		ModelsWhenSubscriptionActive:   []string{"claude-sonnet-5"},
-		ModelsWhenSubscriptionInactive: []string{"gpt-5.6-terra"},
+		ID:                  uuid.New(),
+		ExternalID:          "org-trial",
+		TrialCaptureEnabled: true,
+		TrialEnrollmentID:   pgtype.UUID{Bytes: enrollment, Valid: true},
+	})
+	assert.True(t, inst.TrialCaptureEnabled)
+	assert.Equal(t, enrollment.String(), inst.TrialEnrollmentID)
+
+	unenrolled := toAuthInstallation(sqlc.RouterModelRouterInstallation{ID: uuid.New(), ExternalID: "org-plain"})
+	assert.False(t, unenrolled.TrialCaptureEnabled)
+	assert.Empty(t, unenrolled.TrialEnrollmentID)
+}
+
+func TestToAuthInstallationSubscriptionStateModelsIncludeNewCatalogModels(t *testing.T) {
+	inst := toAuthInstallation(sqlc.RouterModelRouterInstallation{
+		ID:                                     uuid.New(),
+		ExternalID:                             "org-subscription-state",
+		SubscriptionStateModelsEnabled:         true,
+		ModelsWhenSubscriptionActive:           []string{"gpt-6-luna", "claude-opus-5-5"},
+		ModelsWhenSubscriptionInactive:         []string{"gpt-6-luna", "claude-opus-5-5"},
+		ModelsExcludedWhenSubscriptionActive:   []string{"claude-opus-5-5"},
+		ModelsExcludedWhenSubscriptionInactive: []string{"gpt-6-luna"},
 	})
 
-	assert.Equal(t, []string{"claude-sonnet-5"}, inst.ModelsWhenSubscriptionActive)
-	assert.Equal(t, []string{"gpt-5.6-terra"}, inst.ModelsWhenSubscriptionInactive)
+	assert.True(t, inst.SubscriptionStateModelsEnabled)
+	assert.Contains(t, inst.ModelsWhenSubscriptionActive, "gpt-6.1-sol")
+	assert.Contains(t, inst.ModelsWhenSubscriptionActive, "gpt-6-luna")
+	assert.NotContains(t, inst.ModelsWhenSubscriptionActive, "claude-opus-5-5")
+	assert.Contains(t, inst.ModelsWhenSubscriptionInactive, "gpt-6.1-sol")
+	assert.Contains(t, inst.ModelsWhenSubscriptionInactive, "claude-opus-5-5")
+	assert.NotContains(t, inst.ModelsWhenSubscriptionInactive, "gpt-6-luna")
+}
+
+func TestToAuthInstallationSubscriptionStateModelsDisabledIgnoresLegacyLists(t *testing.T) {
+	inst := toAuthInstallation(sqlc.RouterModelRouterInstallation{
+		ID:                             uuid.New(),
+		ExternalID:                     "org-subscription-state-off",
+		ModelsWhenSubscriptionActive:   []string{"gpt-6-luna"},
+		ModelsWhenSubscriptionInactive: []string{"gpt-6-luna"},
+	})
+
+	assert.False(t, inst.SubscriptionStateModelsEnabled)
+	assert.Empty(t, inst.ModelsWhenSubscriptionActive)
+	assert.Empty(t, inst.ModelsWhenSubscriptionInactive)
 }

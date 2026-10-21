@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"workweave/router/internal/observability/otel"
+	"weave-os/router/internal/observability/otel"
 )
 
 func TestLookup(t *testing.T) {
@@ -18,18 +18,25 @@ func TestLookup(t *testing.T) {
 		// ── Anthropic ──────────────────────────────────────────
 		{name: "claude-fable-5-1", model: "claude-fable-5-1", wantInput: 10.00, wantOutput: 50.00},
 		{name: "claude-fable-5", model: "claude-fable-5", wantInput: 10.00, wantOutput: 50.00},
+		{name: "claude-opus-5-5", model: "claude-opus-5-5", wantInput: 4.00, wantOutput: 20.00},
 		{name: "claude-opus-5", model: "claude-opus-5", wantInput: 5.00, wantOutput: 25.00},
 		{name: "claude-opus-4-8", model: "claude-opus-4-8", wantInput: 5.00, wantOutput: 25.00},
 		{name: "claude-opus-4-7", model: "claude-opus-4-7", wantInput: 5.00, wantOutput: 25.00},
 		{name: "claude-opus-4-6", model: "claude-opus-4-6", wantInput: 5.00, wantOutput: 25.00},
-		{name: "claude-sonnet-5", model: "claude-sonnet-5", wantInput: 3.00, wantOutput: 15.00},
+		{name: "claude-sonnet-5-5", model: "claude-sonnet-5-5", wantInput: 2.00, wantOutput: 10.00},
+		{name: "claude-haiku-5-5", model: "claude-haiku-5-5", wantInput: 0.10, wantOutput: 0.50},
+		{name: "claude-sonnet-5", model: "claude-sonnet-5", wantInput: 2.00, wantOutput: 10.00},
 		{name: "claude-sonnet-4-5", model: "claude-sonnet-4-5", wantInput: 3.00, wantOutput: 15.00},
 		{name: "claude-haiku-4-5", model: "claude-haiku-4-5", wantInput: 1.00, wantOutput: 5.00},
 
 		// ── OpenAI GPT-5.5 ─────────────────────────────────────
-		{name: "gpt-5.6-sol", model: "gpt-5.6-sol", wantInput: 5.00, wantOutput: 30.00},
-		{name: "gpt-5.6-terra", model: "gpt-5.6-terra", wantInput: 2.50, wantOutput: 15.00},
-		{name: "gpt-5.6-luna", model: "gpt-5.6-luna", wantInput: 1.00, wantOutput: 6.00},
+		{name: "gpt-6-astra", model: "gpt-6-astra", wantInput: 10.00, wantOutput: 50.00},
+		{name: "gpt-6-sol", model: "gpt-6-sol", wantInput: 2.00, wantOutput: 10.00},
+		{name: "gpt-6.1-sol", model: "gpt-6.1-sol", wantInput: 2.00, wantOutput: 10.00},
+		{name: "gpt-6-luna", model: "gpt-6-luna", wantInput: 0.10, wantOutput: 0.50},
+		{name: "gpt-5.6-sol", model: "gpt-5.6-sol", wantInput: 4.00, wantOutput: 20.00},
+		{name: "gpt-5.6-terra", model: "gpt-5.6-terra", wantInput: 2.00, wantOutput: 12.00},
+		{name: "gpt-5.6-luna", model: "gpt-5.6-luna", wantInput: 0.20, wantOutput: 1.20},
 		{name: "gpt-5.5", model: "gpt-5.5", wantInput: 5.00, wantOutput: 30.00},
 		{name: "gpt-5.5-pro", model: "gpt-5.5-pro", wantInput: 30.00, wantOutput: 180.00},
 		{name: "gpt-5.5-mini", model: "gpt-5.5-mini", wantInput: 0.50, wantOutput: 2.50},
@@ -38,6 +45,7 @@ func TestLookup(t *testing.T) {
 		// ── xAI Grok ───────────────────────────────────────────
 		{name: "grok-4.5", model: "grok-4.5", wantInput: 2.00, wantOutput: 6.00},
 		{name: "grok-4.6", model: "grok-4.6", wantInput: 2.00, wantOutput: 6.00},
+		{name: "grok-4.7", model: "grok-4.7", wantInput: 2.00, wantOutput: 6.00},
 		{name: "muse-spark-1.3", model: "muse-spark-1.3", wantInput: 1.25, wantOutput: 4.25},
 
 		// ── OpenAI GPT-5.4 ─────────────────────────────────────

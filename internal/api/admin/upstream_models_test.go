@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/api/admin"
-	"workweave/router/internal/auth"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/api/admin"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -171,6 +171,28 @@ func TestDiscoverModelsHandler_RejectsMissingKey(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestDiscoverModelsHandler_RejectsBlockedDestinationAs400(t *testing.T) {
+	lister := &modelListingClient{err: providers.ErrModelDiscoveryDestination}
+	engine := discoverModelsEngine(
+		upstreamModelsProxyService(map[string]providers.Client{providers.ProviderOpenAIGateway: lister}),
+	)
+
+	body, err := json.Marshal(map[string]string{
+		"provider": providers.ProviderOpenAIGateway,
+		"key":      "sk-unsaved",
+		"base_url": "https://gateway.example/v1",
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/admin/v1/provider-keys/discover-models", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "gateway.example")
+	assert.NotContains(t, rec.Body.String(), "sk-unsaved")
+}
+
 func TestListUpstreamModelsHandler_EndpointFailureIs502(t *testing.T) {
 	key := &auth.ExternalAPIKey{
 		ID:             "ext-1",
@@ -179,7 +201,8 @@ func TestListUpstreamModelsHandler_EndpointFailureIs502(t *testing.T) {
 		Plaintext:      []byte("sk-byok"),
 		BaseURL:        "https://cortex.example/api/v2/cortex/v1",
 	}
-	lister := &modelListingClient{err: errors.New("model listing returned status 401")}
+	const upstreamSecret = "sentinel-upstream-response-secret"
+	lister := &modelListingClient{err: errors.New("model listing returned status 401: " + upstreamSecret)}
 	engine := upstreamModelsEngine(
 		upstreamModelsAuthService([]*auth.ExternalAPIKey{key}),
 		upstreamModelsProxyService(map[string]providers.Client{providers.ProviderOpenAIGateway: lister}),
@@ -189,4 +212,30 @@ func TestListUpstreamModelsHandler_EndpointFailureIs502(t *testing.T) {
 	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/v1/provider-keys/ext-1/models", nil))
 
 	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.NotContains(t, rec.Body.String(), upstreamSecret)
+}
+
+// A saved key pointed at a refused destination is a rejected configuration,
+// not an endpoint outage; a 502 here would send an operator to debug the
+// customer's gateway instead of their own base URL.
+func TestListUpstreamModelsHandler_BlockedDestinationIs400(t *testing.T) {
+	key := &auth.ExternalAPIKey{
+		ID:             "ext-1",
+		InstallationID: testInstallationID,
+		Provider:       providers.ProviderOpenAIGateway,
+		Plaintext:      []byte("sk-byok"),
+		BaseURL:        "https://gateway.example/v1",
+	}
+	lister := &modelListingClient{err: providers.ErrModelDiscoveryDestination}
+	engine := upstreamModelsEngine(
+		upstreamModelsAuthService([]*auth.ExternalAPIKey{key}),
+		upstreamModelsProxyService(map[string]providers.Client{providers.ProviderOpenAIGateway: lister}),
+	)
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/v1/provider-keys/ext-1/models", nil))
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "gateway.example")
+	assert.NotContains(t, rec.Body.String(), "sk-byok")
 }

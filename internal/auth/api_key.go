@@ -54,6 +54,14 @@ type APIKey struct {
 	CreatedAt      time.Time
 	DeletedAt      *time.Time
 	CreatedBy      *string
+	// CredentialSubjectID is authenticated ownership, unlike client-asserted attribution or CreatedBy.
+	CredentialSubjectID string
+	// Harness is the stored agent that minted this key (claude_code, codex, opencode, pi).
+	Harness string
+	// PaidFallbackOnSubscriptionRefusal is an admin opt-in that lets a forced
+	// Claude turn use paid API capacity when every linked Claude subscription
+	// refuses the client app. Never settable from a request.
+	PaidFallbackOnSubscriptionRefusal bool
 }
 
 type CreateAPIKeyParams struct {
@@ -71,7 +79,8 @@ type APIKeyRepository interface {
 	Create(ctx context.Context, params CreateAPIKeyParams) (*APIKey, error)
 	GetActiveByHashWithInstallation(ctx context.Context, keyHash string) (*APIKey, *Installation, error)
 	ListForInstallation(ctx context.Context, installationID string) ([]*APIKey, error)
-	MarkUsed(ctx context.Context, id string) error
+	// MarkUsed stamps first use, coalesces later usage timestamps, and reports the first-use transition.
+	MarkUsed(ctx context.Context, id string) (firstUse bool, err error)
 	// SoftDelete soft-deletes the key and returns the rows-affected count; 0 means the key was already gone.
 	SoftDelete(ctx context.Context, installationID, id string) (int64, error)
 }

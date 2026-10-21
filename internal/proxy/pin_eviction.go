@@ -5,11 +5,11 @@ import (
 	"strings"
 	"time"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 )
@@ -27,6 +27,11 @@ import (
 // immediately via maybeExpireDeadArmPin, so this threshold only guards the
 // residual non-deterministic 4xx noise.
 const pinEvictionStrikeThreshold = 2
+
+const (
+	pinEvictionReasonSubscriptionPool  = "subscription_pool_exhausted"
+	pinEvictionReasonSubscriptionModel = "subscription_model_unavailable"
+)
 
 // expireSessionPin writes an already-expired sessionpin.Pin so the next
 // turn's loadPin discards it and the session re-routes via the cluster
@@ -59,17 +64,7 @@ func (s *Service) expireSessionPinRow(
 	reason string,
 	invalidateContinuation bool,
 ) error {
-	expired := sessionpin.Pin{
-		SessionKey:     sessionKey,
-		Role:           role,
-		InstallationID: installationID,
-		Provider:       "",
-		Model:          "",
-		Reason:         reason,
-		Strategy:       router.StrategyFromContext(ctx),
-		TurnCount:      1,
-		PinnedUntil:    time.Now().Add(-time.Second),
-	}
+	expired := expiredSessionPin(installationID, sessionKey, role, reason, router.StrategyFromContext(ctx))
 	if err := s.pinStore.Upsert(context.Background(), expired); err != nil {
 		return err
 	}
@@ -77,6 +72,28 @@ func (s *Service) expireSessionPinRow(
 		return nil
 	}
 	return s.invalidatePostCommandContinuation(ctx, sessionKey, role)
+}
+
+// expiredSessionPin is the already-expired marker for one (session_key, role)
+// row: no model, so loadPin discards it and the next turn re-routes.
+func expiredSessionPin(
+	installationID uuid.UUID,
+	sessionKey [sessionpin.SessionKeyLen]byte,
+	role string,
+	reason string,
+	strategy router.Strategy,
+) sessionpin.Pin {
+	return sessionpin.Pin{
+		SessionKey:     sessionKey,
+		Role:           role,
+		InstallationID: installationID,
+		Provider:       "",
+		Model:          "",
+		Reason:         reason,
+		Strategy:       strategy,
+		TurnCount:      1,
+		PinnedUntil:    time.Now().Add(-time.Second),
+	}
 }
 
 func (s *Service) expireSessionPinAndHMMHistory(
@@ -154,6 +171,45 @@ func (s *Service) maybeExpireDeadArmPin(
 	log := observability.FromContext(ctx)
 	if err := s.expireSessionPin(ctx, installationID, sessionKey, role, "dead_arm_rejected"); err != nil {
 		log.Error("pin eviction after dead-arm rejection failed", "err", err, "role", role)
+	}
+}
+
+// maybeExpireSubscriptionArmPin expires a sticky pin when its subscription
+// pool is empty or every available account has denied the selected model.
+// The client-visible errors stay distinct, while both outcomes invalidate an
+// automatic pin. Also expires a pin written on this first unpinned turn so the
+// next request re-scores. Never expires a user force-model pin.
+func (s *Service) maybeExpireSubscriptionArmPin(
+	ctx context.Context,
+	failure error,
+	decisionReason string,
+	installationID uuid.UUID,
+	sessionKey [sessionpin.SessionKeyLen]byte,
+	role string,
+) {
+	reason := subscriptionArmPinEvictionReason(failure)
+	if reason == "" || s.pinStore == nil || installationID == uuid.Nil || sessionKey == ([sessionpin.SessionKeyLen]byte{}) || strings.HasPrefix(decisionReason, translate.ReasonUserForceModel) {
+		return
+	}
+	log := observability.FromContext(ctx)
+	if err := s.expireSessionPin(ctx, installationID, sessionKey, role, reason); err != nil {
+		log.Error("pin eviction after subscription arm became unavailable failed", "err", err, "role", role, "reason", reason)
+		return
+	}
+	log.Info("session pin evicted after subscription arm became unavailable",
+		"role", role,
+		"reason", reason,
+	)
+}
+
+func subscriptionArmPinEvictionReason(err error) string {
+	switch {
+	case isSubscriptionPoolError(err):
+		return pinEvictionReasonSubscriptionPool
+	case anthropicSubscriptionModelRejected(err):
+		return pinEvictionReasonSubscriptionModel
+	default:
+		return ""
 	}
 }
 

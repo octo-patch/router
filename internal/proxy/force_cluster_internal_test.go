@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +27,15 @@ func forceClusterRequest(t *testing.T, value string) *http.Request {
 
 func TestApplyForceClusterHeader_AbsentIsNoOp(t *testing.T) {
 	label, err := applyForceClusterHeader(context.Background(), forceClusterRequest(t, ""))
+
+	require.NoError(t, err)
+	assert.Empty(t, label)
+}
+
+func TestApplyForceClusterHeader_PlanOwnedRequestIgnoresHeader(t *testing.T) {
+	ctx := router.WithStrategy(planOwnedContext(), router.StrategyHMM)
+
+	label, err := applyForceClusterHeader(ctx, forceClusterRequest(t, "maximum"))
 
 	require.NoError(t, err)
 	assert.Empty(t, label)

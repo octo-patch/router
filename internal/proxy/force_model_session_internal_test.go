@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -23,6 +23,24 @@ type forceModelMapStore struct {
 	pins       map[string]sessionpin.Pin
 	usageRoles []string
 	usageKeys  [][sessionpin.SessionKeyLen]byte
+}
+
+type recoveryForceModelMapStore struct {
+	*forceModelMapStore
+	attempted []string
+}
+
+func (s *recoveryForceModelMapStore) AcquireRecoveryProbe(_ context.Context, _ [sessionpin.SessionKeyLen]byte, model string, _ uuid.UUID, _ time.Duration) (bool, error) {
+	s.attempted = append(s.attempted, model)
+	return true, nil
+}
+
+func (*recoveryForceModelMapStore) ReleaseRecoveryProbe(context.Context, [sessionpin.SessionKeyLen]byte, string, uuid.UUID) error {
+	return nil
+}
+
+func (*recoveryForceModelMapStore) ClearDemotionCooldown(context.Context, [sessionpin.SessionKeyLen]byte, string, string, time.Time) error {
+	return nil
 }
 
 func newForceModelMapStore() *forceModelMapStore {
@@ -62,6 +80,9 @@ func (s *forceModelMapStore) Upsert(_ context.Context, pin sessionpin.Pin) error
 		pin.LastTurnEndedAt = existing.LastTurnEndedAt
 		pin.LastInputTokens = existing.LastInputTokens
 		pin.LastOutputTokens = existing.LastOutputTokens
+		pin.LastCachedReadTokens = existing.LastCachedReadTokens
+		pin.LastCachedWriteTokens = existing.LastCachedWriteTokens
+		pin.LastOutputLimitAt = existing.LastOutputLimitAt
 		pin.HasEverSwitched = existing.HasEverSwitched
 	}
 	s.pins[key] = pin
@@ -82,7 +103,14 @@ func (s *forceModelMapStore) UpdateUsage(_ context.Context, sessionKey [sessionp
 	pin.LastTurnEndedAt = usage.EndedAt
 	pin.LastInputTokens = usage.InputTokens
 	pin.LastOutputTokens = usage.OutputTokens
-	pin.HasEverSwitched = usage.SessionEverSwitched ||
+	pin.LastCachedReadTokens = usage.CachedReadTokens
+	pin.LastCachedWriteTokens = usage.CachedWriteTokens
+	pin.Provider = usage.ServedProvider
+	pin.LastOutputLimitAt = time.Time{}
+	if usage.OutputLimitReached {
+		pin.LastOutputLimitAt = usage.EndedAt
+	}
+	pin.HasEverSwitched = pin.HasEverSwitched || usage.SessionEverSwitched ||
 		(usage.PriorServedModel != "" && usage.PriorServedModel != usage.ServedModel)
 	s.pins[key] = pin
 	return nil
@@ -100,6 +128,10 @@ func (*forceModelMapStore) IncrementOverloadErrors(context.Context, [sessionpin.
 func (*forceModelMapStore) ResetOverloadErrors(context.Context, [sessionpin.SessionKeyLen]byte, string, router.Strategy) error {
 	return nil
 }
+func (*forceModelMapStore) ExpireAndDemoteModel(context.Context, sessionpin.Pin, string, sessionpin.DemotionReason) error {
+	return nil
+}
+
 func (*forceModelMapStore) DisableProvider(context.Context, [sessionpin.SessionKeyLen]byte, string, string, router.Strategy) error {
 	return nil
 }
@@ -131,15 +163,19 @@ func TestRunTurnLoop_ForceModelSessionPinAppliesAcrossChildThreads(t *testing.T)
 	require.Equal(t, forceSessionKey, deriveForceModelSessionKeyForRequest(ctx, child, apiKeyID, childThreadKey))
 
 	store := newForceModelMapStore()
+	endedAt := time.Now().Add(-time.Second)
 	store.pins[forceModelMapKey(forceSessionKey, forceModelSessionRole)] = sessionpin.Pin{
-		SessionKey:     forceSessionKey,
-		Role:           forceModelSessionRole,
-		InstallationID: installationID,
-		Provider:       providers.ProviderAnthropic,
-		Model:          forcedModel,
-		Reason:         translate.ReasonUserForceModel,
-		Strategy:       router.StrategyCluster,
-		PinnedUntil:    pinNeverExpires,
+		SessionKey:        forceSessionKey,
+		Role:              forceModelSessionRole,
+		InstallationID:    installationID,
+		Provider:          providers.ProviderAnthropic,
+		Model:             forcedModel,
+		Reason:            translate.ReasonUserForceModel,
+		Strategy:          router.StrategyCluster,
+		PinnedUntil:       pinNeverExpires,
+		LastOutputTokens:  32000,
+		LastTurnEndedAt:   endedAt,
+		LastOutputLimitAt: endedAt,
 	}
 	freshRouter := &tierProbeRouter{available: map[string]struct{}{"claude-haiku-4-5": {}}}
 	svc := NewService(freshRouter, nil, nil, false, nil, store, false,
@@ -182,7 +218,7 @@ func TestRunTurnLoop_DroppedSessionForcePreservesThreadPin(t *testing.T) {
 	threadKey := deriveSessionKeyForRequest(ctx, env, apiKeyID)
 	forceKey := deriveForceModelSessionKeyForRequest(ctx, env, apiKeyID, threadKey)
 	role := roleForTier(catalog.TierFor(features.Model))
-	store := newForceModelMapStore()
+	store := &recoveryForceModelMapStore{forceModelMapStore: newForceModelMapStore()}
 	store.pins[forceModelMapKey(forceKey, forceModelSessionRole)] = sessionpin.Pin{
 		SessionKey:     forceKey,
 		Role:           forceModelSessionRole,
@@ -202,9 +238,17 @@ func TestRunTurnLoop_DroppedSessionForcePreservesThreadPin(t *testing.T) {
 		Strategy:       router.StrategyCluster,
 		PinnedUntil:    time.Now().Add(time.Hour),
 	}
+	store.pins[forceModelMapKey(threadKey, hmmHistoryRole(role))] = sessionpin.Pin{
+		SessionKey: threadKey,
+		Role:       hmmHistoryRole(role),
+		DemotionCooldowns: map[string]time.Time{
+			catalog.ModelGPT6Luna: time.Now().Add(-time.Minute),
+		},
+	}
 	freshRouter := &tierProbeRouter{available: map[string]struct{}{"claude-haiku-4-5": {}}}
 	svc := NewService(freshRouter, nil, nil, false, nil, store, false,
 		providers.ProviderAnthropic, "claude-haiku-4-5", nil)
+	svc.WithTransientRateLimit(true, 45)
 	ctx = router.WithStrategy(ctx, router.StrategyCluster)
 
 	result, err := svc.runTurnLoop(ctx, env, features, apiKeyID, installationID, "", nil, router.Request{
@@ -218,6 +262,8 @@ func TestRunTurnLoop_DroppedSessionForcePreservesThreadPin(t *testing.T) {
 	assert.True(t, result.StickyHit)
 	assert.True(t, result.ForcedPinDropped)
 	assert.Equal(t, "provider_not_enabled", result.ForcedPinDropReason)
+	assert.Equal(t, []string{catalog.ModelGPT6Luna}, store.attempted,
+		"a forced pin dropped for this request must not suppress a recovery probe for an eligible model")
 }
 
 func TestRunTurnLoop_ClearTombstoneBlocksLegacyForce(t *testing.T) {
@@ -303,8 +349,12 @@ func TestRunTurnLoop_SessionForceOverridesAuxiliaryHardPin(t *testing.T) {
 	assert.Empty(t, freshRouter.captured)
 }
 
-func TestApplyForceModelCommand_WritesAndClearsSessionControl(t *testing.T) {
-	const apiKeyID = "api-key"
+func TestApplyForceModelCommand_FableThenAstraWritesAndClearsSessionControl(t *testing.T) {
+	const (
+		apiKeyID     = "api-key"
+		fableModelID = "claude-fable-5-1"
+		astraModelID = "gpt-6-astra"
+	)
 	installationID := uuid.New()
 	ctx := context.WithValue(context.Background(), ClientIdentityContextKey{}, ClientIdentity{SessionID: "client-session"})
 	env, err := translate.ParseAnthropic([]byte(`{
@@ -318,12 +368,14 @@ func TestApplyForceModelCommand_WritesAndClearsSessionControl(t *testing.T) {
 	svc := NewService(nil, nil, nil, false, nil, store, false,
 		providers.ProviderAnthropic, "claude-haiku-4-5", nil)
 
-	forcedModel, _, err := svc.applyForceModelCommand(ctx, env, translate.ForceModelResult{Model: "opus"}, installationID, threadKey, forceKey)
+	forcedModel, _, err := svc.applyForceModelCommand(ctx, translate.ForceModelResult{Model: "fable"}, installationID, threadKey, forceKey)
 	require.NoError(t, err)
-	assert.Equal(t, "claude-opus-5", forcedModel)
+	assert.Equal(t, fableModelID, forcedModel)
 	pin, found, err := store.Get(ctx, forceKey, forceModelSessionRole)
 	require.NoError(t, err)
 	require.True(t, found)
+	assert.Equal(t, fableModelID, pin.Model)
+	assert.Equal(t, providers.ProviderAnthropic, pin.Provider)
 	assert.Equal(t, translate.ReasonUserForceModel, pin.Reason)
 	assert.Equal(t, pinNeverExpires, pin.PinnedUntil)
 	for _, role := range forceModelClearRoles() {
@@ -332,22 +384,23 @@ func TestApplyForceModelCommand_WritesAndClearsSessionControl(t *testing.T) {
 		assert.False(t, threadForceFound, "new force state must have only one authoritative row")
 	}
 
-	nextModel, _, err := svc.applyForceModelCommand(ctx, env, translate.ForceModelResult{Model: "sonnet"}, installationID, threadKey, forceKey)
+	nextModel, _, err := svc.applyForceModelCommand(ctx, translate.ForceModelResult{Model: "astra"}, installationID, threadKey, forceKey)
 	require.NoError(t, err)
-	assert.Equal(t, "claude-sonnet-5", nextModel)
+	assert.Equal(t, astraModelID, nextModel)
 	switched, found, err := store.Get(ctx, forceKey, forceModelSessionRole)
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.Equal(t, "claude-opus-5", switched.LastServedModel)
+	assert.Equal(t, fableModelID, switched.LastServedModel)
+	assert.Equal(t, providers.ProviderOpenAI, switched.Provider)
 
-	_, _, err = svc.applyForceModelCommand(ctx, env, translate.ForceModelResult{Clear: true}, installationID, threadKey, forceKey)
+	_, _, err = svc.applyForceModelCommand(ctx, translate.ForceModelResult{Clear: true}, installationID, threadKey, forceKey)
 	require.NoError(t, err)
 	cleared, found, err := store.Get(ctx, forceKey, forceModelSessionRole)
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, pinNeverExpires, cleared.PinnedUntil, "the clear tombstone prevents legacy child pins from reviving")
 	assert.Empty(t, cleared.Model)
-	assert.Equal(t, "claude-sonnet-5", cleared.LastServedModel)
+	assert.Equal(t, astraModelID, cleared.LastServedModel)
 	assert.True(t, cleared.HasEverSwitched)
 	assert.Equal(t, userUnforcedReason, cleared.Reason)
 }
@@ -371,7 +424,7 @@ func TestRecordTurnUsage_ForcedDecisionWritesThreadHistoryOnly(t *testing.T) {
 		Role:       forceModelHistoryRole(role),
 	}
 
-	svc.recordTurnUsage(turnLoopResult{
+	svc.recordTurnUsage(context.Background(), turnLoopResult{
 		SessionKey: threadKey,
 		PinRole:    role,
 		Decision: router.Decision{
@@ -379,7 +432,7 @@ func TestRecordTurnUsage_ForcedDecisionWritesThreadHistoryOnly(t *testing.T) {
 			Model:    "claude-opus-5",
 			Reason:   translate.ReasonUserForceModel,
 		},
-	}, providers.ProviderAnthropic, "claude-opus-5", 100, 10, 0, 0)
+	}, providers.ProviderAnthropic, "claude-opus-5", 100, 10, 0, 0, false)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()

@@ -9,14 +9,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/router/hmm/rosterdata"
+	"weave-os/router/internal/router/hmm/rosterdata"
 )
 
 func TestLoadValidRoster(t *testing.T) {
 	roster, err := rosterdata.Load(filepath.Join("testdata", "roster_valid.json"))
 	require.NoError(t, err)
 
-	assert.Equal(t, "hmm_router_cluster_roster_v6", roster.SchemaVersion)
+	assert.Equal(t, rosterdata.SchemaVersionV6, roster.SchemaVersion)
 	require.Len(t, roster.Clusters, 2)
 
 	low := roster.Clusters["low"]
@@ -60,13 +60,15 @@ func TestAllArmsUnionsClusterHarnessAndMembership(t *testing.T) {
 	}, roster.AllArms())
 }
 
-func TestParseUnknownFieldsTolerated(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("testdata", "roster_valid.json"))
-	require.NoError(t, err)
-
-	roster, parseErr := rosterdata.Parse(data)
-	require.NoError(t, parseErr)
-	assert.Equal(t, "hmm_router_cluster_roster_v6", roster.SchemaVersion)
+func TestParseUnknownFieldsRejected(t *testing.T) {
+	_, parseErr := rosterdata.Parse([]byte(`{
+  "schema_version":"hmm_router_cluster_roster_v6",
+  "ranking":{},
+  "clusters":{},
+  "python_selection_order":["model-a"]
+}`))
+	require.Error(t, parseErr)
+	assert.Contains(t, parseErr.Error(), "unknown field")
 }
 
 func TestParseSchemaErrors(t *testing.T) {
@@ -94,8 +96,10 @@ func TestParseSchemaErrors(t *testing.T) {
 			wantErr: "missing schema_version",
 		},
 		{
-			name:    "no clusters",
-			mutate:  func(t *testing.T, doc []byte) []byte { return []byte(`{"schema_version":"v6","clusters":{}}`) },
+			name: "no clusters",
+			mutate: func(t *testing.T, doc []byte) []byte {
+				return []byte(`{"schema_version":"hmm_router_cluster_roster_v6","clusters":{}}`)
+			},
 			wantErr: "no clusters",
 		},
 		{
@@ -136,6 +140,126 @@ func TestParseSchemaErrors(t *testing.T) {
 			assert.Contains(t, parseErr.Error(), tc.wantErr)
 		})
 	}
+}
+
+func TestParseDynamicRoster(t *testing.T) {
+	roster, err := rosterdata.Parse([]byte(`{
+  "schema_version": "hmm_router_cluster_roster_v7",
+  "ranking": {
+    "alpha": {"low": 0.4},
+    "alpha_min": {"low": 0.05},
+    "alpha_max": {"low": 0.8},
+    "quality_bias_neutral": 0.7,
+    "wii_score_version": "wii-v1",
+    "wii_normalization_sha256": "wii-sha",
+    "wpi_score_version": "wpi-v1",
+    "wpi_normalization_sha256": "wpi-sha"
+  },
+  "clusters": {
+    "low": {
+      "complexity_label": "low",
+      "arms": ["provider/scored"],
+      "arms_by_harness": {"pi": ["provider/manual"]},
+      "cost_ref_usd": 0.02,
+      "latency_ref_ms": 8000,
+      "arm_scores": {"provider/scored": 10, "provider/manual": 20},
+      "arm_indices": {"provider/scored": {"wii_v1": 50, "wpi_v1": 10}},
+      "manual_pins_by_harness": {"pi": ["provider/manual"]},
+      "preferred_vendors_by_harness": {"codex": ["provider"]}
+    }
+  }
+}`))
+	require.NoError(t, err)
+	assert.Equal(t, 50.0, roster.Clusters["low"].ArmIndices["provider/scored"].WII)
+	assert.Equal(t, []string{"provider/manual"}, roster.Clusters["low"].ManualPinsByHarness["pi"])
+}
+
+// A policy may key every per-harness surface on opencode; any harness outside
+// the shared vocabulary is still rejected so a roster typo cannot silently
+// serve the pooled order.
+func TestParseDynamicRosterHarnessVocabulary(t *testing.T) {
+	const policyWithHarness = `{
+  "schema_version": "hmm_router_cluster_roster_v7",
+  "ranking": {
+    "alpha": {"low": 0.4}, "alpha_min": {"low": 0.05}, "alpha_max": {"low": 0.8},
+    "quality_bias_neutral": 0.7,
+    "wii_score_version": "wii-v1", "wii_normalization_sha256": "wii-sha",
+    "wpi_score_version": "wpi-v1", "wpi_normalization_sha256": "wpi-sha"
+  },
+  "clusters": {
+    "low": {
+      "complexity_label": "low", "arms": ["provider/scored", "provider/other"],
+      "arms_by_harness": {"HARNESS": ["provider/other", "provider/scored"]},
+      "membership_by_harness": {"HARNESS": ["provider/other"]},
+      "cost_ref_usd": 0.02, "latency_ref_ms": 8000,
+      "arm_scores": {"provider/scored": 10, "provider/other": 20},
+      "arm_indices": {"provider/scored": {"wii_v1": 50, "wpi_v1": 10}, "provider/other": {"wii_v1": 60, "wpi_v1": 20}},
+      "manual_pins_by_harness": {"HARNESS": ["provider/other"]},
+      "preferred_vendors_by_harness": {"HARNESS": ["provider"]}
+    }
+  }
+}`
+	policyFor := func(harness string) []byte {
+		return []byte(strings.ReplaceAll(policyWithHarness, "HARNESS", harness))
+	}
+
+	roster, err := rosterdata.Parse(policyFor(string(rosterdata.HarnessOpenCode)))
+	require.NoError(t, err)
+	low := roster.Clusters["low"]
+	assert.Equal(t, []string{"provider/other", "provider/scored"}, low.ArmsByHarness[rosterdata.HarnessOpenCode])
+	assert.Equal(t, []string{"provider/other"}, low.MembershipByHarness[rosterdata.HarnessOpenCode])
+	assert.Equal(t, []string{"provider/other"}, low.ManualPinsByHarness[rosterdata.HarnessOpenCode])
+	assert.Equal(t, []string{"provider"}, low.PreferredVendorsByHarness[rosterdata.HarnessOpenCode])
+
+	_, err = rosterdata.Parse(policyFor("cursor"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unknown`)
+	assert.Contains(t, err.Error(), `harness "cursor"`)
+}
+
+func TestParseDynamicRosterRejectsMissingIndices(t *testing.T) {
+	_, err := rosterdata.Parse([]byte(`{
+  "schema_version": "hmm_router_cluster_roster_v7",
+  "ranking": {
+    "alpha": {"low": 0.4}, "alpha_min": {"low": 0.05}, "alpha_max": {"low": 0.8},
+    "quality_bias_neutral": 0.7,
+    "wii_score_version": "wii-v1", "wii_normalization_sha256": "wii-sha",
+    "wpi_score_version": "wpi-v1", "wpi_normalization_sha256": "wpi-sha"
+  },
+  "clusters": {
+    "low": {
+      "complexity_label": "low", "arms": ["provider/unscored"],
+      "cost_ref_usd": 0.02, "latency_ref_ms": 8000,
+      "arm_scores": {"provider/unscored": 10}, "arm_indices": {}
+    }
+  }
+}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no arm_indices entry")
+}
+
+func TestParseDynamicRosterRejectsHarnessPinWithoutGlobalCoverage(t *testing.T) {
+	_, err := rosterdata.Parse([]byte(`{
+  "schema_version": "hmm_router_cluster_roster_v7",
+  "ranking": {
+    "alpha": {"low": 0.4}, "alpha_min": {"low": 0.05}, "alpha_max": {"low": 0.8},
+    "quality_bias_neutral": 0.7,
+    "wii_score_version": "wii-v1", "wii_normalization_sha256": "wii-sha",
+    "wpi_score_version": "wpi-v1", "wpi_normalization_sha256": "wpi-sha"
+  },
+  "clusters": {
+    "low": {
+      "complexity_label": "low", "arms": ["provider/scored", "provider/manual"],
+      "arms_by_harness": {"pi": ["provider/manual"]},
+      "cost_ref_usd": 0.02, "latency_ref_ms": 8000,
+      "arm_scores": {"provider/scored": 10, "provider/manual": 20},
+      "arm_indices": {"provider/scored": {"wii_v1": 50, "wpi_v1": 10}},
+      "manual_pins_by_harness": {"pi": ["provider/manual"]}
+    }
+  }
+}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `arm "provider/manual" has no arm_indices entry`)
 }
 
 // replaceJSON returns a mutator that swaps one occurrence of old for new in

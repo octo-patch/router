@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/translate"
 )
 
 // On the v0.57 SWE-bench Verified router eval, 224 phantom CC-only tool_use
@@ -230,14 +230,17 @@ func TestKeepOrchestrationTools_OpenAITarget_KeepsOrchestrationDropsRest(t *test
 	assert.ElementsMatch(t, []string{
 		"Read", "Edit", "Write", "Bash", "NotebookEdit",
 		"ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Monitor", "BashOutput", "KillShell",
-		"Task", "Agent", "TaskCreate", "TaskUpdate", "TaskList",
+		"Task", "Agent", "SendMessage",
 		"EnterPlanMode", "ExitPlanMode", "UpdatePlan", "Skill", "Workflow",
 		"ToolSearch",
 	}, names, "orchestration + scheduling tools survive when the flag is on")
-	assert.NotContains(t, names, "SendMessage", "non-orchestration CC-only tools stay stripped")
+	assert.Contains(t, names, "SendMessage", "peer messaging survives with orchestration enabled")
 	assert.NotContains(t, names, "AskUserQuestion", "non-orchestration CC-only tools stay stripped")
 	assert.Contains(t, names, "ToolSearch")
 	assert.NotContains(t, names, "TodoWrite")
+	for _, name := range []string{"TaskCreate", "TaskUpdate", "TaskList"} {
+		assert.NotContains(t, names, name, "task-list bookkeeping is stripped even with orchestration kept")
+	}
 }
 
 func TestKeepOrchestrationTools_OpenAITarget_NormalizesTypelessAnyOf(t *testing.T) {
@@ -283,11 +286,11 @@ func TestKeepOrchestrationTools_GeminiTarget_KeepsOrchestrationDropsRest(t *test
 	assert.ElementsMatch(t, []string{
 		"Read", "Edit", "Write", "Bash", "NotebookEdit",
 		"ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Monitor", "BashOutput", "KillShell",
-		"Task", "Agent", "TaskCreate", "TaskUpdate", "TaskList",
+		"Task", "Agent", "SendMessage",
 		"EnterPlanMode", "ExitPlanMode", "UpdatePlan", "Skill", "Workflow",
 		"ToolSearch",
 	}, names, "Anthropic→Gemini keeps orchestration + scheduling tools when the flag is on")
-	assert.NotContains(t, names, "SendMessage")
+	assert.Contains(t, names, "SendMessage")
 	assert.NotContains(t, names, "AskUserQuestion")
 	assert.Contains(t, names, "ToolSearch")
 }

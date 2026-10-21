@@ -6,13 +6,47 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/policy"
 )
 
 func catalogRosterID(model catalog.Model) string { return model.ID }
+
+func TestManagedResolverMiMoV26FlashProviderOrder(t *testing.T) {
+	resolver := policy.NewResolver(
+		set(catalog.ModelMiMoV26Flash),
+		set(providers.ProviderMakora, providers.ProviderDeepInfra, providers.ProviderOpenRouter),
+		catalogRosterID,
+		policy.ManagedProviderPolicy(),
+	)
+	cases := []struct {
+		name       string
+		enabled    map[string]struct{}
+		provider   string
+		upstreamID string
+	}{
+		{"Makora primary", set(providers.ProviderMakora, providers.ProviderDeepInfra, providers.ProviderOpenRouter), providers.ProviderMakora, "XiaomiMiMo/MiMo-V2.6-Flash-RL"},
+		{"DeepInfra fallback", set(providers.ProviderDeepInfra, providers.ProviderOpenRouter), providers.ProviderDeepInfra, "XiaomiMiMo/MiMo-V2.6-Flash"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved := resolver.Resolve(router.Request{EnabledProviders: tc.enabled})
+			require.Len(t, resolved.Candidates, 1)
+			require.Equal(t, catalog.ModelMiMoV26Flash, resolved.Candidates[0].CatalogID)
+			require.Equal(t, tc.provider, resolved.Candidates[0].Provider)
+			require.Equal(t, tc.upstreamID, resolved.Candidates[0].UpstreamID)
+		})
+	}
+	resolved := resolver.Resolve(router.Request{EnabledProviders: set(providers.ProviderOpenRouter)})
+	require.Empty(t, resolved.Candidates)
+	require.Contains(t, resolved.Diagnostics, policy.Diagnostic{
+		CatalogID: catalog.ModelMiMoV26Flash,
+		RosterID:  catalog.ModelMiMoV26Flash,
+		Reason:    policy.ExclusionProviderPolicy,
+	})
+}
 
 func TestManagedResolverUsesCurrentProvidersAndNeverOpenRouter(t *testing.T) {
 	resolver := policy.NewResolver(
@@ -219,6 +253,72 @@ func TestResolverIncludesExpectedOutputInContextBudget(t *testing.T) {
 	})
 }
 
+func TestResolverKeepsOverflowAdmittedModels(t *testing.T) {
+	resolver := policy.NewResolver(
+		set("claude-opus-4-8", "claude-sonnet-4-6"),
+		set(providers.ProviderAnthropic),
+		catalogRosterID,
+		policy.ManagedProviderPolicy(),
+	)
+
+	resolved := resolver.Resolve(router.Request{
+		EstimatedInputTokens:   catalog.ContextWindowFor("claude-opus-4-8") + 1,
+		OverflowAdmittedModels: set("claude-opus-4-8"),
+	})
+
+	assert.Equal(t, []string{"claude-opus-4-8"}, resolved.CandidateModels(),
+		"the provider's exact count decides for a model the proxy admitted on total overflow")
+	assert.Equal(t, []policy.Diagnostic{{
+		CatalogID: "claude-sonnet-4-6",
+		RosterID:  "claude-sonnet-4-6",
+		Reason:    policy.ExclusionContextWindow,
+	}}, resolved.Diagnostics)
+}
+
+func TestResolverPreservesUnsignedHistoryExclusionAfterOverflowAdmission(t *testing.T) {
+	const model = "gemini-3.1-pro-preview"
+	resolver := policy.NewResolver(
+		set(model),
+		set(providers.ProviderGoogle),
+		catalogRosterID,
+		policy.ManagedProviderPolicy(),
+	)
+
+	resolved := resolver.Resolve(router.Request{
+		ExcludedModels:                set(model),
+		OverflowAdmittedModels:        set(model),
+		UnsignedHistoryExcludedModels: set(model),
+	})
+
+	assert.Empty(t, resolved.Candidates)
+	assert.Equal(t, []policy.Diagnostic{{
+		CatalogID: model,
+		RosterID:  model,
+		Reason:    policy.ExclusionUnsignedHistory,
+	}}, resolved.Diagnostics)
+}
+
+func TestResolverDoesNotCallUnmappedOverflowCandidateAContextExclusion(t *testing.T) {
+	const model = "gemini-3.1-pro-preview"
+	resolver := policy.NewResolver(
+		set(model),
+		set(providers.ProviderGoogle),
+		func(catalog.Model) string { return "" },
+		policy.ManagedProviderPolicy(),
+	)
+
+	resolved := resolver.Resolve(router.Request{
+		ExcludedModels:              set(model),
+		ContextWindowExcludedModels: set(model),
+	})
+
+	assert.Empty(t, resolved.Candidates)
+	assert.Equal(t, []policy.Diagnostic{{
+		CatalogID: model,
+		Reason:    policy.ExclusionUnmappedRoster,
+	}}, resolved.Diagnostics)
+}
+
 func TestResolverIncludesLiveCandidateEconomics(t *testing.T) {
 	resolver := policy.NewResolver(
 		set("claude-opus-4-8"),
@@ -231,18 +331,36 @@ func TestResolverIncludesLiveCandidateEconomics(t *testing.T) {
 	resolved := resolver.Resolve(router.Request{
 		EstimatedInputTokens: 1_000,
 		RoutingKnobs:         &router.Overrides{ExpectedOutputTokens: &expectedOutputTokens},
-		SubsidizedModelCostFactor: map[string]float64{
-			"claude-opus-4-8": 0.25,
-		},
 	})
 
 	require.Len(t, resolved.Candidates, 1)
 	candidate := resolved.Candidates[0]
 	assert.Equal(t, 0.1, candidate.CacheReadMultiplier)
-	assert.Equal(t, 0.25, candidate.MarginalCostFactor)
-	assert.Equal(t, 1.25, candidate.EffectiveInputUSDPer1M)
-	assert.Equal(t, 6.25, candidate.EffectiveOutputUSDPer1M)
-	assert.InDelta(t, candidate.EstimatedCostUSD*0.25, candidate.EffectiveEstimatedCostUSD, 1e-12)
+	assert.Equal(t, 1.0, candidate.MarginalCostFactor)
+	assert.Equal(t, 5.0, candidate.EffectiveInputUSDPer1M)
+	assert.Equal(t, 25.0, candidate.EffectiveOutputUSDPer1M)
+	assert.InDelta(t, candidate.EstimatedCostUSD, candidate.EffectiveEstimatedCostUSD, 1e-12)
+}
+
+func TestResolverUsesLongContextPricing(t *testing.T) {
+	resolver := policy.NewResolver(
+		set("gpt-5.6-luna"),
+		set(providers.ProviderOpenAI),
+		catalogRosterID,
+		policy.ManagedProviderPolicy(),
+	)
+	expectedOutputTokens := 1_000
+
+	resolved := resolver.Resolve(router.Request{
+		EstimatedInputTokens: 300_000,
+		RoutingKnobs:         &router.Overrides{ExpectedOutputTokens: &expectedOutputTokens},
+	})
+
+	require.Len(t, resolved.Candidates, 1)
+	candidate := resolved.Candidates[0]
+	assert.Equal(t, 0.40, candidate.InputUSDPer1M)
+	assert.Equal(t, 1.80, candidate.OutputUSDPer1M)
+	assert.InDelta(t, 0.1218, candidate.EstimatedCostUSD, 1e-12)
 }
 
 func set(values ...string) map[string]struct{} {
@@ -336,6 +454,39 @@ func TestResolverKeepsPoolWhenAutomaticDisablesWouldEmptyIt(t *testing.T) {
 	})
 
 	assert.Equal(t, []string{"claude-opus-4-8"}, resolved.CandidateModels())
+}
+
+// A session demotion (AutomaticExcludedModels) is bounded by the
+// installation's allowlist in both directions: it can only move the pick to a
+// model the allowlist already admits, and when the allowlist admits nothing
+// else the demoted model is kept rather than the pool widened.
+func TestResolverSessionDemotionStaysInsideAllowlist(t *testing.T) {
+	resolver := policy.NewResolver(
+		set("claude-opus-4-8", "claude-sonnet-5", "gpt-5.6-luna"),
+		set(providers.ProviderAnthropic, providers.ProviderOpenAI),
+		catalogRosterID,
+		policy.ManagedProviderPolicy(),
+	)
+
+	t.Run("allowlist admits an Anthropic sibling", func(t *testing.T) {
+		resolved := resolver.Resolve(router.Request{
+			AllowedModels:           set("claude-opus-4-8", "claude-sonnet-5"),
+			AutomaticExcludedModels: set("claude-opus-4-8"),
+		})
+
+		assert.Equal(t, []string{"claude-sonnet-5"}, resolved.CandidateModels())
+	})
+
+	t.Run("allowlist admits only the demoted model", func(t *testing.T) {
+		resolved := resolver.Resolve(router.Request{
+			AllowedModels:           set("claude-opus-4-8"),
+			AutomaticExcludedModels: set("claude-opus-4-8"),
+		})
+
+		assert.Equal(t, []string{"claude-opus-4-8"}, resolved.CandidateModels(),
+			"the demotion must not admit a cross-vendor model the allowlist excludes")
+		assert.NotContains(t, resolved.CandidateModels(), "gpt-5.6-luna")
+	})
 }
 
 func TestResolverDirectlyEnforcesAllowlistForStrategySpecificCandidates(t *testing.T) {

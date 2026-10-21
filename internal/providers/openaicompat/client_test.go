@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/providers/openaicompat"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/providers/openaicompat"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,6 +66,69 @@ func TestProxy_ForwardsToChatCompletionsUnderVersionedBaseURL(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
+func TestProxy_RewritesMappedCatalogModelIDs(t *testing.T) {
+	cases := []struct {
+		catalog  string
+		upstream string
+	}{
+		{"deepseek/deepseek-v4-flash", "deepseek-v4-flash"},
+		{"deepseek/deepseek-v4-pro", "deepseek-v4-pro"},
+		{"moonshotai/kimi-k2.6", "kimi-k2.6"},
+		{"xiaomi/mimo-v2.5-pro", "mimo-v2.5-pro"},
+		{"z-ai/glm-5.2", "glm-5.2"},
+	}
+	idMap := make(map[string]string, len(cases))
+	for _, tc := range cases {
+		idMap[tc.catalog] = tc.upstream
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.catalog, func(t *testing.T) {
+			var gotModel string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				var parsed map[string]any
+				require.NoError(t, json.Unmarshal(body, &parsed))
+				gotModel, _ = parsed["model"].(string)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion"}`))
+			}))
+			defer upstream.Close()
+
+			c := openaicompat.NewClientWithModelIDMap("test-key", upstream.URL, idMap)
+			rec := httptest.NewRecorder()
+			clientReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
+			body := []byte(`{"model":"` + tc.catalog + `","messages":[{"role":"user","content":"hi"}]}`)
+			err := c.Proxy(context.Background(), router.Decision{Model: tc.catalog}, providers.PreparedRequest{Body: body, Headers: make(http.Header)}, rec, clientReq)
+			require.NoError(t, err)
+			assert.Equal(t, tc.upstream, gotModel)
+		})
+	}
+
+	t.Run("unmapped catalog id is unchanged", func(t *testing.T) {
+		var gotModel string
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			var parsed map[string]any
+			require.NoError(t, json.Unmarshal(body, &parsed))
+			gotModel, _ = parsed["model"].(string)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion"}`))
+		}))
+		defer upstream.Close()
+
+		c := openaicompat.NewClientWithModelIDMap("test-key", upstream.URL, idMap)
+		rec := httptest.NewRecorder()
+		clientReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
+		body := []byte(`{"model":"qwen/qwen3-coder","messages":[{"role":"user","content":"hi"}]}`)
+		err := c.Proxy(context.Background(), router.Decision{Model: "qwen/qwen3-coder"}, providers.PreparedRequest{Body: body, Headers: make(http.Header)}, rec, clientReq)
+		require.NoError(t, err)
+		assert.Equal(t, "qwen/qwen3-coder", gotModel)
+	})
+}
+
 // TestProxy_BYOKCredentialsOverrideEnvKey: a BYOK key on context (e.g. a
 // managed installation's own OpenRouter key) must win over the deployment env key.
 func TestProxy_BYOKCredentialsOverrideEnvKey(t *testing.T) {
@@ -80,8 +143,8 @@ func TestProxy_BYOKCredentialsOverrideEnvKey(t *testing.T) {
 	defer upstream.Close()
 
 	c := openaicompat.NewClient("deployment-key", upstream.URL+"/api/v1")
-	byok := &proxy.Credentials{APIKey: []byte("sk-or-v1-byok-key"), Source: "byok"}
-	ctx := context.WithValue(context.Background(), proxy.CredentialsContextKey{}, byok)
+	byok := &requestcontext.Credentials{APIKey: []byte("sk-or-v1-byok-key"), Source: "byok"}
+	ctx := context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, byok)
 
 	rec := httptest.NewRecorder()
 	clientReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
@@ -117,12 +180,12 @@ func TestProxy_BYOKBaseURLOverridesDeploymentBaseURL(t *testing.T) {
 	c := openaicompat.NewClient("deployment-key", deployment.URL+"/api/v1")
 	// Trailing slash is deliberate: EffectiveBaseURL must normalize it so the
 	// joined path doesn't end up with a doubled separator.
-	byok := &proxy.Credentials{
+	byok := &requestcontext.Credentials{
 		APIKey:  []byte("mk-customer-key"),
 		Source:  "byok",
 		BaseURL: customer.URL + "/v1/",
 	}
-	ctx := context.WithValue(context.Background(), proxy.CredentialsContextKey{}, byok)
+	ctx := context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, byok)
 
 	rec := httptest.NewRecorder()
 	clientReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))
@@ -148,8 +211,8 @@ func TestProxy_DeploymentBaseURLUsedWhenBYOKOmitsIt(t *testing.T) {
 	defer upstream.Close()
 
 	c := openaicompat.NewClient("deployment-key", upstream.URL+"/api/v1")
-	byok := &proxy.Credentials{APIKey: []byte("mk-customer-key"), Source: "byok"}
-	ctx := context.WithValue(context.Background(), proxy.CredentialsContextKey{}, byok)
+	byok := &requestcontext.Credentials{APIKey: []byte("mk-customer-key"), Source: "byok"}
+	ctx := context.WithValue(context.Background(), requestcontext.CredentialsContextKey{}, byok)
 
 	rec := httptest.NewRecorder()
 	clientReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(""))

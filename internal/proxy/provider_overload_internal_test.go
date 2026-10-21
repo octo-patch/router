@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -69,6 +69,10 @@ func (s *overloadStubPinStore) ResetOverloadErrors(context.Context, [sessionpin.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resetCalls++
+	return nil
+}
+
+func (*overloadStubPinStore) ExpireAndDemoteModel(context.Context, sessionpin.Pin, string, sessionpin.DemotionReason) error {
 	return nil
 }
 

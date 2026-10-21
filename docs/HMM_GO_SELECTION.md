@@ -23,13 +23,23 @@ class and shrinks the sidecar's authority to what only it can do: ML inference.
 
 | Concern | Owner |
 |---|---|
-| Roster contents (`hmm_router_cluster_roster_v6` JSON) | Declarative data, loaded and fail-loud validated by Go at boot (`internal/router/hmm/rosterdata`) |
+| Roster contents (`hmm_router_cluster_roster_v7` JSON) | Declarative data, loaded and fail-loud validated by Go at boot (`internal/router/hmm/rosterdata`) |
 | Roster↔catalog validation | Go: `hmm.ValidateRosterIDs` (`internal/router/hmm/validate.go`) plus the `validate-roster` CLI for CI |
-| Within-cluster deterministic arm selection (harness-specific order, rank-1 pick, ranked cluster-fallback walk) | Go: `internal/router/hmm/selection` |
+| Within-cluster deterministic arm selection (harness policy, preference-adjusted WII/WPI ranking, ranked cluster-fallback walk) | Go: `internal/router/hmm/selection` |
 | Complexity classification (ML) | Python sidecar (`policy_router_v3` contract) |
 | Ranked cluster fallback (per-group probability, roster arms, eligible arms) | Python sidecar — the only selection input the router accepts |
 
 ## Configuration
+
+Managed gateway admission loads the conversation's immutable selection from the
+serving registry, validates it in Go, and supplies a request-bound roster. Selection
+v3 shares one code candidate per internal/stable target and assigns default/customer
+rosters as configuration. Existing conversations retain their admitted roster; new
+conversations receive promotions or roster rollback. See
+[SERVING_CONTROL.md](SERVING_CONTROL.md#shared-code-cohorts-and-roster-configuration-selection-v3)
+for schema, retention and reader-rollout requirements.
+
+The following boot-file configuration describes the legacy/self-hosted path.
 
 `ROUTER_HMM_ROSTER_PATH` is the only lever, and it is **required** whenever
 `ROUTER_HMM_SIDECAR_URL` is set: the roster is loaded and validated against the
@@ -43,6 +53,18 @@ and the sidecar's classifier label/confidence is kept. Explicit force-cluster
 and per-key cluster overrides take precedence when they actually constrain the
 pick (a ranked-group pass-through with no configured list for the winning group
 does not).
+
+The organization quality/price dial is applied only after the classifier band,
+candidate set, sidecar allowlist, and harness membership are fixed. Within that
+eligible pool, v7 rosters score each arm as `alpha*WII - (1-alpha)*WPI`.
+The user-facing neutral value (`0.70`) maps to the independently tuned alpha for
+each band; an unset or exactly neutral preference uses the generated fixed order
+and score map byte-for-byte. Manual pins and harness vendor priority remain
+stronger tiers than the dynamic score, and original roster position breaks ties.
+
+The same Go scorer produces `/v1/router/routing-distribution` and the per-arm
+scores used by effort hysteresis. WPI is a normalized evaluation-workload axis,
+not a billing rate; preview dollars always come from catalog serving prices.
 
 Selection is **fail-closed**. A `/route` response with no ranked fallback, a
 ranked fallback holding no eligible arm, or a `policy_router_v1`/`v2` schema is
@@ -59,8 +81,11 @@ rejects a v1/v2 sidecar and a v3 sidecar names no arm for a v1/v2 router. Router
 and sidecar deploy together, and roll back together — revert both image pins.
 There is no runtime flag to flip.
 
-Roster content is still rolled back on its own: republish the previous roster
-artifact and redeploy — an invalid roster fails boot rather than serving.
+For legacy/self-hosted configuration, roll back roster content by republishing the
+previous roster artifact and redeploying; an invalid roster fails boot. Managed
+serving instead promotes the prior immutable policy reference on the current code
+binding, preserving existing conversations without rebuilding or creating a
+customer-specific revision.
 
 ## Still to remove
 

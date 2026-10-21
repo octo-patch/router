@@ -10,11 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/flags"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/server/middleware"
+	"weave-os/router/internal/api/subscriptions"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/flags"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/server/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -45,9 +46,7 @@ func (f *fakeExternalAPIKeyRepository) UpdateModelAliases(context.Context, strin
 	return nil, errors.New("not used")
 }
 
-func (f *fakeExternalAPIKeyRepository) MarkUsed(context.Context, string) error {
-	return nil
-}
+func (f *fakeExternalAPIKeyRepository) MarkUsed(context.Context, string) error { return nil }
 
 type fakeAPIKeyRepository struct {
 	byHash map[string]fakeKeyRow
@@ -82,11 +81,11 @@ func (f *fakeAPIKeyRepository) ListForInstallation(ctx context.Context, installa
 	return nil, errors.New("not used")
 }
 
-func (f *fakeAPIKeyRepository) MarkUsed(ctx context.Context, id string) error {
+func (f *fakeAPIKeyRepository) MarkUsed(ctx context.Context, id string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.used = append(f.used, id)
-	return nil
+	return true, nil
 }
 
 func (f *fakeAPIKeyRepository) SoftDelete(ctx context.Context, installationID, id string) (int64, error) {
@@ -94,6 +93,51 @@ func (f *fakeAPIKeyRepository) SoftDelete(ctx context.Context, installationID, i
 }
 
 type fakeInstallationRepository struct{}
+
+type failingSubscriptionAccountRepository struct{ err error }
+
+type failingCredentialSubjectLookup struct{ err error }
+
+func (r failingCredentialSubjectLookup) GetCredentialSubject(context.Context, string, string) (*auth.CredentialSubject, error) {
+	return nil, r.err
+}
+
+func (r failingSubscriptionAccountRepository) UpsertSubscriptionAccount(context.Context, auth.CreateSubscriptionAccountParams) (*auth.SubscriptionAccount, auth.SubscriptionUpsertKind, error) {
+	return nil, auth.SubscriptionUpsertUpdated, r.err
+}
+func (r failingSubscriptionAccountRepository) ListSubscriptionCandidates(context.Context, auth.SubscriptionOwner) ([]*auth.SubscriptionAccount, error) {
+	return nil, r.err
+}
+func (r failingSubscriptionAccountRepository) ListSubscriptionAccounts(context.Context, auth.SubscriptionOwner) ([]*auth.SubscriptionAccount, error) {
+	return nil, r.err
+}
+func (r failingSubscriptionAccountRepository) UpdateSubscriptionAccountState(context.Context, string, auth.SubscriptionOwner, bool, *time.Time) error {
+	return r.err
+}
+func (r failingSubscriptionAccountRepository) UpdateSubscriptionAccountCooldown(context.Context, string, auth.SubscriptionOwner, time.Time) error {
+	return r.err
+}
+func (r failingSubscriptionAccountRepository) UpdateSubscriptionRefreshToken(context.Context, string, auth.SubscriptionOwner, []byte) error {
+	return r.err
+}
+func (r failingSubscriptionAccountRepository) DeleteSubscriptionAccount(context.Context, string, auth.SubscriptionOwner) error {
+	return r.err
+}
+func (r failingSubscriptionAccountRepository) TryAcquireSubscriptionRefreshLease(context.Context, string, auth.SubscriptionOwner, string, time.Duration) (auth.RefreshLeaseAcquisition, error) {
+	return auth.RefreshLeaseAcquisition{}, r.err
+}
+func (r failingSubscriptionAccountRepository) ExtendSubscriptionRefreshLease(context.Context, string, auth.SubscriptionOwner, string, time.Duration) (int64, error) {
+	return 0, r.err
+}
+func (r failingSubscriptionAccountRepository) ReleaseSubscriptionRefreshLease(context.Context, string, auth.SubscriptionOwner, string) error {
+	return r.err
+}
+func (r failingSubscriptionAccountRepository) GetSubscriptionCredentialRecord(context.Context, string, auth.SubscriptionOwner) (*auth.SubscriptionCredentialRecord, error) {
+	return nil, r.err
+}
+func (r failingSubscriptionAccountRepository) PersistSubscriptionTokens(context.Context, string, auth.SubscriptionOwner, string, int64, []byte, []byte, time.Time) error {
+	return r.err
+}
 
 func (fakeInstallationRepository) Create(ctx context.Context, params auth.CreateInstallationParams) (*auth.Installation, error) {
 	return nil, errors.New("not used")
@@ -143,6 +187,10 @@ func (fakeInstallationRepository) UpdateSubscriptionRoutingDisabled(ctx context.
 func (fakeInstallationRepository) UpdateContentCaptureMode(ctx context.Context, externalID, id string, mode *string) error {
 	return errors.New("not used")
 }
+
+func (fakeInstallationRepository) UpdateShowModelSelectionReasoning(context.Context, string, string, bool) error {
+	return errors.New("not used")
+}
 func (fakeInstallationRepository) UpdateHideTerminalSurfaces(ctx context.Context, externalID, id string, hide bool) error {
 	return errors.New("not used")
 }
@@ -160,6 +208,7 @@ func TestWithAuthPrefersRouterKeyHeader(t *testing.T) {
 		ID: "inst-1", ExternalID: "ext-1", RoutingRolloutID: "rollout-1",
 		PolicyShadowStrategy: "future-policy", PolicyDebugEnabled: true,
 		PolicyRoutingIntent: "high", AITrainingAllowed: true,
+		ShowModelSelectionReasoning: true,
 	}
 	repo := &fakeAPIKeyRepository{byHash: map[string]fakeKeyRow{
 		hash: {apiKey: apiKey, installation: installation},
@@ -179,6 +228,7 @@ func TestWithAuthPrefersRouterKeyHeader(t *testing.T) {
 		assert.Equal(t, true, ctx.Value(proxy.PolicyDebugEnabledContextKey{}))
 		assert.Equal(t, "high", ctx.Value(proxy.PolicyRoutingIntentContextKey{}))
 		assert.Equal(t, true, ctx.Value(proxy.PolicyTrainingAllowedContextKey{}))
+		assert.Equal(t, true, ctx.Value(proxy.InstallationShowModelSelectionReasoningContextKey{}))
 		c.Status(http.StatusOK)
 	})
 
@@ -189,6 +239,33 @@ func TestWithAuthPrefersRouterKeyHeader(t *testing.T) {
 	engine.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
+}
+
+func TestWithAuthLeavesControlPlaneAvailableWhenSubscriptionEnrollmentLookupFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const routerToken = "rk_subscription_lookup"
+	hash, prefix, suffix := auth.APITokenFingerprint(routerToken)
+	apiKey := &auth.APIKey{ID: "key-subscription-lookup", KeyHash: hash, KeyPrefix: prefix, KeySuffix: suffix}
+	repo := &fakeAPIKeyRepository{byHash: map[string]fakeKeyRow{
+		hash: {apiKey: apiKey, installation: &auth.Installation{ID: "inst-1"}},
+	}}
+	svc := auth.NewService(fakeInstallationRepository{}, repo, nil, nil, auth.NoOpAPIKeyCache{}, nil, time.Now).
+		WithSubscriptionAccounts(failingSubscriptionAccountRepository{err: errors.New("database unavailable")})
+
+	engine := gin.New()
+	engine.Use(middleware.WithAuth(svc, false))
+	engine.GET("/validate", func(c *gin.Context) {
+		unavailable, _ := c.Request.Context().Value(proxy.ManagedSubscriptionEnrollmentUnavailableContextKey{}).(bool)
+		require.True(t, unavailable)
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/validate", nil)
+	req.Header.Set(middleware.RouterKeyHeader, routerToken)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
 }
 
 func TestWithAuthPropagatesContentCaptureOverride(t *testing.T) {
@@ -245,6 +322,37 @@ func TestWithAuthOmitsContentCaptureOverrideWhenUnset(t *testing.T) {
 	engine.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
+}
+
+func TestWithAuthCarriesPaidFallbackOnSubscriptionRefusalOptIn(t *testing.T) {
+	for _, optedIn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default", true: "opted in"}[optedIn], func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			const routerToken = "rk_paid_fallback"
+			hash, prefix, suffix := auth.APITokenFingerprint(routerToken)
+			apiKey := &auth.APIKey{ID: "key-paid-fallback", KeyHash: hash, KeyPrefix: prefix, KeySuffix: suffix, PaidFallbackOnSubscriptionRefusal: optedIn}
+			installation := &auth.Installation{ID: "inst-paid-fallback", ExternalID: "ext-paid-fallback"}
+			repo := &fakeAPIKeyRepository{byHash: map[string]fakeKeyRow{
+				hash: {apiKey: apiKey, installation: installation},
+			}}
+			svc := auth.NewService(fakeInstallationRepository{}, repo, nil, nil, auth.NoOpAPIKeyCache{}, nil, func() time.Time { return time.Now() })
+
+			engine := gin.New()
+			engine.Use(middleware.WithAuth(svc, false))
+			engine.GET("/probe", func(c *gin.Context) {
+				consented, _ := c.Request.Context().Value(proxy.APIKeyPaidFallbackOnSubscriptionRefusalContextKey{}).(bool)
+				assert.Equal(t, optedIn, consented)
+				c.Status(http.StatusOK)
+			})
+
+			req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+			req.Header.Set(middleware.RouterKeyHeader, routerToken)
+			rr := httptest.NewRecorder()
+			engine.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+		})
+	}
 }
 
 func TestWithAuthManagedModeDropsBYOKWhenNotOptedIn(t *testing.T) {
@@ -473,4 +581,45 @@ func TestWithAuthMalformedPrefixStays401(t *testing.T) {
 
 	require.Equal(t, http.StatusUnauthorized, rr.Code)
 	assert.Contains(t, rr.Body.String(), "invalid_key")
+}
+
+func (r failingSubscriptionAccountRepository) DisableSubscriptionAccountIfRefreshHolder(context.Context, string, auth.SubscriptionOwner, string, int64) error {
+	return r.err
+}
+func (r failingSubscriptionAccountRepository) CooldownSubscriptionAccountIfRefreshHolder(context.Context, string, auth.SubscriptionOwner, string, int64, time.Time) error {
+	return r.err
+}
+
+func TestSubscriptionManagementReturnsUnavailableOnLiveIdentityLookupFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const routerToken = "rk_subscription_owner_test"
+	hash, prefix, suffix := auth.APITokenFingerprint(routerToken)
+	apiKey := &auth.APIKey{
+		ID:                  "subscription-key",
+		InstallationID:      "subscription-installation",
+		CredentialSubjectID: "subscription-subject",
+		KeyHash:             hash,
+		KeyPrefix:           prefix,
+		KeySuffix:           suffix,
+	}
+	installation := &auth.Installation{ID: apiKey.InstallationID, ExternalID: "subscription-org"}
+	apiKeys := &fakeAPIKeyRepository{byHash: map[string]fakeKeyRow{
+		hash: {apiKey: apiKey, installation: installation},
+	}}
+	svc := auth.NewService(fakeInstallationRepository{}, apiKeys, nil, nil, auth.NoOpAPIKeyCache{}, nil, time.Now).
+		WithCredentialSubjectLookup(failingCredentialSubjectLookup{err: errors.New("identity database unavailable")}).
+		WithSubscriptionAccounts(failingSubscriptionAccountRepository{err: errors.New("subscription database unavailable")})
+
+	engine := gin.New()
+	group := engine.Group("/v1")
+	group.Use(middleware.WithAuth(svc, false))
+	subscriptions.Register(group, svc)
+	request := httptest.NewRequest(http.MethodGet, "/v1/subscriptions/accounts", nil)
+	request.Header.Set(middleware.RouterKeyHeader, routerToken)
+	response := httptest.NewRecorder()
+
+	engine.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.Contains(t, response.Body.String(), "subscription_owner_unavailable")
 }

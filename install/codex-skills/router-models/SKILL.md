@@ -15,7 +15,7 @@ router dashboard's settings page.
 Start by running:
 
 ```bash
-npx --package @workweave/router -y -- weave-router models --codex{{SCOPE}}
+npx --package @weave-os/router -y -- weave-router models --codex{{SCOPE}}
 ```
 
 That prints every deployed model grouped by provider, with `[x]` for models the
@@ -43,7 +43,7 @@ Other things they might ask for:
 
 If the command reports that this router doesn't expose model selection, that's a
 Weave-hosted router: model selection belongs to the whole organization there, so
-tell the user to change it at https://router.workweave.ai/dashboard/settings —
+tell the user to change it at https://router.workweave.ai/models —
 don't try to work around it. Its listing carries no on/off state, so present it
 as a plain list; don't infer which models are enabled.
 

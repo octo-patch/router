@@ -3,7 +3,7 @@ package catalog
 import (
 	"testing"
 
-	"workweave/router/internal/providers"
+	"weave-os/router/internal/providers"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,17 +12,29 @@ import (
 func TestFastPriceFor_PublishedRatesInheritCacheMultiplier(t *testing.T) {
 	fast, ok := FastPriceFor(providers.ProviderOpenAI, "gpt-5.6-luna")
 	require.True(t, ok)
-	assert.Equal(t, Pricing{InputUSDPer1M: 2.00, OutputUSDPer1M: 12.00, CacheReadMultiplier: 0.10}, fast)
+	assert.Equal(t, 0.40, fast.InputUSDPer1M)
+	assert.Equal(t, 2.40, fast.OutputUSDPer1M)
+	assert.Equal(t, 1.25, fast.CacheWriteMultiplier)
+	assert.Equal(t, 0.10, fast.CacheReadMultiplier)
+	require.NotNil(t, fast.LongContext)
+	assert.Equal(t, 0.80, fast.LongContext.InputUSDPer1M)
+	assert.Equal(t, 3.60, fast.LongContext.OutputUSDPer1M)
 
 	opusFast, ok := FastPriceFor(providers.ProviderAnthropic, "claude-opus-5")
 	require.True(t, ok)
-	assert.Equal(t, Pricing{InputUSDPer1M: 10.00, OutputUSDPer1M: 50.00, CacheReadMultiplier: 0.10}, opusFast)
+	assert.Equal(t, Pricing{InputUSDPer1M: 10.00, OutputUSDPer1M: 50.00, CacheReadMultiplier: 0.10, USInferenceGeoMultiplier: USInferenceGeoMultiplier}, opusFast)
 }
 
 func TestFastPriceFor_BaseListPriceUnchanged(t *testing.T) {
 	base, ok := PriceFor(providers.ProviderOpenAI, "gpt-5.6-luna")
 	require.True(t, ok)
-	assert.Equal(t, Pricing{InputUSDPer1M: 1.00, OutputUSDPer1M: 6.00, CacheReadMultiplier: 0.10}, base)
+	assert.Equal(t, 0.20, base.InputUSDPer1M)
+	assert.Equal(t, 1.20, base.OutputUSDPer1M)
+	assert.Equal(t, 1.25, base.CacheWriteMultiplier)
+	assert.Equal(t, 0.10, base.CacheReadMultiplier)
+	require.NotNil(t, base.LongContext)
+	assert.Equal(t, 0.40, base.LongContext.InputUSDPer1M)
+	assert.Equal(t, 1.80, base.LongContext.OutputUSDPer1M)
 	primary, ok := PrimaryPriceFor("gpt-5.6-luna")
 	require.True(t, ok)
 	assert.Equal(t, base, primary)

@@ -7,10 +7,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"workweave/router/internal/api/admin"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/api/admin"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -64,11 +64,13 @@ func TestPolicyCatalogHandlerReportsDefaultAndCapabilities(t *testing.T) {
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &payload))
 	assert.Equal(t, policy.SchemaVersionV1, payload.SchemaVersion)
 	assert.Equal(t, "hmm", payload.DefaultStrategy)
-	require.Len(t, payload.Strategies, 2)
+	require.Len(t, payload.Strategies, 3)
 	assert.Equal(t, "cluster", payload.Strategies[0].Strategy)
 	assert.True(t, payload.Strategies[0].Capabilities.SupportsPreview)
 	assert.True(t, payload.Strategies[0].Capabilities.SupportsShadow)
 	assert.Equal(t, "hmm", payload.Strategies[1].Strategy)
 	assert.True(t, payload.Strategies[1].Available)
-	assert.NotContains(t, recorder.Body.String(), string(router.StrategyHMMBeta))
+	assert.Equal(t, string(router.StrategyHMMBeta), payload.Strategies[2].Strategy,
+		"beta is listed so the control plane can pin an installation to the beta lane")
+	assert.True(t, payload.Strategies[2].Available)
 }

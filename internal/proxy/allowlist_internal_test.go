@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"workweave/router/internal/router/catalog"
+	"weave-os/router/internal/router/catalog"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,29 +33,6 @@ func TestAllowedModelsForRequest_EmptyMeansNoRestriction(t *testing.T) {
 func TestAllowedModelsForRequest_BuildsSet(t *testing.T) {
 	got := allowedModelsForRequest(ctxWithAllowedModels("a", "b"))
 	assert.Equal(t, map[string]struct{}{"a": {}, "b": {}}, got)
-}
-
-func TestAllowedModelsForRequest_IntersectsSubscriptionConditionalList(t *testing.T) {
-	ctx := ctxWithAllowedModels("a", "b")
-	ctx = context.WithValue(ctx, InstallationSubscriptionConditionalModelsContextKey{}, []string{"b", "c"})
-
-	assert.Equal(t, map[string]struct{}{"b": {}}, allowedModelsForRequest(ctx))
-}
-
-func TestAllowedModelsForRequest_EmptyConditionalIntersectionFailsClosed(t *testing.T) {
-	ctx := ctxWithAllowedModels("a")
-	ctx = context.WithValue(ctx, InstallationSubscriptionConditionalModelsContextKey{}, []string{"b"})
-
-	assert.NotNil(t, allowedModelsForRequest(ctx))
-	assert.Empty(t, allowedModelsForRequest(ctx))
-}
-
-func TestAllowedModelsForRequest_EmptyConfiguredConditionalListFailsClosed(t *testing.T) {
-	ctx := context.WithValue(context.Background(), InstallationSubscriptionConditionalModelsContextKey{}, []string{})
-
-	assert.True(t, subscriptionConditionalModelsConfigured(ctx))
-	assert.NotNil(t, allowedModelsForRequest(ctx))
-	assert.Empty(t, allowedModelsForRequest(ctx))
 }
 
 // The allowlist is enforced by desugaring into the exclusion set: every

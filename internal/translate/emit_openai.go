@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/websearch"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/websearch"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -54,10 +54,16 @@ func toolTurnNeedsExplicitEffortNone(opts EmitOptions, hasTools bool) bool {
 }
 
 // samplersAccepted reports whether the target accepts temperature / top_p.
-// Reasoning gpt-5.x models 400 on non-default values on both endpoints;
+// OpenAI reasoning models 400 on non-default values on both endpoints;
 // other CapReasoning targets (OpenRouter, xAI) sample normally.
 func samplersAccepted(opts EmitOptions) bool {
-	return !opts.Capabilities.Supports(router.CapReasoning) || !strings.HasPrefix(opts.TargetModel, "gpt-5")
+	return !opts.Capabilities.Supports(router.CapReasoning) ||
+		!isOpenAIReasoningTarget(opts)
+}
+
+func isOpenAIReasoningTarget(opts EmitOptions) bool {
+	return opts.TargetProvider == providers.ProviderOpenAI ||
+		strings.HasPrefix(opts.TargetModel, "gpt-") || strings.HasPrefix(opts.TargetModel, "o")
 }
 
 // clampOpenAIToolCallID makes a tool-call id safe for the OpenAI wire format:
@@ -83,19 +89,38 @@ func hasNonEmptyTools(body []byte) bool {
 
 // PrepareOpenAI builds an OpenAI Chat Completions request body.
 func (e *RequestEnvelope) PrepareOpenAI(in http.Header, opts EmitOptions) (providers.PreparedRequest, error) {
+	e, err := e.withRouterSystemAppends(opts)
+	if err != nil {
+		return providers.PreparedRequest{}, err
+	}
+	e, err = e.withUnambiguousReadPrefixes()
+	if err != nil {
+		return providers.PreparedRequest{}, err
+	}
 	var body []byte
 	var stats providers.RequestMutationStats
-	var err error
+	var toolNames map[string]string
 	switch e.format {
 	case FormatOpenAI:
 		body, err = e.buildOpenAIFromOpenAI(opts)
 	case FormatAnthropic:
 		body, stats, err = e.buildOpenAIFromAnthropic(opts)
+		toolNames = openAIToolNameAliases(e.body, anthropicRequestToolNamePaths)
 	default:
 		return providers.PreparedRequest{}, fmt.Errorf("unsupported source format for OpenAI emit: %d", e.format)
 	}
 	if err != nil {
 		return providers.PreparedRequest{}, err
+	}
+	body, err = ensureOpenAIToolParameters(body)
+	if err != nil {
+		return providers.PreparedRequest{}, err
+	}
+	if toolTurnNeedsExplicitEffortNone(opts, hasNonEmptyTools(body)) {
+		body, err = sjson.SetBytes(body, "reasoning_effort", "none")
+		if err != nil {
+			return providers.PreparedRequest{}, fmt.Errorf("set reasoning_effort none: %w", err)
+		}
 	}
 	headers := make(http.Header)
 	body, err = applySessionAffinity(body, headers, opts)
@@ -106,7 +131,7 @@ func (e *RequestEnvelope) PrepareOpenAI(in http.Header, opts EmitOptions) (provi
 	if err != nil {
 		return providers.PreparedRequest{}, err
 	}
-	return providers.PreparedRequest{Body: body, Headers: headers, Stats: stats}, nil
+	return providers.PreparedRequest{Body: body, Headers: headers, Stats: stats, ResponseToolNames: toolNames}, nil
 }
 
 // applySessionAffinity attaches an upstream-specific prompt-cache routing hint
@@ -235,12 +260,6 @@ func (e *RequestEnvelope) buildOpenAIFromOpenAI(opts EmitOptions) ([]byte, error
 			return nil, fmt.Errorf("set reasoning_effort: %w", err)
 		}
 	}
-	if toolTurnNeedsExplicitEffortNone(opts, hasNonEmptyTools(body)) {
-		body, err = sjson.SetBytes(body, "reasoning_effort", "none")
-		if err != nil {
-			return nil, fmt.Errorf("set reasoning_effort none: %w", err)
-		}
-	}
 	if targetIsOpenRouter(opts) {
 		if hint := openRouterProviderHint(opts.TargetModel); hint != nil {
 			body, err = sjson.SetBytes(body, "provider", hint)
@@ -297,11 +316,12 @@ func targetIsOpenRouter(opts EmitOptions) bool {
 
 func (e *RequestEnvelope) buildOpenAIFromAnthropic(opts EmitOptions) ([]byte, providers.RequestMutationStats, error) {
 	var stats providers.RequestMutationStats
-	body, removed, err := filterClaudeCodeOnlyToolsFromAnthropicBody(e.body, opts.KeepCrossVendorOrchestrationTools)
+	body, ccFilter, err := filterClaudeCodeOnlyToolsFromAnthropicBody(e.body, opts.ccToolFilter())
 	if err != nil {
 		return nil, stats, fmt.Errorf("strip claude-code-only tools: %w", err)
 	}
-	stats.CCOnlyToolsStripped = removed
+	stats.CCOnlyToolsStripped = ccFilter.ToolsRemoved
+	stats.CCTaskRemindersStripped = ccFilter.TaskRemindersRemoved
 	// Anthropic executes web_search_*/web_fetch_* itself; passing them through
 	// writeOpenAIToolsFromAnthropic creates phantom function tools. Drop them.
 	body, stats.ServerToolsStripped = websearch.StripServerTools(body)
@@ -332,6 +352,7 @@ func (e *RequestEnvelope) buildOpenAIFromAnthropic(opts EmitOptions) ([]byte, pr
 
 	// Tool choice
 	writeOpenAIToolChoiceFromAnthropic(jw, body)
+	writeOpenAIParallelToolCallsFromAnthropic(jw, body)
 
 	// Temperature, top_p
 	clientSetTemp := false
@@ -631,7 +652,7 @@ func buildOpenAIToolCall(block gjson.Result) string {
 	inner.Key("function")
 	inner.Obj()
 	inner.Key("name")
-	inner.Str(block.Get("name").String())
+	inner.Str(sanitizeResponsesToolAlias(block.Get("name").String()))
 	// input is a JSON object; encode it as a JSON string (arguments field).
 	inputRaw := block.Get("input").Raw
 	if inputRaw == "" {
@@ -821,17 +842,19 @@ func writeOpenAIToolsFromAnthropic(jw *jsonWriter, body []byte) {
 		jw.Key("function")
 		jw.Obj()
 		jw.Key("name")
-		jw.Str(tool.Get("name").String())
+		jw.Str(sanitizeResponsesToolAlias(tool.Get("name").String()))
 		if desc := tool.Get("description"); desc.Exists() {
 			jw.Key("description")
 			jw.Raw(desc.Raw)
 		}
+		paramBytes := emptyOpenAIToolParameters
 		if params != nil {
-			if paramBytes, err := json.Marshal(params); err == nil {
-				jw.Key("parameters")
-				jw.RawBytes(paramBytes)
+			if marshaled, err := json.Marshal(params); err == nil {
+				paramBytes = marshaled
 			}
 		}
+		jw.Key("parameters")
+		jw.RawBytes(paramBytes)
 		jw.EndObj()
 		jw.EndObj()
 		return true
@@ -850,6 +873,9 @@ func writeOpenAIToolChoiceFromAnthropic(jw *jsonWriter, body []byte) {
 	case toolChoiceRequired:
 		jw.Key("tool_choice")
 		jw.Str("required")
+	case toolChoiceNone:
+		jw.Key("tool_choice")
+		jw.Str("none")
 	case toolChoiceNamed:
 		inner := newJSONWriter()
 		inner.Obj()
@@ -858,7 +884,7 @@ func writeOpenAIToolChoiceFromAnthropic(jw *jsonWriter, body []byte) {
 		inner.Key("function")
 		inner.Obj()
 		inner.Key("name")
-		inner.Str(name)
+		inner.Str(sanitizeResponsesToolAlias(name))
 		inner.EndObj()
 		inner.EndObj()
 		jw.Key("tool_choice")
@@ -868,15 +894,23 @@ func writeOpenAIToolChoiceFromAnthropic(jw *jsonWriter, body []byte) {
 
 // writeOpenAIMaxTokensFromAnthropic emits either "max_tokens" or
 // "max_completion_tokens" (for reasoning-capable models), clamped to the
-// model's output-token cap.
+// model's output-token cap. max_completion_tokens counts reasoning tokens, so
+// a reasoning target that isn't pinned to effort "none" gets headroom above a
+// tiny client budget.
 func writeOpenAIMaxTokensFromAnthropic(jw *jsonWriter, body []byte, opts EmitOptions) {
 	r := gjson.GetBytes(body, "max_tokens")
 	val := defaultOutputTokens(opts.TargetModel)
 	if r.Exists() {
 		val = r.Int()
 	}
+	reasoning := opts.Capabilities.Supports(router.CapReasoning)
+	effort := resolveReasoningEffortFor(opts)
+	if toolTurnNeedsExplicitEffortNone(opts, hasNonEmptyTools(body)) {
+		effort = "none"
+	}
+	val = reasoningOutputFloor(val, reasoning && effort != "none")
 	val = clampToModelOutputCap(val, opts.TargetModel)
-	if opts.Capabilities.Supports(router.CapReasoning) {
+	if reasoning {
 		jw.Key("max_completion_tokens")
 	} else {
 		jw.Key("max_tokens")
@@ -965,6 +999,49 @@ func deepCopyJSON(node any) any {
 	default:
 		return v
 	}
+}
+
+var emptyOpenAIToolParameters = []byte(`{"type":"object","properties":{}}`)
+
+// ensureOpenAIToolParameters fills a missing function-tool parameters schema.
+// xAI (and some other OpenAI-compat gateways) serde-require the field; a
+// no-arg tool that omitted it 400s as tools[N]: missing field parameters.
+func ensureOpenAIToolParameters(body []byte) ([]byte, error) {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return body, nil
+	}
+	out := body
+	var err error
+	for i, tool := range tools.Array() {
+		path, ok := openAIToolParametersPath(tool)
+		if !ok {
+			continue
+		}
+		schema := tool.Get(path)
+		if schema.Exists() && schema.Type != gjson.Null {
+			continue
+		}
+		out, err = sjson.SetRawBytes(out, fmt.Sprintf("tools.%d.%s", i, path), emptyOpenAIToolParameters)
+		if err != nil {
+			return nil, fmt.Errorf("set tools[%d].%s: %w", i, path, err)
+		}
+	}
+	return out, nil
+}
+
+func openAIToolParametersPath(tool gjson.Result) (string, bool) {
+	typ := tool.Get("type").String()
+	if tool.Get("function").Exists() {
+		if typ != "" && typ != "function" {
+			return "", false
+		}
+		return "function.parameters", true
+	}
+	if typ == "function" || (typ == "" && tool.Get("name").Exists()) {
+		return "parameters", true
+	}
+	return "", false
 }
 
 func sanitizeOpenAIToolSchema(node any) {

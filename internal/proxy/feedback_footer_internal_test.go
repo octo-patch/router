@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"workweave/router/internal/router/turntype"
+	"weave-os/router/internal/router/turntype"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -64,6 +64,7 @@ func TestFeedbackFooter_TurnTypeGating(t *testing.T) {
 		for _, tt := range []turntype.TurnType{
 			turntype.SubAgentDispatch,
 			turntype.Compaction,
+			turntype.Recap,
 			turntype.Probe,
 			turntype.TitleGen,
 			turntype.Classifier,

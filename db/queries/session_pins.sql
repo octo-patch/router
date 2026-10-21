@@ -19,7 +19,7 @@ WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   )
   AND pinned_until > CURRENT_TIMESTAMP
 RETURNING *;
@@ -56,22 +56,30 @@ RETURNING *;
 --
 -- pinned_effort always takes the incoming value: it belongs to the pinned
 -- model, so a rewrite that carries no level intentionally clears it.
+--
+-- consecutive_downgrade_votes and consecutive_upgrade_votes also take the incoming value: unlike the error
+-- counters above it is computed by the turn loop from the pin it just read,
+-- which knows whether this turn confirmed, upgraded, or held the pin.
 -- name: UpsertSessionPin :exec
 INSERT INTO router.session_pins (
   session_key, role, installation_id, pinned_provider,
-  pinned_model, pinned_effort, paired_provider, paired_model,
-  decision_reason, routing_strategy, policy_group, turn_count, pinned_until
+  pinned_model, pinned_effort, forced_thread_key, paired_provider, paired_model,
+  decision_reason, routing_strategy, policy_group, turn_count, pinned_until,
+  consecutive_downgrade_votes, consecutive_upgrade_votes
 ) VALUES (
   @session_key::bytea, @role::varchar, @installation_id::uuid,
-  @pinned_provider::varchar, @pinned_model::varchar, @pinned_effort::varchar,
+  @pinned_provider::varchar, @pinned_model::varchar, @pinned_effort::varchar, @forced_thread_key::varchar,
   @paired_provider::varchar, @paired_model::varchar,
   @decision_reason::text, @routing_strategy::varchar, @policy_group::varchar,
-  @turn_count::int, @pinned_until::timestamp
+  @turn_count::int, @pinned_until::timestamp,
+  @consecutive_downgrade_votes::int,
+  @consecutive_upgrade_votes::int
 )
 ON CONFLICT (session_key, role) DO UPDATE SET
   pinned_provider = EXCLUDED.pinned_provider,
   pinned_model    = EXCLUDED.pinned_model,
   pinned_effort   = EXCLUDED.pinned_effort,
+  forced_thread_key = EXCLUDED.forced_thread_key,
   decision_reason = EXCLUDED.decision_reason,
   routing_strategy = EXCLUDED.routing_strategy,
   turn_count      = CASE
@@ -131,8 +139,10 @@ ON CONFLICT (session_key, role) DO UPDATE SET
       THEN router.session_pins.consecutive_overload_errors
     ELSE 0
   END,
+  consecutive_downgrade_votes = EXCLUDED.consecutive_downgrade_votes,
+  consecutive_upgrade_votes = EXCLUDED.consecutive_upgrade_votes,
   -- A strategy switch selects a different policy. Do not carry cache,
-  -- switch, or error evidence from the previous policy into it.
+  -- switch, output-limit, or error evidence from the previous policy into it.
   last_input_tokens = CASE
     WHEN router.session_pins.routing_strategy = EXCLUDED.routing_strategy
       THEN router.session_pins.last_input_tokens
@@ -158,6 +168,11 @@ ON CONFLICT (session_key, role) DO UPDATE SET
       THEN router.session_pins.last_turn_ended_at
     ELSE NULL
   END,
+  last_output_limit_at = CASE
+    WHEN router.session_pins.routing_strategy = EXCLUDED.routing_strategy
+      THEN router.session_pins.last_output_limit_at
+    ELSE NULL
+  END,
   last_served_model = CASE
     WHEN router.session_pins.routing_strategy = EXCLUDED.routing_strategy
       THEN router.session_pins.last_served_model
@@ -172,6 +187,16 @@ ON CONFLICT (session_key, role) DO UPDATE SET
     WHEN router.session_pins.routing_strategy = EXCLUDED.routing_strategy
       THEN router.session_pins.disabled_providers
     ELSE '{}'
+  END,
+  demoted_models = CASE
+    WHEN router.session_pins.routing_strategy = EXCLUDED.routing_strategy
+      THEN router.session_pins.demoted_models
+    ELSE '{}'
+  END,
+  demotion_cooldowns = CASE
+    WHEN router.session_pins.routing_strategy = EXCLUDED.routing_strategy
+      THEN router.session_pins.demotion_cooldowns
+    ELSE '{}'::jsonb
   END;
 
 -- Records the previous turn's upstream token usage on an existing pin
@@ -192,24 +217,63 @@ ON CONFLICT (session_key, role) DO UPDATE SET
 -- latch evidence preserves history when the stored role row is new.
 -- The latch keeps stripping stale thinking signatures on later turns because
 -- clients resend the full transcript.
+-- last_output_limit_at shares the usage timestamp on a confirmed cap, else
+-- NULL. Readers require equality with last_turn_ended_at so an older writer
+-- refreshing usage alone cannot attach a stale cap to another served model.
 -- name: UpdateSessionPinUsage :exec
 UPDATE router.session_pins
-SET last_input_tokens        = @last_input_tokens::int,
-    last_cached_read_tokens  = @last_cached_read_tokens::int,
-    last_cached_write_tokens = @last_cached_write_tokens::int,
-    last_output_tokens       = @last_output_tokens::int,
-    last_turn_ended_at       = @last_turn_ended_at::timestamptz,
-    pinned_provider          = @last_served_provider::varchar,
+SET last_input_tokens        = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_input_tokens::int
+      ELSE last_input_tokens
+    END,
+    last_cached_read_tokens  = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_cached_read_tokens::int
+      ELSE last_cached_read_tokens
+    END,
+    last_cached_write_tokens = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_cached_write_tokens::int
+      ELSE last_cached_write_tokens
+    END,
+    last_output_tokens       = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_output_tokens::int
+      ELSE last_output_tokens
+    END,
+    last_turn_ended_at       = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_turn_ended_at::timestamptz
+      ELSE last_turn_ended_at
+    END,
+    last_output_limit_at     = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN CASE
+          WHEN @output_limit_reached::boolean THEN @last_turn_ended_at::timestamptz
+          ELSE NULL
+        END
+      ELSE last_output_limit_at
+    END,
+    pinned_provider          = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_served_provider::varchar
+      ELSE pinned_provider
+    END,
     has_ever_switched        = has_ever_switched
       OR @session_ever_switched::boolean
       OR (last_served_model <> '' AND last_served_model <> @last_served_model::varchar)
       OR (@prior_served_model::varchar <> '' AND @prior_served_model::varchar <> @last_served_model::varchar),
-    last_served_model        = @last_served_model::varchar
+    last_served_model        = CASE
+      WHEN last_turn_ended_at IS NULL OR @last_turn_ended_at::timestamptz >= last_turn_ended_at
+        THEN @last_served_model::varchar
+      ELSE last_served_model
+    END
 WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   );
 
 -- Atomically increments consecutive_upstream_errors and returns the
@@ -225,7 +289,7 @@ WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   )
 RETURNING consecutive_upstream_errors;
 
@@ -239,7 +303,7 @@ WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   )
   AND consecutive_upstream_errors > 0;
 
@@ -258,7 +322,7 @@ WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   )
 RETURNING consecutive_overload_errors;
 
@@ -272,7 +336,7 @@ WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   )
   AND consecutive_overload_errors > 0;
 
@@ -292,8 +356,113 @@ WHERE session_key = @session_key::bytea
   AND role        = @role::varchar
   AND (
     routing_strategy = @expected_routing_strategy::varchar
-    OR (routing_strategy = '' AND @expected_routing_strategy::varchar <> 'hmm_beta')
+    OR (routing_strategy = '' AND @expected_routing_strategy::varchar NOT IN ('hmm_beta', 'hmm_qwen'))
   );
+
+-- Expires the pin row and appends a model to demoted_models (deduped) in one
+-- write, after an upstream stream failed with the prelude already committed,
+-- so the next turn re-routes and its automatic selection skips that arm. One
+-- failure is enough: the committed turn is already lost. A missing row is
+-- seeded (a fresh authoritative pick or a swept session has none), an
+-- existing row is rewritten only when it still belongs to the caller's
+-- strategy, and a row another strategy has since taken over is left intact:
+-- the failing request may be a late one whose pin was already replaced, and
+-- a plain upsert here would hand that newer pin back to the stale strategy
+-- before the strike lands. demoted_models only grows within one strategy's
+-- pin lifecycle, like disabled_providers.
+-- name: ExpireAndDemoteSessionPinModel :exec
+INSERT INTO router.session_pins (
+  session_key, role, installation_id, pinned_provider,
+  pinned_model, pinned_effort, paired_provider, paired_model,
+  decision_reason, routing_strategy, policy_group, turn_count, pinned_until,
+  demoted_models
+) VALUES (
+  @session_key::bytea, @role::varchar, @installation_id::uuid,
+  '', '', '', '', '',
+  @decision_reason::text, @expected_routing_strategy::varchar, '',
+  1, @pinned_until::timestamp,
+  ARRAY[@model::varchar]::text[]
+)
+ON CONFLICT (session_key, role) DO UPDATE SET
+  pinned_provider  = '',
+  pinned_model     = '',
+  pinned_effort    = '',
+  paired_provider  = '',
+  paired_model     = '',
+  decision_reason  = EXCLUDED.decision_reason,
+  routing_strategy = EXCLUDED.routing_strategy,
+  pinned_until     = EXCLUDED.pinned_until,
+  last_seen_at     = CURRENT_TIMESTAMP,
+  demoted_models   = CASE
+    WHEN @model::varchar = ANY(router.session_pins.demoted_models)
+      THEN router.session_pins.demoted_models
+    ELSE array_append(router.session_pins.demoted_models, @model::varchar)
+  END
+WHERE router.session_pins.routing_strategy = EXCLUDED.routing_strategy
+  OR (router.session_pins.routing_strategy = '' AND EXCLUDED.routing_strategy NOT IN ('hmm_beta', 'hmm_qwen'));
+
+-- Time-limited counterpart of ExpireAndDemoteSessionPinModel: expires the pin
+-- row and records model in demotion_cooldowns until the given instant, so the
+-- next turns re-route around a rate-limited arm while it cools down and
+-- return to it afterwards. A later cooldown for the same model overwrites the
+-- earlier one. Seeding, strategy guard and the untouched newer-strategy row
+-- behave exactly as in ExpireAndDemoteSessionPinModel.
+-- name: ExpireAndCoolDownSessionPinModel :exec
+INSERT INTO router.session_pins (
+  session_key, role, installation_id, pinned_provider,
+  pinned_model, pinned_effort, paired_provider, paired_model,
+  decision_reason, routing_strategy, policy_group, turn_count, pinned_until,
+  demotion_cooldowns
+) VALUES (
+  @session_key::bytea, @role::varchar, @installation_id::uuid,
+  '', '', '', '', '',
+  @decision_reason::text, @expected_routing_strategy::varchar, '',
+  1, @pinned_until::timestamp,
+  jsonb_build_object(@model::varchar, to_jsonb(@cooldown_until::timestamptz))
+)
+ON CONFLICT (session_key, role) DO UPDATE SET
+  pinned_provider  = '',
+  pinned_model     = '',
+  pinned_effort    = '',
+  paired_provider  = '',
+  paired_model     = '',
+  decision_reason  = EXCLUDED.decision_reason,
+  routing_strategy = EXCLUDED.routing_strategy,
+  pinned_until     = EXCLUDED.pinned_until,
+  last_seen_at     = CURRENT_TIMESTAMP,
+  demotion_cooldowns = router.session_pins.demotion_cooldowns || EXCLUDED.demotion_cooldowns
+WHERE router.session_pins.routing_strategy = EXCLUDED.routing_strategy
+  OR (router.session_pins.routing_strategy = '' AND EXCLUDED.routing_strategy NOT IN ('hmm_beta', 'hmm_qwen'));
+
+-- Removes model's cooldown from one (session_key, role) row after a recovery
+-- probe served the model successfully, so later turns no longer need a lease
+-- to use it. The guard keeps a cooldown written by a concurrent failure after
+-- the probe observed its expiry.
+-- name: DeleteSessionPinDemotionCooldown :exec
+UPDATE router.session_pins
+SET demotion_cooldowns = demotion_cooldowns - @model::varchar
+WHERE session_key = @session_key::bytea
+  AND role = @role::varchar
+  AND demotion_cooldowns ? @model::varchar
+  AND (demotion_cooldowns ->> @model::varchar)::timestamptz <= @observed_until::timestamptz;
+
+-- Records model as failed for the current agent turn on an existing
+-- (session_key, role) row (deduped). Upsert never touches turn_strikes, so the
+-- strike survives the pin rewrite to the rescuing model.
+-- name: UpdateSessionPinTurnStrike :exec
+UPDATE router.session_pins
+SET turn_strikes = array_append(turn_strikes, @model::varchar)
+WHERE session_key = @session_key::bytea
+  AND role = @role::varchar
+  AND NOT (@model::varchar = ANY(turn_strikes));
+
+-- Clears the agent-turn strikes once a real user prompt starts the next turn.
+-- name: DeleteSessionPinTurnStrikes :exec
+UPDATE router.session_pins
+SET turn_strikes = '{}'
+WHERE session_key = @session_key::bytea
+  AND role = @role::varchar
+  AND turn_strikes <> '{}';
 
 -- Garbage-collects pins that have been expired for >24h. The 24h grace
 -- means a transient Postgres outage doesn't immediately prune live pins;

@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"net/http"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/websearch"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/websearch"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -24,14 +24,24 @@ import (
 // exceeds the header timeout ("http2: timeout awaiting response headers").
 
 func (e *RequestEnvelope) PrepareOpenAIResponses(in http.Header, opts EmitOptions) (providers.PreparedRequest, error) {
+	e, err := e.withRouterSystemAppends(opts)
+	if err != nil {
+		return providers.PreparedRequest{}, err
+	}
+	e, err = e.withUnambiguousReadPrefixes()
+	if err != nil {
+		return providers.PreparedRequest{}, err
+	}
 	var body []byte
 	var stats providers.RequestMutationStats
-	var err error
+	var toolNames map[string]string
 	switch e.format {
 	case FormatAnthropic:
 		body, stats, err = e.buildResponsesFromAnthropic(opts)
+		toolNames = openAIToolNameAliases(e.body, anthropicRequestToolNamePaths)
 	case FormatOpenAI:
 		body, err = e.buildResponsesFromOpenAI(opts)
+		toolNames = openAIToolNameAliases(e.body, openAIRequestToolNamePaths)
 	default:
 		return providers.PreparedRequest{}, fmt.Errorf("PrepareOpenAIResponses: unsupported source format: %d", e.format)
 	}
@@ -46,7 +56,7 @@ func (e *RequestEnvelope) PrepareOpenAIResponses(in http.Header, opts EmitOption
 	if err != nil {
 		return providers.PreparedRequest{}, err
 	}
-	return providers.PreparedRequest{Body: body, Endpoint: providers.EndpointResponses, Stats: stats}, nil
+	return providers.PreparedRequest{Body: body, Endpoint: providers.EndpointResponses, Stats: stats, ResponseToolNames: toolNames}, nil
 }
 
 // applyResponsesSessionAffinity mirrors applySessionAffinity for the Responses
@@ -254,19 +264,14 @@ func responsesReasoningEffort(eff, model string) string {
 	return eff
 }
 
-// minResponsesOutputTokens floors max_output_tokens for reasoning targets:
-// hidden reasoning exhausts a tiny budget (1 for a quota probe, 64 for title
-// generation) before a visible token is emitted. max_output_tokens is a
-// ceiling, not an allocation.
-const minResponsesOutputTokens = 16000
-
 func (e *RequestEnvelope) buildResponsesFromAnthropic(opts EmitOptions) ([]byte, providers.RequestMutationStats, error) {
 	var stats providers.RequestMutationStats
-	body, removed, err := filterClaudeCodeOnlyToolsFromAnthropicBody(e.body, opts.KeepCrossVendorOrchestrationTools)
+	body, ccFilter, err := filterClaudeCodeOnlyToolsFromAnthropicBody(e.body, opts.ccToolFilter())
 	if err != nil {
 		return nil, stats, fmt.Errorf("strip claude-code-only tools: %w", err)
 	}
-	stats.CCOnlyToolsStripped = removed
+	stats.CCOnlyToolsStripped = ccFilter.ToolsRemoved
+	stats.CCTaskRemindersStripped = ccFilter.TaskRemindersRemoved
 	// See buildOpenAIFromAnthropic: native server tools cannot cross to a
 	// non-Anthropic upstream without becoming phantom client tools.
 	body, stats.ServerToolsStripped = websearch.StripServerTools(body)
@@ -319,17 +324,14 @@ func (e *RequestEnvelope) buildResponsesFromAnthropic(opts EmitOptions) ([]byte,
 		jw.EndArr()
 	}
 
-	writeResponsesInputFromAnthropic(jw, body)
 	writeResponsesToolsFromAnthropic(jw, body)
 	writeResponsesToolChoiceFromAnthropic(jw, body)
+	writeOpenAIParallelToolCallsFromAnthropic(jw, body)
 
 	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() && mt.Type == gjson.Number {
-		want := mt.Int()
 		// Gated on the target: OpenAI applies its own default effort when we send
 		// none, so a reasoning model burns the budget on hidden reasoning either way.
-		if opts.Capabilities.Supports(router.CapReasoning) {
-			want = max(want, minResponsesOutputTokens)
-		}
+		want := reasoningOutputFloor(mt.Int(), opts.Capabilities.Supports(router.CapReasoning))
 		jw.Key("max_output_tokens")
 		jw.Int(clampToModelOutputCap(want, opts.TargetModel))
 	}
@@ -344,16 +346,26 @@ func (e *RequestEnvelope) buildResponsesFromAnthropic(opts EmitOptions) ([]byte,
 		}
 	}
 
+	writeResponsesInputFromAnthropic(jw, body, opts.ReasoningReplayScope)
+
 	jw.EndObj()
 	return jw.Bytes(), stats, nil
 }
 
 // writeResponsesInputFromAnthropic converts Anthropic messages into Responses
 // input items (text/image messages, reasoning, function_call, function_call_output).
-func writeResponsesInputFromAnthropic(jw *jsonWriter, body []byte) {
+// Reasoning is replayed only for the turn in progress (after the latest typed
+// user prompt): earlier turns' reasoning plans already-answered prompts and
+// would otherwise dominate the context of a long session.
+func writeResponsesInputFromAnthropic(jw *jsonWriter, body []byte, scope string) {
+	messages := gjson.GetBytes(body, "messages")
+	replayFrom := latestUserPromptIndex(messages) + 1
 	jw.Key("input")
 	jw.Arr()
-	gjson.GetBytes(body, "messages").ForEach(func(_, msg gjson.Result) bool {
+	msgIdx := -1
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		msgIdx++
+		replayReasoning := msgIdx >= replayFrom
 		role := msg.Get("role").String()
 		content := msg.Get("content")
 		if content.Type == gjson.String {
@@ -387,19 +399,19 @@ func writeResponsesInputFromAnthropic(jw *jsonWriter, body []byte) {
 				}
 			case "thinking":
 				sig := block.Get("signature").String()
-				if _, emitted := emittedReasoningSignatures[sig]; emitted || !decodeOpenAIReasoningSignatureValid(sig) {
+				if _, emitted := emittedReasoningSignatures[sig]; emitted || !replayReasoning || !openAIReasoningSignatureReplayable(sig, scope) {
 					return true
 				}
 				flushContent()
-				emitResponsesReasoningItem(jw, sig)
+				emitResponsesReasoningItem(jw, sig, scope)
 				emittedReasoningSignatures[sig] = struct{}{}
 			case "tool_use":
 				callID, sig := extractOpenAIReasoningSignatureFromID(block.Get("id").String())
 				flushContent()
 				// Claude Code's round-trip drops the thinking block but keeps
 				// the tool_use id, so replay the reasoning item carried on it.
-				if sig != "" {
-					if _, emitted := emittedReasoningSignatures[sig]; !emitted && emitResponsesReasoningItem(jw, sig) {
+				if sig != "" && replayReasoning {
+					if _, emitted := emittedReasoningSignatures[sig]; !emitted && emitResponsesReasoningItem(jw, sig, scope) {
 						emittedReasoningSignatures[sig] = struct{}{}
 					}
 				}
@@ -409,7 +421,7 @@ func writeResponsesInputFromAnthropic(jw *jsonWriter, body []byte) {
 				jw.Key("call_id")
 				jw.Str(clampOpenAIToolCallID(callID))
 				jw.Key("name")
-				jw.Str(block.Get("name").String())
+				jw.Str(sanitizeResponsesToolAlias(block.Get("name").String()))
 				inputRaw := block.Get("input").Raw
 				if inputRaw == "" {
 					inputRaw = "{}"
@@ -447,13 +459,43 @@ func writeResponsesInputFromAnthropic(jw *jsonWriter, body []byte) {
 	jw.EndArr()
 }
 
-func decodeOpenAIReasoningSignatureValid(sig string) bool {
-	_, _, ok := decodeOpenAIReasoningSignature(sig)
-	return ok
+// latestUserPromptIndex returns the index of the last user message carrying
+// input a person typed, or -1 when there is none. Tool results and Claude
+// Code's injected wrapper blocks (<system-reminder>, ...) are not typed input.
+func latestUserPromptIndex(messages gjson.Result) int {
+	latest, idx := -1, -1
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		idx++
+		if msg.Get("role").String() == "user" && hasTypedUserInput(msg.Get("content")) {
+			latest = idx
+		}
+		return true
+	})
+	return latest
 }
 
-func emitResponsesReasoningItem(jw *jsonWriter, sig string) bool {
-	id, enc, ok := decodeOpenAIReasoningSignature(sig)
+func hasTypedUserInput(content gjson.Result) bool {
+	if content.Type == gjson.String {
+		return !isOnlyKnownInjectedText(content.String())
+	}
+	typed := false
+	content.ForEach(func(_, block gjson.Result) bool {
+		switch block.Get("type").String() {
+		case "image":
+			typed = true
+		case "text":
+			typed = !isOnlyKnownInjectedText(block.Get("text").String())
+		}
+		return !typed
+	})
+	return typed
+}
+
+// emitResponsesReasoningItem replays encrypted reasoning only to the account
+// and model that minted it. Anywhere else the upstream rejects the whole turn
+// rather than ignoring the item, which ends the session.
+func emitResponsesReasoningItem(jw *jsonWriter, sig, scope string) bool {
+	id, enc, ok := openAIReasoningSignatureForScope(sig, scope)
 	if !ok {
 		return false
 	}
@@ -621,6 +663,9 @@ func writeResponsesFunctionTools(jw *jsonWriter, tools []responsesFunctionTool) 
 				params = strictParams
 				strict = true
 			} else {
+				if closedParams, ok := closeOpenAISchemaObjects(params); ok {
+					params = closedParams
+				}
 				observability.Get().Info("Responses strictify fallback — emitting non-strict tool",
 					"tool_name", tool.name)
 			}
@@ -629,19 +674,23 @@ func writeResponsesFunctionTools(jw *jsonWriter, tools []responsesFunctionTool) 
 		jw.Key("type")
 		jw.Str("function")
 		jw.Key("name")
-		jw.Str(tool.name)
+		jw.Str(sanitizeResponsesToolAlias(tool.name))
 		if tool.description.Exists() {
 			jw.Key("description")
 			jw.Raw(tool.description.Raw)
 		}
+		paramBytes := emptyOpenAIToolParameters
 		if params != nil {
-			if paramBytes, err := json.Marshal(params); err == nil {
-				jw.Key("parameters")
-				jw.RawBytes(paramBytes)
-				jw.Key("strict")
-				jw.Bool(strict)
+			if marshaled, err := json.Marshal(params); err == nil {
+				paramBytes = marshaled
+			} else {
+				strict = false
 			}
 		}
+		jw.Key("parameters")
+		jw.RawBytes(paramBytes)
+		jw.Key("strict")
+		jw.Bool(strict)
 		jw.EndObj()
 	}
 	jw.EndArr()
@@ -658,13 +707,16 @@ func writeResponsesToolChoiceFromAnthropic(jw *jsonWriter, body []byte) {
 	case toolChoiceRequired:
 		jw.Key("tool_choice")
 		jw.Str("required")
+	case toolChoiceNone:
+		jw.Key("tool_choice")
+		jw.Str("none")
 	case toolChoiceNamed:
 		jw.Key("tool_choice")
 		jw.Obj()
 		jw.Key("type")
 		jw.Str("function")
 		jw.Key("name")
-		jw.Str(name)
+		jw.Str(sanitizeResponsesToolAlias(name))
 		jw.EndObj()
 	}
 }

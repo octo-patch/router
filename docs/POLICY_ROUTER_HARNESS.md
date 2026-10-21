@@ -24,6 +24,34 @@ contain OpenRouter bindings. A production sidecar must not send prompts,
 outcomes, or feedback to OpenRouter for auxiliary inference either; use the
 same direct provider stack approved for the router deployment.
 
+Request-shape recognition and compatibility are router responsibilities. A
+sidecar may use generic tool evidence for classification, but it must not detect
+native search (or another wire capability) to select, exclude, reorder, or
+allowlist providers/models. Go applies those constraints before invoking the
+sidecar, and isolated pass-through turns do not invoke it at all.
+
+Turn facts are router-owned as well. `harness`, `latest_user_text`,
+`turn_index`, `is_subagent`, `available_tools`, and `invoked_tools` on the
+`policy_router_v4` request are authoritative: a sidecar consumes them verbatim
+and must not recompute them from `conversation_messages`, `client_app`, or
+`prompt_text`. `available_tools` is the advertised set unioned with every tool
+already invoked in the full conversation (before any wire truncation);
+`invoked_tools` is that invoked subset on its own. The reviewed top-level
+field list lives in `internal/policyclient/testdata/classifier_request_v4_fields.txt`;
+adding or removing a wire field is a contract change and updates that fixture.
+
+`harness` is the router's policy identity for the calling agent, derived from
+`client_app` by `policy.HarnessForClientApp`
+(`internal/router/policy/harness.go`): `claude_code`, `codex`, `pi`, `cursor`,
+`opencode`, `api` (generic API and Gemini CLI callers), or `unknown`. For
+`claude_code`, `codex`, `pi`, and `opencode` the same spelling is the roster
+key under which a Go selection policy may declare per-harness arms,
+membership, pins, and vendor preferences (`rosterdata.Harness`); a harness with
+no roster entry serves the pooled cluster order, which is what every promoted
+policy does for `opencode` today. A sidecar must degrade a `harness` value outside its own
+vocabulary to its pooled default rather than reject the route, so adding a
+harness here never changes what an older sidecar serves.
+
 There is no strategy fallback. If a serving policy cannot return a valid
 selection after bounded transient retries, the client receives HTTP 503.
 Availability comes from healthy replicas, readiness gates, immutable artifacts,

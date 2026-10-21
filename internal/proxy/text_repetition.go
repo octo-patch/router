@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 )
@@ -127,10 +127,6 @@ func (s *Service) handleTextRepetitionBreak(
 		}
 	}
 
-	switch env.SourceFormat() {
-	case translate.FormatOpenAI:
-		return writeSyntheticOpenAIResponse(w, env, msg, inputTokens)
-	default:
-		return writeSyntheticAnthropicResponse(w, env, msg, inputTokens)
-	}
+	ack := newCommandAcknowledgment(translate.CommandLoopStop)
+	return writeCommandOutcome(ctx, w, env, msg, ack.outcome, inputTokens)
 }

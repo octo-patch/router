@@ -1,17 +1,17 @@
 package gemini
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/server/middleware"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/server/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/sjson"
@@ -55,8 +55,15 @@ func GenerateContentHandler(svc *proxy.Service, authSvc *auth.Service) gin.Handl
 			return
 		}
 
-		ctx := context.WithValue(c.Request.Context(), proxy.ClientIdentityContextKey{}, proxy.ClientIdentityFromHeaders(c.Request.Header))
+		ctx := requestcontext.WithClientIdentity(c.Request.Context(), proxy.ClientIdentityFromHeaders(c.Request.Header))
 		ctx = proxy.ResolveUserFromContext(ctx, authSvc, middleware.InstallationFrom(c))
+		ctx, err = proxy.ResolveRoutingAssignment(ctx, authSvc, middleware.InstallationFrom(c))
+		if err != nil {
+			log.Error("Failed to resolve routing assignment", "installation_id", middleware.InstallationFrom(c).ID, "err", err)
+			c.Header("Retry-After", "1")
+			writeGeminiError(c, http.StatusServiceUnavailable, "UNAVAILABLE", "Routing policy temporarily unavailable.")
+			return
+		}
 		c.Request = c.Request.WithContext(ctx)
 
 		if err := svc.ProxyGeminiGenerateContent(c.Request.Context(), body, c.Writer, c.Request); err != nil {
@@ -128,13 +135,13 @@ func geminiErrorStatus(kind proxy.DispatchErrorKind) string {
 		return "UNIMPLEMENTED"
 	case proxy.DispatchErrorProviderNotConfigured:
 		return "FAILED_PRECONDITION"
-	case proxy.DispatchErrorRequestNotJSONObject:
+	case proxy.DispatchErrorRequestNotJSONObject, proxy.DispatchErrorContextWindowExceeded:
 		return "INVALID_ARGUMENT"
 	case proxy.DispatchErrorNoEligibleProvider:
 		return "FAILED_PRECONDITION"
-	case proxy.DispatchErrorInvalidRoutingKnobs:
+	case proxy.DispatchErrorInvalidRoutingKnobs, proxy.DispatchErrorPlanOverrideRejected:
 		return "INVALID_ARGUMENT"
-	case proxy.DispatchErrorRLPolicyUnavailable, proxy.DispatchErrorBanditUnavailable, proxy.DispatchErrorHMMUnavailable, proxy.DispatchErrorPolicyUnavailable, proxy.DispatchErrorClusterUnavailable:
+	case proxy.DispatchErrorRLPolicyUnavailable, proxy.DispatchErrorBanditUnavailable, proxy.DispatchErrorHMMUnavailable, proxy.DispatchErrorDecisionModelUnavailable, proxy.DispatchErrorPolicyUnavailable, proxy.DispatchErrorClusterUnavailable, proxy.DispatchErrorPlanUnresolvable, proxy.DispatchErrorPolicyPinUnavailable:
 		return "UNAVAILABLE"
 	default:
 		return "UPSTREAM_ERROR"

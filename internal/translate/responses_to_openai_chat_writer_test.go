@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/translate"
-	"workweave/router/internal/translate/toolcheck"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/translate"
+	"weave-os/router/internal/translate/toolcheck"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,12 +16,13 @@ import (
 )
 
 // chatChunks returns the parsed data payloads of a translated chat SSE stream,
-// asserting every frame is a well-formed chat.completion.chunk and that the
-// stream ends with [DONE].
+// asserting every frame is a well-formed chat.completion.chunk or error frame.
+// Successful streams end with [DONE]; failed streams never carry it.
 func chatChunks(t *testing.T, body string) []gjson.Result {
 	t.Helper()
 	var out []gjson.Result
 	sawDone := false
+	sawError := false
 	for _, line := range strings.Split(body, "\n") {
 		data, ok := strings.CutPrefix(line, "data: ")
 		if !ok {
@@ -35,6 +36,7 @@ func chatChunks(t *testing.T, body string) []gjson.Result {
 		require.True(t, gjson.Valid(data), "every frame must be valid JSON: %s", data)
 		parsed := gjson.Parse(data)
 		if parsed.Get("error").Exists() {
+			sawError = true
 			out = append(out, parsed)
 			continue
 		}
@@ -42,7 +44,11 @@ func chatChunks(t *testing.T, body string) []gjson.Result {
 		assert.NotEmpty(t, parsed.Get("id").String())
 		out = append(out, parsed)
 	}
-	assert.True(t, sawDone, "a chat client waits for data: [DONE]")
+	if sawError {
+		assert.False(t, sawDone, "failure cannot carry success terminator")
+	} else {
+		assert.True(t, sawDone, "successful stream ends with data: [DONE]")
+	}
 	return out
 }
 
@@ -202,6 +208,45 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
 	assert.NotEmpty(t, w.Summary().ToolCallIssues, "the finding must surface for router.tool_call_invalid")
 }
 
+// The proxy persists InvalidToolArgsBlocks as a measured count, so it must
+// track the calls whose args degraded to `{}` — not every reported finding,
+// and not a flat zero on a turn that carried one.
+func TestResponsesToOpenAIChatWriter_CountsUnrepairableToolArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments string
+		want      int
+	}{
+		{name: "valid args", arguments: `{\"location\":\"NYC\"}`, want: 0},
+		{name: "repaired args", arguments: `{\"location\":\"NYC\"`, want: 0},
+		{name: "unrepairable args", arguments: `not json at all`, want: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v := toolcheck.Compile([]byte(`[{"name":"get_weather","input_schema":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}]`))
+			require.NotNil(t, v)
+			rec := httptest.NewRecorder()
+			w := translate.NewResponsesToOpenAIChatWriter(rec, "gpt-5.6-luna", nil).WithToolValidator(v)
+
+			require.NoError(t, w.Prelude(true))
+			_, err := w.Write([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"get_weather"}}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"` + tc.arguments + `"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"` + tc.arguments + `"}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}]}}
+
+`))
+			require.NoError(t, err)
+			require.NoError(t, w.Finalize())
+
+			assert.Equal(t, tc.want, w.Summary().InvalidToolArgsBlocks)
+			assert.Equal(t, 1, w.Summary().ToolUseBlocks)
+		})
+	}
+}
+
 // A nameless function_call must be dropped: a chat client would otherwise
 // invoke tool "" in a loop.
 func TestResponsesToOpenAIChatWriter_DropsNamelessToolCall(t *testing.T) {
@@ -263,7 +308,8 @@ data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","err
 }
 
 // A stream that dies without a terminal event must surface an error to the
-// proxy (usage accounting depends on it) and still close the client's stream.
+// proxy (usage accounting depends on it) and end with an error frame rather
+// than the [DONE] success terminator.
 func TestResponsesToOpenAIChatWriter_TruncatedStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	w := translate.NewResponsesToOpenAIChatWriter(rec, "gpt-5.6-luna", nil)
@@ -273,7 +319,7 @@ func TestResponsesToOpenAIChatWriter_TruncatedStream(t *testing.T) {
 `))
 	require.NoError(t, err)
 	require.Error(t, w.Finalize(), "an unterminated stream is an error, not a clean stop")
-	assert.Contains(t, rec.Body.String(), "data: [DONE]")
+	assert.NotContains(t, rec.Body.String(), "data: [DONE]")
 	assert.Contains(t, rec.Body.String(), "before a terminal event")
 }
 
@@ -315,7 +361,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
 		assert.NotEqual(t, "stop", c.Get("choices.0.finish_reason").String(),
 			"a turn that lost a frame must not report a clean stop")
 	}
-	assert.Contains(t, rec.Body.String(), "data: [DONE]")
+	assert.NotContains(t, rec.Body.String(), "data: [DONE]")
 }
 
 // A `[DONE]` sentinel is not JSON but is emitted by some gateways, so it must
@@ -357,14 +403,15 @@ func TestResponsesToOpenAIChatWriter_NonStreamingFailure(t *testing.T) {
 	assert.Equal(t, "upstream_error", root.Get("error.type").String())
 }
 
-// The output-progress watchdog must not be fed by reasoning-only frames, or a
-// stream that reasons forever without answering looks healthy.
-func TestResponsesToOpenAIChatWriter_ReasoningDoesNotMarkOutputProgress(t *testing.T) {
+// Reasoning keeps the stall watchdog alive without becoming answer output.
+func TestResponsesToOpenAIChatWriter_SeparatesReasoningProgress(t *testing.T) {
 	rec := httptest.NewRecorder()
 	w := translate.NewResponsesToOpenAIChatWriter(rec, "gpt-5.6-luna", nil)
 	require.NoError(t, w.Prelude(true))
 	marks := 0
 	require.True(t, w.ArmOutputProgress(func() { marks++ }))
+	reasoningMarks := 0
+	require.True(t, w.ArmReasoningProgress(func() { reasoningMarks++ }))
 
 	_, err := w.Write([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","summary":[]}}
 
@@ -373,10 +420,12 @@ data: {"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"
 `))
 	require.NoError(t, err)
 	assert.Zero(t, marks, "reasoning is not output")
+	assert.Equal(t, 1, reasoningMarks)
 
 	_, err = w.Write([]byte(`data: {"type":"response.output_text.delta","output_index":1,"delta":"answer"}
 
 `))
 	require.NoError(t, err)
 	assert.Positive(t, marks)
+	assert.Equal(t, 1, reasoningMarks, "answer output must not become reasoning progress")
 }

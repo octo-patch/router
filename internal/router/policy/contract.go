@@ -3,7 +3,8 @@ package policy
 import (
 	"context"
 
-	"workweave/router/internal/router"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/taskdomain"
 )
 
 // SchemaVersionV1 is the first stable policy-sidecar wire contract.
@@ -16,6 +17,20 @@ const SchemaVersionV2 = "policy_router_v2"
 // SchemaVersionV3 identifies the classifier-only contract: the sidecar classifies
 // and returns a ranked fallback; the router selects the arm.
 const SchemaVersionV3 = "policy_router_v3"
+
+// SchemaVersionV4 identifies the strict classification-facts-only contract.
+// Candidate identities, roster data, group clamps, and selection fields are
+// forbidden on this boundary.
+const SchemaVersionV4 = "policy_router_v4"
+
+// ClassifierArtifact identifies an alternate classifier with the sidecar's taxonomy.
+type ClassifierArtifact struct {
+	ArtifactID      string `json:"artifact_id"`
+	PackageSHA256   string `json:"package_sha256"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	Audience        string `json:"audience,omitempty"`
+	ServingRevision string `json:"serving_revision,omitempty"`
+}
 
 const (
 	ExecutionModeServing = "serving"
@@ -32,7 +47,10 @@ type Capabilities struct {
 	HonorsQualityPriceBias   bool   `json:"honors_quality_price_bias"`
 	SupportsDebugRouteDetail bool   `json:"supports_debug_route_detail"`
 	SupportsPreview          bool   `json:"supports_preview"`
-	SupportsShadow           bool   `json:"supports_shadow"`
+	// SupportsRoutingDistribution means the Go router can project the same
+	// quality/price scorer used by live serving across the dashboard dial.
+	SupportsRoutingDistribution bool `json:"supports_routing_distribution"`
+	SupportsShadow              bool `json:"supports_shadow"`
 	// ReportsRankedFallback declares that the sidecar returns ranked_fallback on
 	// the serving /route response. When false, cluster arm overrides fail open.
 	ReportsRankedFallback bool `json:"reports_ranked_fallback"`
@@ -52,6 +70,18 @@ type CapabilitySource interface {
 	CurrentCapabilities() Capabilities
 }
 
+// RequestCapabilitySource keeps capability-dependent behavior on the admitted runtime.
+type RequestCapabilitySource interface {
+	CapabilitiesForRequest(context.Context) Capabilities
+}
+
+// AvailabilitySource reports whether a policy-backed router has an active
+// serving snapshot. Registration alone is not readiness: a dynamic router can
+// be wired before its first valid policy refresh completes.
+type AvailabilitySource interface {
+	Available() bool
+}
+
 // StrategySpec is the complete proxy registration for one policy strategy.
 // Reporter capabilities are discovered from Router when the spec is installed.
 type StrategySpec struct {
@@ -63,6 +93,8 @@ type StrategySpec struct {
 
 // Query contains the strategy-neutral request context supplied to a policy.
 type Query struct {
+	TaskDomain           *taskdomain.Input
+	ClassifierPrediction *router.ClassifierPrediction
 	SchemaVersion        string
 	Strategy             router.Strategy
 	ExecutionMode        string
@@ -90,10 +122,14 @@ type Query struct {
 	CaptureMode          string
 	DebugEnabled         bool
 	Candidates           []Candidate
+	// ArtifactSHA256 selects a boot-loaded sidecar package; empty serves the
+	// sidecar's default package.
+	ArtifactSHA256 string
 }
 
 // Result is a policy sidecar's selected candidate and decision metadata.
 type Result struct {
+	TaskDomain           *taskdomain.Outcome
 	SchemaVersion        string
 	RouteID              string
 	ArmID                string
@@ -134,6 +170,12 @@ type Result struct {
 	// ClassProbabilities is the classifier's typed per-class probability map;
 	// nil on sidecars that do not report it.
 	ClassProbabilities map[string]float64
+	// ClassOrder is the classifier taxonomy order used for deterministic ties.
+	ClassOrder []string
+	// HMMStateID and the state vectors are classifier evidence, not selection.
+	HMMStateID            int
+	HMMStatePath          []int
+	HMMStateProbabilities []float64
 }
 
 // PreviewGroup records one classifier group in serving fallback order.
@@ -158,6 +200,7 @@ type PreviewResult struct {
 	HMMStateProbabilities []float64          `json:"hmm_state_probabilities"`
 	ClassOrder            []string           `json:"class_order"`
 	ClassProbabilities    map[string]float64 `json:"class_probabilities"`
+	PredictedLabel        string             `json:"predicted_label"`
 	RankedFallback        []PreviewGroup     `json:"ranked_fallback"`
 	SelectedGroup         string             `json:"selected_group,omitempty"`
 	EligibleRosterIDs     []string           `json:"eligible_roster_ids"`
@@ -165,14 +208,26 @@ type PreviewResult struct {
 	ResolverExclusions    []Diagnostic       `json:"resolver_exclusions"`
 }
 
-// RosterSnapshot is the frozen per-cluster arm roster from the sidecar artifact.
-// Used to seed the control plane's default arm-order UI.
+// RosterSnapshot is the live Go selection-policy projection used by routing,
+// preview, deployed-model discovery, and the admin control plane.
 type RosterSnapshot struct {
-	Clusters     map[string][]string `json:"clusters"`
-	RosterSHA256 string              `json:"roster_sha256"`
+	SchemaVersion            string                         `json:"schema_version"`
+	ReleaseID                string                         `json:"release_id"`
+	PolicySHA256             string                         `json:"policy_sha256"`
+	Environment              string                         `json:"environment"`
+	Lane                     string                         `json:"lane"`
+	HeadGeneration           int64                          `json:"head_generation"`
+	LatestObservedGeneration int64                          `json:"latest_observed_generation"`
+	RejectedGeneration       int64                          `json:"rejected_generation,omitempty"`
+	LastRejectionReason      string                         `json:"last_rejection_reason,omitempty"`
+	Clusters                 map[string][]string            `json:"clusters"`
+	Harnesses                map[string]map[string][]string `json:"harnesses,omitempty"`
+	// RosterSHA256 is dual-written for compatibility while callers migrate to
+	// PolicySHA256. Both identify the exact Go policy bytes.
+	RosterSHA256 string `json:"roster_sha256"`
 }
 
-// RosterSource returns the sidecar's frozen per-cluster arm roster.
+// RosterSource returns the active Go-owned serving-policy projection.
 type RosterSource interface {
 	ClusterRoster(ctx context.Context) (RosterSnapshot, error)
 }

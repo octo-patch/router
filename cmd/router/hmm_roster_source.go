@@ -8,27 +8,39 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/policyclient"
-	"workweave/router/internal/router/cluster"
-	"workweave/router/internal/router/hmm"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/policyclient"
+	"weave-os/router/internal/policyregistry"
+	"weave-os/router/internal/router/cluster"
+	"weave-os/router/internal/router/hmm"
 )
 
 // hmmRosterTTL reuses the same freshness window as the control plane's own
-// deployed-models cache; the HMM roster only changes on a bandit-state swap.
+// deployed-models cache; the source is the active Go policy manager.
 const hmmRosterTTL = 5 * time.Minute
 
 // hmmRosterRetryBackoff caps how often a failing refresh re-hits the sidecar
 // while stale data is being served, to avoid hammering it during an outage.
 const hmmRosterRetryBackoff = 30 * time.Second
 
-// rosterFetcher is the subset of the policy sidecar client the roster source
-// needs; satisfied by *policyclient.Client.
+// Admitted snapshots already cache immutable policies. A global TTL cache here
+// would leak the first customer's roster into every subsequent request.
+type admittedHMMRosterSource struct{}
+
+func (admittedHMMRosterSource) HMMDeployedModels(ctx context.Context) ([]cluster.DeployedEntry, error) {
+	arms, err := (policyregistry.AdmittedRosterSource{}).Roster(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return hmm.DeployedModelsForRosterIDs(arms), nil
+}
+
+// rosterFetcher is the active Go policy projection needed for model discovery.
 type rosterFetcher interface {
 	Roster(ctx context.Context) ([]string, error)
 }
 
-// hmmRosterSource adapts HMM sidecar roster arms to deployed-model entries.
+// hmmRosterSource adapts active Go policy arms to deployed-model entries.
 // On fetch failure it serves the prior snapshot rather than blanking the roster.
 type hmmRosterSource struct {
 	fetch        rosterFetcher

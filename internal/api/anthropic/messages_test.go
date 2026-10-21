@@ -5,17 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	anthropicapi "workweave/router/internal/api/anthropic"
-	"workweave/router/internal/auth"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/cluster"
-	"workweave/router/internal/router/policy"
+	anthropicapi "weave-os/router/internal/api/anthropic"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/cluster"
+	"weave-os/router/internal/router/policy"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -79,10 +80,12 @@ func (f *fakeRouter) Route(_ context.Context, req router.Request) (router.Decisi
 // fakeProviderClient is a minimal providers.Client double: Proxy/Passthrough
 // return whatever the test wants, optionally writing a response first.
 type fakeProviderClient struct {
-	proxyErr       error
-	proxyStatus    int
-	proxyBody      string
-	passthroughErr error
+	proxyErr               error
+	proxyStatus            int
+	proxyBody              string
+	flushProxyBody         bool
+	propagateProxyWriteErr bool
+	passthroughErr         error
 }
 
 func (f *fakeProviderClient) Proxy(_ context.Context, _ router.Decision, _ providers.PreparedRequest, w http.ResponseWriter, _ *http.Request) error {
@@ -94,7 +97,15 @@ func (f *fakeProviderClient) Proxy(_ context.Context, _ router.Decision, _ provi
 		status = http.StatusOK
 	}
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(f.proxyBody))
+	_, writeErr := w.Write([]byte(f.proxyBody))
+	if f.flushProxyBody {
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	if f.propagateProxyWriteErr {
+		return writeErr
+	}
 	return nil
 }
 
@@ -286,6 +297,37 @@ func TestMessagesHandler_UpstreamStatusErrorPassesThroughStatus(t *testing.T) {
 	assert.Equal(t, "api_error", errObj["type"])
 }
 
+func TestMessagesHandler_CrossFormatOverflowReturnsNativeError(t *testing.T) {
+	const responsesOverflow = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}
+
+event: error
+data: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."},"output":[]}}
+
+`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			client := &fakeProviderClient{proxyStatus: http.StatusOK, proxyBody: responsesOverflow, flushProxyBody: true, propagateProxyWriteErr: true}
+			svc := proxy.NewService(
+				&fakeRouter{decision: router.Decision{Provider: providers.ProviderOpenAI, Model: "gpt-5-mini", Reason: "test"}},
+				map[string]providers.Client{providers.ProviderOpenAI: client},
+				nil, false, nil, nil, false, providers.ProviderOpenAI, "gpt-5-mini", nil,
+			)
+			reqBody := fmt.Sprintf(`{"model":"gpt-5-mini","max_tokens":1024,"stream":%t,"messages":[{"role":"user","content":"hi"}]}`, stream)
+			rec := postMessages(messagesEngine(svc), []byte(reqBody))
+
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			errObj := errorEnvelope(t, rec.Body.Bytes())
+			assert.Equal(t, "invalid_request_error", errObj["type"])
+			assert.Contains(t, errObj["message"], "prompt is too long")
+			assert.NotContains(t, rec.Body.String(), "upstream Responses request failed")
+		})
+	}
+}
+
 func TestMessagesHandler_UnknownErrorReturns502(t *testing.T) {
 	client := &fakeProviderClient{proxyErr: errors.New("boom: transport exploded")}
 	svc := newTestService(
@@ -362,6 +404,19 @@ func TestRouteHandler_InvalidRoutingKnobsReturns400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	errObj := errorEnvelope(t, rec.Body.Bytes())
 	assert.Equal(t, "invalid_request_error", errObj["type"])
+}
+
+func TestRouteHandler_PolicyPinUnavailableReturns503(t *testing.T) {
+	svc := newTestService(&fakeRouter{err: fmt.Errorf("hmm: %w", router.ErrPolicyPinUnavailable)}, "", nil)
+	engine := routeEngine(svc)
+
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/route", bytes.NewReader([]byte(validAnthropicBody))))
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	errObj := errorEnvelope(t, rec.Body.Bytes())
+	assert.Equal(t, "api_error", errObj["type"])
+	assert.Equal(t, router.PolicyPinUnavailableReason, errObj["message"])
 }
 
 func TestRouteHandler_GenericRoutingErrorReturns502(t *testing.T) {

@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/translate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func parseAndEmit(t *testing.T, body []byte, format string, opts translate.EmitOptions) map[string]any {
@@ -595,6 +597,91 @@ func TestAnthropicSameFormat_MidConversationSystemMessageDemotedInPlace(t *testi
 	}
 }
 
+func TestAnthropicSameFormat_MidConversationSystemOutputConfigHoistedBeforeDemotion(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"},{"role":"system","content":"set effort","output_config":{"effort":"high"}}],"max_tokens":1024}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-opus-4-7",
+		Capabilities: router.Lookup("claude-opus-4-7"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+
+	outputConfig, _ := out["output_config"].(map[string]any)
+	require.NotNil(t, outputConfig)
+	assert.Equal(t, "high", outputConfig["effort"])
+
+	msgs, _ := out["messages"].([]any)
+	require.Len(t, msgs, 2)
+	demoted, _ := msgs[1].(map[string]any)
+	assert.Equal(t, "user", demoted["role"])
+	assert.NotContains(t, demoted, "output_config", "role-scoped config must not remain on the demoted message")
+}
+
+func TestAnthropicSameFormat_DemotedSystemNullOutputConfigRemoved(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"},{"role":"system","content":"reminder","output_config":null}],"max_tokens":1024}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-opus-4-7",
+		Capabilities: router.Lookup("claude-opus-4-7"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+
+	assert.NotContains(t, out, "output_config")
+	msgs, _ := out["messages"].([]any)
+	require.Len(t, msgs, 2)
+	demoted, _ := msgs[1].(map[string]any)
+	assert.Equal(t, "user", demoted["role"])
+	assert.NotContains(t, demoted, "output_config", "even null role-scoped fields must not remain on a user message")
+}
+
+func TestAnthropicSameFormat_SystemOutputConfigDoesNotOverwriteTopLevelConfig(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-20250514","output_config":{"effort":"low"},"messages":[{"role":"user","content":"hi"},{"role":"system","content":"set effort","output_config":{"effort":"high"}}],"max_tokens":1024}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-opus-4-7",
+		Capabilities: router.Lookup("claude-opus-4-7"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+
+	outputConfig, _ := out["output_config"].(map[string]any)
+	require.NotNil(t, outputConfig)
+	assert.Equal(t, "low", outputConfig["effort"], "an explicit request-level option remains authoritative")
+
+	msgs, _ := out["messages"].([]any)
+	require.Len(t, msgs, 2)
+	demoted, _ := msgs[1].(map[string]any)
+	assert.NotContains(t, demoted, "output_config")
+}
+
+func TestAnthropicSameFormat_NullTopLevelOutputConfigDoesNotBlockHoist(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-20250514","output_config":null,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"set effort","output_config":{"effort":"high"}}],"max_tokens":1024}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-opus-4-7",
+		Capabilities: router.Lookup("claude-opus-4-7"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+
+	outputConfig, _ := out["output_config"].(map[string]any)
+	require.NotNil(t, outputConfig)
+	assert.Equal(t, "high", outputConfig["effort"])
+	msgs, _ := out["messages"].([]any)
+	require.Len(t, msgs, 2)
+	demoted, _ := msgs[1].(map[string]any)
+	assert.NotContains(t, demoted, "output_config")
+}
+
+func TestAnthropicSameFormat_LeadingSystemOutputConfigHoisted(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"system","content":"set effort","output_config":{"effort":"high"}},{"role":"user","content":"hi"}],"max_tokens":1024}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-opus-4-7",
+		Capabilities: router.Lookup("claude-opus-4-7"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+
+	outputConfig, _ := out["output_config"].(map[string]any)
+	require.NotNil(t, outputConfig)
+	assert.Equal(t, "high", outputConfig["effort"])
+	msgs, _ := out["messages"].([]any)
+	require.Len(t, msgs, 1, "leading system message is still hoisted out of the message array")
+}
+
 func TestAnthropicSameFormat_NewSystemMessageLeavesEarlierTurnsInPlace(t *testing.T) {
 	// The cache-affecting property: a system reminder arriving on a later turn
 	// must not shift any earlier message, or the whole cached prefix moves.
@@ -814,6 +901,21 @@ func TestAnthropicSameFormat_DisabledThinkingKeptForExtendedModel(t *testing.T) 
 	out := parseAndEmit(t, body, "anthropic", opts)
 	thinking, _ := out["thinking"].(map[string]any)
 	require.NotNil(t, thinking, "disabled thinking must be preserved for extended-thinking models")
+	assert.Equal(t, "disabled", thinking["type"])
+	assert.NotContains(t, out, "output_config")
+}
+
+// Haiku 5.5 is adaptive but not always-on; Anthropic accepts
+// thinking.type=disabled for it, so the cheap no-thinking path passes through.
+func TestAnthropicSameFormat_DisabledThinkingKeptForHaiku55(t *testing.T) {
+	body := []byte(`{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1024,"thinking":{"type":"disabled"}}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-haiku-5-5",
+		Capabilities: router.Lookup("claude-haiku-5-5"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+	thinking, _ := out["thinking"].(map[string]any)
+	require.NotNil(t, thinking, "disabled thinking must be preserved for Haiku 5.5")
 	assert.Equal(t, "disabled", thinking["type"])
 	assert.NotContains(t, out, "output_config")
 }
@@ -1425,4 +1527,106 @@ func TestAnthropicSameFormat_ForeignSignedThinkingOnlyMessageDropped(t *testing.
 	out := parseAndEmit(t, body, "anthropic", opts)
 	msgs, _ := out["messages"].([]any)
 	require.Len(t, msgs, 2, "the foreign-signed-thinking-only assistant message must be dropped entirely")
+}
+
+// Fable 5.1 400s on tool_choice any/tool ("not supported for this model");
+// the forced choice downgrades to auto so the turn still reaches upstream.
+func TestAnthropicSameFormat_ForcedToolChoiceDowngradedForAutoOnlyModel(t *testing.T) {
+	for _, tc := range []string{
+		`{"type":"tool","name":"web_search","disable_parallel_tool_use":true}`,
+		`{"type":"any"}`,
+	} {
+		body := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"Perform a web search for the query: x"}],"max_tokens":1024,"tools":[{"type":"web_search_20260209","name":"web_search"}],"tool_choice":` + tc + `}`)
+		opts := translate.EmitOptions{
+			TargetModel:  "claude-fable-5-1",
+			Capabilities: router.Lookup("claude-fable-5-1"),
+		}
+		out := parseAndEmit(t, body, "anthropic", opts)
+		choice, _ := out["tool_choice"].(map[string]any)
+		require.NotNil(t, choice, tc)
+		assert.Equal(t, "auto", choice["type"], tc)
+		assert.Nil(t, choice["name"], tc)
+		if strings.Contains(tc, "disable_parallel_tool_use") {
+			assert.Equal(t, true, choice["disable_parallel_tool_use"], tc)
+		}
+	}
+}
+
+func TestAnthropicSameFormat_ForcedToolChoicePreservedForCapableModel(t *testing.T) {
+	body := []byte(`{"model":"claude-fable-5-1","messages":[{"role":"user","content":"hi"}],"max_tokens":1024,"tools":[{"type":"web_search_20260209","name":"web_search"}],"tool_choice":{"type":"tool","name":"web_search"}}`)
+	opts := translate.EmitOptions{
+		TargetModel:  "claude-opus-5",
+		Capabilities: router.Lookup("claude-opus-5"),
+	}
+	out := parseAndEmit(t, body, "anthropic", opts)
+	choice, _ := out["tool_choice"].(map[string]any)
+	require.NotNil(t, choice)
+	assert.Equal(t, "tool", choice["type"])
+	assert.Equal(t, "web_search", choice["name"])
+}
+
+// OpenAI-sourced forced choices ("required" / named function) hit the same
+// Fable limitation on the cross-format path.
+func TestOpenAIToAnthropic_ForcedToolChoiceDowngradedForAutoOnlyModel(t *testing.T) {
+	for _, tc := range []string{`"required"`, `{"type":"function","function":{"name":"lookup"}}`} {
+		body := []byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":` + tc + `}`)
+		env, err := translate.ParseOpenAI(body)
+		require.NoError(t, err)
+		p, err := env.PrepareAnthropic(http.Header{}, translate.EmitOptions{
+			TargetModel:  "claude-fable-5-1",
+			Capabilities: router.Lookup("claude-fable-5-1"),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "auto", gjson.GetBytes(p.Body, "tool_choice.type").String(), tc)
+		assert.False(t, gjson.GetBytes(p.Body, "tool_choice.name").Exists(), tc)
+	}
+}
+
+func TestOpenAIEmit_FillsMissingFunctionToolParameters(t *testing.T) {
+	empty := map[string]any{"type": "object", "properties": map[string]any{}}
+	opts := translate.EmitOptions{TargetModel: "grok-4.6", TargetProvider: providers.ProviderXAI, Capabilities: router.Lookup("grok-4.6")}
+
+	nested := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}},{"type":"function","function":{"name":"noop"}},{"type":"function","function":{"name":"ping","parameters":null}}]}`)
+	out := parseAndEmit(t, nested, "openai", opts)
+	tools := out["tools"].([]any)
+	require.Len(t, tools, 3)
+	fn0 := tools[0].(map[string]any)["function"].(map[string]any)
+	assert.Equal(t, map[string]any{"type": "object"}, fn0["parameters"])
+	fn1 := tools[1].(map[string]any)["function"].(map[string]any)
+	assert.Equal(t, empty, fn1["parameters"])
+	fn2 := tools[2].(map[string]any)["function"].(map[string]any)
+	assert.Equal(t, empty, fn2["parameters"])
+
+	flat := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"bash","parameters":{"type":"object"}},{"type":"function","name":"ping"},{"type":"function","name":"noop","parameters":null}]}`)
+	out = parseAndEmit(t, flat, "openai", opts)
+	tools = out["tools"].([]any)
+	require.Len(t, tools, 3)
+	assert.Equal(t, map[string]any{"type": "object"}, tools[0].(map[string]any)["parameters"])
+	assert.Equal(t, empty, tools[1].(map[string]any)["parameters"])
+	assert.Equal(t, empty, tools[2].(map[string]any)["parameters"])
+
+	native := []byte(`{"model":"grok-4.6","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search"}]}`)
+	out = parseAndEmit(t, native, "openai", opts)
+	tool := out["tools"].([]any)[0].(map[string]any)
+	assert.Equal(t, "web_search", tool["type"])
+	assert.NotContains(t, tool, "parameters")
+}
+
+func TestAnthropicToOpenAI_FillsMissingInputSchemaAsParameters(t *testing.T) {
+	body := []byte(`{"model":"claude-opus-4-6","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"Read","input_schema":{"type":"object"}},{"name":"Ping","description":"no args"}]}`)
+	env, err := translate.ParseAnthropic(body)
+	require.NoError(t, err)
+	p, err := env.PrepareOpenAI(http.Header{}, translate.EmitOptions{TargetModel: "grok-4.6", TargetProvider: providers.ProviderXAI, Capabilities: router.Lookup("grok-4.6")})
+	require.NoError(t, err)
+	tools := gjson.GetBytes(p.Body, "tools")
+	require.Equal(t, int64(2), tools.Get("#").Int())
+	assert.Equal(t, "object", tools.Get("0.function.parameters.type").String())
+	assert.True(t, tools.Get("1.function.parameters").Exists(), "xAI serde-requires parameters")
+	assert.Equal(t, "object", tools.Get("1.function.parameters.type").String())
+	assert.JSONEq(t, `{"type":"object","properties":{}}`, tools.Get("1.function.parameters").Raw)
+
+	p, err = env.PrepareOpenAIResponses(http.Header{}, translate.EmitOptions{TargetModel: "gpt-5.5", TargetProvider: providers.ProviderOpenAI, Capabilities: router.Lookup("gpt-5.5")})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"object","properties":{}}`, gjson.GetBytes(p.Body, "tools.1.parameters").Raw)
+	assert.Equal(t, "false", gjson.GetBytes(p.Body, "tools.1.strict").Raw)
 }

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"strings"
 
-	"workweave/router/internal/observability"
+	"weave-os/router/internal/observability"
 
 	"github.com/tidwall/gjson"
 )
@@ -42,6 +42,10 @@ type RoutingFeatures struct {
 	// MaxTokens is the caller's requested output cap. 0 means unset.
 	// Probe detection keys off this — Anthropic SDK quota probes set max_tokens=1.
 	MaxTokens int
+	// TitleGenHint marks a Codex Responses title-generation request. The
+	// Responses ingress sets this only for the Codex client after matching the
+	// native request's schema or hidden-session prompt fingerprint.
+	TitleGenHint bool
 	// LastKind: "user_prompt", "tool_result", or "assistant".
 	LastKind string
 	// LastPreview: first previewMaxChars of the last message's text.
@@ -58,7 +62,8 @@ func (e *RequestEnvelope) FullTokenEstimate() int {
 	// falsely evict Opus for exceeding its context window. Base64 image payloads
 	// are repriced separately (÷6 still over-counts them).
 	imgBytes, imgCount := e.base64ImageStats()
-	return (len(e.body)-imgBytes)/fullBytesPerToken + imgCount*imageTokenEstimate
+	signatureBytes, idBytes := e.routerReasoningTransportBytes()
+	return (len(e.body)-imgBytes-signatureBytes-idBytes)/fullBytesPerToken + imgCount*imageTokenEstimate
 }
 
 // ContextOverflowTokenEstimate estimates tokens for context-window overflow
@@ -72,7 +77,8 @@ func (e *RequestEnvelope) ContextOverflowTokenEstimate() int {
 	// Base64 image bytes are transport, not tokens; subtract them and reprice
 	// per image to avoid phantom token inflation on multi-page PDF reads.
 	imgBytes, imgCount := e.base64ImageStats()
-	return (len(e.body)-imgBytes)/contentBytesPerToken + imgCount*imageTokenEstimate
+	signatureBytes, idBytes := e.routerReasoningTransportBytes()
+	return (len(e.body)-imgBytes-signatureBytes-idBytes)/contentBytesPerToken + imgCount*imageTokenEstimate
 }
 
 // SignatureTokenSavings returns the tokens a signature-STRIPPING target saves
@@ -83,7 +89,47 @@ func (e *RequestEnvelope) SignatureTokenSavings() int {
 	if e.format != FormatAnthropic {
 		return 0
 	}
-	return base64SignatureBytes(e.body) / contentBytesPerToken
+	// Router-minted signatures are already excluded from the base estimate. The
+	// byte scan only matches compact JSON, so it can undercount what the block
+	// walk found; savings never go negative.
+	routerSignatureBytes, _ := e.routerReasoningTransportBytes()
+	return max(0, base64SignatureBytes(e.body)-routerSignatureBytes) / contentBytesPerToken
+}
+
+// routerReasoningTransportBytes sums the router-minted OpenAI reasoning an
+// Anthropic-format client echoes back, in thinking signatures and in tool-id
+// carriers. Only payloads that decode as router envelopes count: Anthropic
+// targets strip exactly those and OpenAI targets consume them as reasoning, so
+// neither reaches an upstream as prompt text. Forged markers, marker text in
+// message content, and undecodable suffixes stay in the estimate.
+func (e *RequestEnvelope) routerReasoningTransportBytes() (signatureBytes, idBytes int) {
+	if e.format != FormatAnthropic {
+		return 0, 0
+	}
+	carrierBytes := func(id string) int {
+		if clean, stripped := stripOpenAIReasoningCarrier(id); stripped {
+			return len(id) - len(clean)
+		}
+		return 0
+	}
+	gjson.GetBytes(e.body, "messages").ForEach(func(_, message gjson.Result) bool {
+		message.Get("content").ForEach(func(_, block gjson.Result) bool {
+			switch block.Get("type").String() {
+			case "thinking":
+				signature := block.Get("signature").String()
+				if _, ok := decodeOpenAIReasoningSignature(signature); ok {
+					signatureBytes += len(signature)
+				}
+			case "tool_use":
+				idBytes += carrierBytes(block.Get("id").String())
+			case "tool_result":
+				idBytes += carrierBytes(block.Get("tool_use_id").String())
+			}
+			return true
+		})
+		return true
+	})
+	return signatureBytes, idBytes
 }
 
 // base64SignatureBytes sums the byte length of every base64 thought-signature
@@ -466,6 +512,8 @@ var claudeCodeInjectedBlockPrefixes = []string{
 	"<local-command-stdout>",
 	"<local-command-stderr>",
 	"<local-command-caveat>",
+	"<task-notification>",
+	"</summary>\n<result>",
 }
 
 func isClaudeCodeInjectedBlock(text string) bool {
@@ -476,6 +524,42 @@ func isClaudeCodeInjectedBlock(text string) bool {
 		}
 	}
 	return false
+}
+
+// leadingClaudeCodeInjectedBlockEnd returns the end of a complete known
+// injected block at the start of trimmed text. The quoted-result envelope is
+// a continuation fragment rather than an opening tag, so it needs its own
+// closing-tag handling instead of the ordinary tag-name rule.
+func leadingClaudeCodeInjectedBlockEnd(trimmed string) int {
+	if strings.HasPrefix(trimmed, "</summary>\n<result>") {
+		resultEnd := strings.Index(trimmed, "</result>")
+		if resultEnd < 0 {
+			return 0
+		}
+		blockEnd := resultEnd + len("</result>")
+		remainder := strings.TrimLeft(trimmed[blockEnd:], " \t\r\n")
+		if strings.HasPrefix(remainder, "<usage>") {
+			usageEnd := strings.Index(remainder, "</usage>")
+			if usageEnd < 0 {
+				return 0
+			}
+			blockEnd = len(trimmed) - len(remainder) + usageEnd + len("</usage>")
+		}
+		return blockEnd
+	}
+	if !isClaudeCodeInjectedBlock(trimmed) {
+		return 0
+	}
+	openingTagEnd := strings.IndexByte(trimmed, '>')
+	if openingTagEnd < 0 {
+		return 0
+	}
+	closingTag := "</" + trimmed[1:openingTagEnd] + ">"
+	closingTagStart := strings.Index(trimmed[openingTagEnd+1:], closingTag)
+	if closingTagStart < 0 {
+		return 0
+	}
+	return openingTagEnd + 1 + closingTagStart + len(closingTag)
 }
 
 func openAIContentTextGJSON(v gjson.Result) string {

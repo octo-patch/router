@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router/policy"
 )
 
 func classifierOnlyClient(t *testing.T, body string) (policy.Result, error) {
@@ -54,6 +54,20 @@ func TestClientDecideRejectsSelectedArmOnClassifierOnlySchema(t *testing.T) {
 		"schema_version": "policy_router_v3",
 		"route_id": "route-v3",
 		"selected_roster_id": "anthropic/claude-opus-4-8",
+		"ranked_fallback": [
+			{"group": "high", "probability": 0.7, "roster_arms": ["anthropic/claude-opus-4-8"], "eligible_arms": ["anthropic/claude-opus-4-8"]}
+		]
+	}`)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selected arm")
+}
+
+func TestClientDecideRejectsSelectedProviderOnClassifierOnlySchema(t *testing.T) {
+	_, err := classifierOnlyClient(t, `{
+		"schema_version": "policy_router_v3",
+		"route_id": "route-v3",
+		"selected_provider": "anthropic",
 		"ranked_fallback": [
 			{"group": "high", "probability": 0.7, "roster_arms": ["anthropic/claude-opus-4-8"], "eligible_arms": ["anthropic/claude-opus-4-8"]}
 		]

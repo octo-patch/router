@@ -7,9 +7,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
 )
 
 type fakeDecider struct {
@@ -199,7 +199,7 @@ func TestCatalogRoutingTargetsResolveCurrentHMMRosterArmsToProviders(t *testing.
 		gotRosterIDs = append(gotRosterIDs, candidate.RosterID)
 	}
 	for _, rosterID := range []string{
-		"deepseek/deepseek-v4-flash",
+		"deepseek/deepseek-v4.1-flash",
 		"qwen/qwen3-coder-next",
 		"openai/gpt-5.4-nano",
 		"minimax/minimax-m3",
@@ -213,6 +213,7 @@ func TestCatalogRoutingTargetsResolveCurrentHMMRosterArmsToProviders(t *testing.
 		"z-ai/glm-5.2",
 		"google/gemini-3.1-pro-preview",
 		"x-ai/grok-4.6",
+		"x-ai/grok-4.7",
 	} {
 		assert.Contains(t, gotRosterIDs, rosterID)
 	}
@@ -231,6 +232,23 @@ func TestRosterIDForMapsBareGrokIDsToXAIRosterSlugs(t *testing.T) {
 	// consumes, not echo the prefixed roster slug back.
 	assert.Equal(t, "grok-4.6", CatalogIDForRoster("x-ai/grok-4.6"))
 	assert.Equal(t, "grok-4.5", CatalogIDForRoster("x-ai/grok-4.5"))
+
+	grok47, ok := catalog.ByID("grok-4.7")
+	require.True(t, ok)
+	assert.Equal(t, "x-ai/grok-4.7", rosterIDFor(grok47))
+	assert.Equal(t, "grok-4.7", CatalogIDForRoster("x-ai/grok-4.7"))
+}
+
+func TestRosterIDForMapsBareMuseSparkToMetaRosterSlug(t *testing.T) {
+	muse, ok := catalog.ByID("muse-spark-1.3")
+	require.True(t, ok)
+	assert.Equal(t, "meta/muse-spark-1.3", rosterIDFor(muse))
+	assert.Equal(t, "muse-spark-1.3", CatalogIDForRoster("meta/muse-spark-1.3"))
+
+	got := DeployedModelsForRosterIDs([]string{"meta/muse-spark-1.3", "meta/muse-spark-1.3:xhigh"})
+	require.Len(t, got, 1)
+	assert.Equal(t, "muse-spark-1.3", got[0].Model)
+	assert.Equal(t, providers.ProviderMeta, got[0].Provider)
 }
 
 func TestRouterOffersAndSelectsTerraWithoutLegacyDeployedSet(t *testing.T) {

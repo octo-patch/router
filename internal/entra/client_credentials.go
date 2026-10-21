@@ -16,7 +16,8 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/singleflight"
 
-	"workweave/router/internal/auth"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/observability"
 )
 
 const (
@@ -48,6 +49,7 @@ func NewClientCredentialsSource(httpClient *http.Client, now auth.Clock) *Client
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
+	httpClient = observability.WrapHTTPClient(httpClient)
 	if now == nil {
 		now = time.Now
 	}

@@ -2,14 +2,15 @@ package proxy
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 )
@@ -64,7 +65,8 @@ func bindRequestLogger(
 	apiKeyID, requestID, ingress string,
 ) (context.Context, *slog.Logger, [sessionpin.SessionKeyLen]byte) {
 	clientSessionID := clientSessionIDForRequest(ctx, env)
-	key := deriveSessionKey(env, apiKeyID, clientSessionID)
+	ctx = observability.WithClientSessionID(ctx, clientSessionID)
+	key := deriveSessionKeyForRequest(ctx, env, apiKeyID)
 	log := observability.FromContext(ctx).With(
 		"session_key", shortKey(key),
 		"api_key_id", apiKeyID,
@@ -108,6 +110,12 @@ func bindRequestLogger(
 // session id alone would collapse concurrent threads onto one pin. Each
 // thread's first user message is stable across turns but distinct per
 // sub-agent, so it separates them while keeping each pin stable.
+// Compacted Pi threads retain their original digest through a verified session
+// ticket, never through a caller-declared client type.
+//
+// System text substitutes for an empty first user message only when no client
+// session id is present, because it is per-turn volatile on the harnesses that
+// lead with a system message.
 func DeriveSessionKey(env *translate.RequestEnvelope, apiKeyID string) [sessionpin.SessionKeyLen]byte {
 	var clientSessionID string
 	if env != nil {
@@ -116,9 +124,30 @@ func DeriveSessionKey(env *translate.RequestEnvelope, apiKeyID string) [sessionp
 	return deriveSessionKey(env, apiKeyID, clientSessionID)
 }
 
-func deriveSessionKeyForRequest(ctx context.Context, env *translate.RequestEnvelope, apiKeyID string) [sessionpin.SessionKeyLen]byte {
-	return deriveSessionKey(env, apiKeyID, clientSessionIDForRequest(ctx, env))
+func sessionCredentialIdentity(ctx context.Context, apiKeyID string) string {
+	if identity, managed := requestcontext.ServingIdentityFromContext(ctx); managed && identity.CredentialIdentity != "" {
+		return identity.CredentialIdentity
+	}
+	return apiKeyID
 }
+
+func deriveSessionKeyForRequest(ctx context.Context, env *translate.RequestEnvelope, apiKeyID string) [sessionpin.SessionKeyLen]byte {
+	if thread, ok := ctx.Value(classifierThreadContextKey{}).(router.ClassifierThread); ok {
+		digest := sha256.Sum256([]byte("classifier-thread:" + thread.InstallationID.String() + ":" + thread.ThreadID.String()))
+		return [sessionpin.SessionKeyLen]byte(digest[:sessionpin.SessionKeyLen])
+	}
+	if claims := piSessionFromContext(ctx); claims != nil && claims.APIKeyID == apiKeyID && claims.matches(ctx, env) {
+		return claims.SessionKey
+	}
+	key := deriveSessionKey(env, sessionCredentialIdentity(ctx, apiKeyID), clientSessionIDForRequest(ctx, env))
+	copy(key[:], requestcontext.ServingStateKey(ctx, key[:]))
+	return key
+}
+
+const (
+	forceModelSessionKeyDomain = requestcontext.ForceModelConversationKey
+	betaSessionKeyDomain       = requestcontext.LegacyBetaConversationKey
+)
 
 // deriveForceModelSessionKeyForRequest omits the first-message discriminator
 // so an explicit force applies to every thread in one client session.
@@ -128,23 +157,29 @@ func deriveForceModelSessionKeyForRequest(
 	apiKeyID string,
 	threadSessionKey [sessionpin.SessionKeyLen]byte,
 ) [sessionpin.SessionKeyLen]byte {
-	h := hmac.New(sha256.New, []byte(apiKeyID))
-	h.Write([]byte("force_model_session:"))
-	h.Write([]byte{0x00})
+	return deriveConversationSessionKeyForRequest(ctx, env, apiKeyID, threadSessionKey, forceModelSessionKeyDomain)
+}
 
-	if clientSessionID := clientSessionIDForRequest(ctx, env); clientSessionID != "" {
-		h.Write([]byte("client_session_id:"))
-		h.Write([]byte(clientSessionID))
-	} else {
-		// Without a client session identifier there is no safe parent scope.
-		h.Write([]byte("thread_key:"))
-		h.Write(threadSessionKey[:])
-	}
+// deriveBetaSessionKeyForRequest scopes the /beta preference to the whole
+// client session: compaction rewrites the first user message and sub-agents
+// carry their own, so a thread-keyed preference would vanish on both.
+func deriveBetaSessionKeyForRequest(
+	ctx context.Context,
+	env *translate.RequestEnvelope,
+	apiKeyID string,
+	threadSessionKey [sessionpin.SessionKeyLen]byte,
+) [sessionpin.SessionKeyLen]byte {
+	return deriveConversationSessionKeyForRequest(ctx, env, apiKeyID, threadSessionKey, betaSessionKeyDomain)
+}
 
-	sum := h.Sum(nil)
-	var key [sessionpin.SessionKeyLen]byte
-	copy(key[:], sum[:sessionpin.SessionKeyLen])
-	return key
+func deriveConversationSessionKeyForRequest(
+	ctx context.Context,
+	env *translate.RequestEnvelope,
+	apiKeyID string,
+	threadSessionKey [sessionpin.SessionKeyLen]byte,
+	domain requestcontext.ConversationKeyDomain,
+) [sessionpin.SessionKeyLen]byte {
+	return requestcontext.ConversationKey(sessionCredentialIdentity(ctx, apiKeyID), clientSessionIDForRequest(ctx, env), domain, threadSessionKey)
 }
 
 func clientSessionIDForRequest(ctx context.Context, env *translate.RequestEnvelope) string {
@@ -176,11 +211,14 @@ func deriveSessionKey(env *translate.RequestEnvelope, apiKeyID, clientSessionID 
 	}
 	if env != nil {
 		// First user message still splits Claude Code sub-agents that share one
-		// parent session id. OpenAI-format bodies fall back to system text when
-		// that first user message is empty so unrelated conversations do not
-		// collapse onto one pin.
+		// parent session id. The system-text fallback covers OpenAI-format
+		// bodies whose leading system message leaves that empty, but only when
+		// nothing else identifies the conversation: a client session id already
+		// separates them, and the harnesses that lead with system rewrite it
+		// per turn (cwd, timestamps), so folding it in there rerolls the key —
+		// and with it the upstream prompt_cache_key — on every turn.
 		disc := env.FirstUserMessageText()
-		if disc == "" {
+		if disc == "" && clientSessionID == "" {
 			disc = env.SystemText()
 		}
 		h.Write([]byte("first_msg:"))

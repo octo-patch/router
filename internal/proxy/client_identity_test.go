@@ -7,8 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/proxy"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/requestcontext"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,6 +20,17 @@ import (
 type captureUserRepo struct {
 	emailUpserts   []auth.UpsertUserParams
 	accountUpserts []auth.UpsertUserByAccountUUIDParams
+}
+
+type assignedRoutingPolicyRepo struct{ assignmentReads int }
+
+func (*assignedRoutingPolicyRepo) GetPolicy(context.Context, string) (auth.RoutingPolicy, error) {
+	return auth.RoutingPolicy{Mode: auth.RoutingPolicyAssigned, Revision: 1}, nil
+}
+
+func (r *assignedRoutingPolicyRepo) HasAssignment(context.Context, string, string, int64) (bool, error) {
+	r.assignmentReads++
+	return true, nil
 }
 
 func (r *captureUserRepo) UpsertByEmail(ctx context.Context, p auth.UpsertUserParams) (*auth.User, error) {
@@ -65,6 +77,18 @@ func TestNormalizeEmail_Valid(t *testing.T) {
 func TestNormalizeEmail_RejectsEmptyAndWhitespace(t *testing.T) {
 	assert.Equal(t, "", proxy.NormalizeEmail("   "))
 	assert.Equal(t, "", proxy.NormalizeEmail(""))
+}
+
+func TestInternalTestIdentitySkipsAssignedUserRouting(t *testing.T) {
+	ctx := requestcontext.WithInternalTestIdentity(context.Background(), requestcontext.InternalTestIdentity{SubjectID: "internal-subject", SessionID: "fresh-session"})
+	routingPolicies := &assignedRoutingPolicyRepo{}
+	authService := auth.NewService(nil, nil, nil, nil, nil, nil, nil).WithRoutingPolicies(routingPolicies, nil)
+	assignedContext, err := authService.WithRoutingPolicy(ctx, "installation")
+	require.NoError(t, err)
+	resolvedContext, err := proxy.ResolveRoutingAssignment(assignedContext, authService, &auth.Installation{ID: "installation"})
+	require.NoError(t, err)
+	require.Same(t, assignedContext, resolvedContext)
+	require.Zero(t, routingPolicies.assignmentReads)
 }
 
 func TestNormalizeEmail_RejectsBadShape(t *testing.T) {
@@ -191,6 +215,49 @@ func TestNormalizeClientApp(t *testing.T) {
 	}
 }
 
+func TestClientIdentityFromHeaders_EvalPrefixKeepsHarness(t *testing.T) {
+	t.Run("eval prefix resolves to the imitated harness", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-App", "Weave-Eval-Codex")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, proxy.ClientAppCodex, got.ClientApp)
+		assert.True(t, got.Eval)
+		assert.Equal(t, "weave-eval-codex", got.TelemetryClientApp())
+	})
+	t.Run("eval prefix on claude-code alias", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-App", "weave-eval-cli")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, proxy.ClientAppClaudeCode, got.ClientApp)
+		assert.True(t, got.Eval)
+		assert.Equal(t, "weave-eval-claude-code", got.TelemetryClientApp())
+	})
+	t.Run("production client is untagged", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-App", "codex")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, proxy.ClientAppCodex, got.ClientApp)
+		assert.False(t, got.Eval)
+		assert.Equal(t, proxy.ClientAppCodex, got.TelemetryClientApp())
+	})
+	t.Run("oversized eval header falls through to UA", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-App", "weave-eval-"+strings.Repeat("a", proxy.MaxClientAppLen))
+		h.Set("User-Agent", "codex_cli_rs/0.39.0 (darwin)")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, proxy.ClientAppCodex, got.ClientApp)
+		assert.False(t, got.Eval)
+	})
+	t.Run("bare prefix carries no harness", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-App", "weave-eval-")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, "", got.ClientApp)
+		assert.True(t, got.Eval)
+		assert.Equal(t, "", got.TelemetryClientApp())
+	})
+}
+
 func TestResolveUserFromContext_BothMissingIsNoOp(t *testing.T) {
 	repo := &captureUserRepo{}
 	svc := newTestAuthSvc(repo)
@@ -207,6 +274,7 @@ func TestResolveUserFromContext_BothMissingIsNoOp(t *testing.T) {
 func TestClientIdentityFromHeaders_SessionIDSources(t *testing.T) {
 	claude := "4dbee464-ebf7-437f-9f20-db5a6f7fe3b4"
 	codex := "01a03b54-9459-7373-a349-88a59b825211"
+	opencode := "ses_f1fb9de93ffeDvaA1651V3ntUj"
 
 	t.Run("claude code header", func(t *testing.T) {
 		h := http.Header{}
@@ -226,6 +294,51 @@ func TestClientIdentityFromHeaders_SessionIDSources(t *testing.T) {
 		h := http.Header{}
 		h.Set("Thread-Id", codex)
 		assert.Equal(t, codex, proxy.ClientIdentityFromHeaders(h).SessionID)
+	})
+	t.Run("opencode X-OpenCode-Session", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-OpenCode-Session", opencode)
+		h.Set("X-App", "opencode")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, opencode, got.SessionID)
+		assert.Equal(t, proxy.ClientAppOpencode, got.ClientApp)
+	})
+	t.Run("opencode subagent reports parent session", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-OpenCode-Session", "ses_child")
+		h.Set("X-Parent-Session-Id", opencode)
+		h.Set("X-App", "opencode")
+		got := proxy.ClientIdentityFromHeaders(h)
+		assert.Equal(t, opencode, got.SessionID)
+		assert.True(t, got.OpenCodeSubagent)
+	})
+	t.Run("opencode parent session is not a subagent", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-OpenCode-Session", opencode)
+		h.Set("X-App", "opencode")
+		assert.False(t, proxy.ClientIdentityFromHeaders(h).OpenCodeSubagent)
+		h.Del("X-OpenCode-Session")
+		h.Set("X-Parent-Session-Id", opencode)
+		assert.False(t, proxy.ClientIdentityFromHeaders(h).OpenCodeSubagent, "a parent id without a child session is not a subagent")
+	})
+	t.Run("opencode subagent headers ignored for other clients", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-OpenCode-Session", "ses_child")
+		h.Set("X-Parent-Session-Id", opencode)
+		h.Set("X-App", "codex")
+		assert.False(t, proxy.ClientIdentityFromHeaders(h).OpenCodeSubagent)
+	})
+	t.Run("opencode detected from User-Agent", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-OpenCode-Session", opencode)
+		h.Set("User-Agent", "opencode/latest/2.0.18/cli")
+		assert.Equal(t, opencode, proxy.ClientIdentityFromHeaders(h).SessionID)
+	})
+	t.Run("X-OpenCode-Session ignored for other clients", func(t *testing.T) {
+		h := http.Header{}
+		h.Set("X-OpenCode-Session", opencode)
+		h.Set("X-App", "codex")
+		assert.Equal(t, "", proxy.ClientIdentityFromHeaders(h).SessionID)
 	})
 	t.Run("claude header wins over Session-Id", func(t *testing.T) {
 		h := http.Header{}

@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -44,6 +44,10 @@ func (s *recordingPinStore) IncrementOverloadErrors(context.Context, [sessionpin
 func (s *recordingPinStore) ResetOverloadErrors(context.Context, [sessionpin.SessionKeyLen]byte, string, router.Strategy) error {
 	return nil
 }
+func (*recordingPinStore) ExpireAndDemoteModel(context.Context, sessionpin.Pin, string, sessionpin.DemotionReason) error {
+	return nil
+}
+
 func (s *recordingPinStore) DisableProvider(context.Context, [sessionpin.SessionKeyLen]byte, string, string, router.Strategy) error {
 	return nil
 }
@@ -82,7 +86,7 @@ func TestSetForceModelSessionPin_WritesNeverExpiresSentinel(t *testing.T) {
 	var key [sessionpin.SessionKeyLen]byte
 	require.NoError(t, svc.setForceModelSessionPin(
 		context.Background(), key, uuid.New(),
-		"claude-opus-4-8", providers.ProviderAnthropic, ""))
+		"claude-opus-4-8", providers.ProviderAnthropic, "", ""))
 
 	require.Len(t, store.upserts, 1)
 	assert.Equal(t, forceModelSessionRole, store.upserts[0].Role)
@@ -99,7 +103,7 @@ func TestSetForceModelSessionPin_IsStrategyIndependent(t *testing.T) {
 	ctx := router.WithStrategy(context.Background(), router.StrategyHMMBeta)
 	require.NoError(t, svc.setForceModelSessionPin(
 		ctx, [sessionpin.SessionKeyLen]byte{}, uuid.New(),
-		"claude-opus-4-8", providers.ProviderAnthropic, ""))
+		"claude-opus-4-8", providers.ProviderAnthropic, "", ""))
 
 	require.Len(t, store.upserts, 1)
 	assert.Empty(t, store.upserts[0].Strategy)

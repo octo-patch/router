@@ -1,14 +1,14 @@
 package openai
 
 import (
-	"context"
 	"io"
 	"net/http"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/server/middleware"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/proxy"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/server/middleware"
 
 	"github.com/gin-gonic/gin"
 )
@@ -33,8 +33,15 @@ func ResponsesHandler(svc *proxy.Service, authSvc *auth.Service) gin.HandlerFunc
 			return
 		}
 
-		ctx := context.WithValue(c.Request.Context(), proxy.ClientIdentityContextKey{}, proxy.ClientIdentityFromHeaders(c.Request.Header))
+		ctx := requestcontext.WithClientIdentity(c.Request.Context(), proxy.ClientIdentityFromHeaders(c.Request.Header))
 		ctx = proxy.ResolveUserFromContext(ctx, authSvc, middleware.InstallationFrom(c))
+		ctx, err = proxy.ResolveRoutingAssignment(ctx, authSvc, middleware.InstallationFrom(c))
+		if err != nil {
+			log.Error("Failed to resolve routing assignment", "installation_id", middleware.InstallationFrom(c).ID, "err", err)
+			c.Header("Retry-After", "1")
+			writeOpenAIError(c, http.StatusServiceUnavailable, "api_error", "Routing policy temporarily unavailable.")
+			return
+		}
 		c.Request = c.Request.WithContext(ctx)
 
 		if err := svc.ProxyOpenAIResponses(c.Request.Context(), body, c.Writer, c.Request); err != nil {
@@ -55,7 +62,7 @@ func ResponsesHandler(svc *proxy.Service, authSvc *auth.Service) gin.HandlerFunc
 				if cls.RetryAfter {
 					c.Header("Retry-After", "1")
 				}
-				writeOpenAIError(c, cls.Status, openAIErrorType(cls.Kind), cls.Message)
+				writeOpenAIErrorWithCode(c, cls.Status, openAIErrorType(cls.Kind), cls.Message, proxy.OpenAIErrorCode(cls.Kind))
 				return
 			}
 			log.Error("Proxy failed", "err", err)

@@ -6,10 +6,14 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/billing"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/router/handover"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/billing"
+	"weave-os/router/internal/inference"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/router/handover"
+	"weave-os/router/internal/router/llmescalation"
+	"weave-os/router/internal/router/policy"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -131,7 +135,7 @@ func (r *auxBillingRepo) GetOrgMonthlySpendAndLimit(context.Context, string) (in
 	return 0, nil, nil
 }
 
-func (r *auxBillingRepo) GetAutopayConfig(context.Context, string) (bool, int64, error) {
+func (r *auxBillingRepo) GetAutopayConfig(context.Context, billing.Owner) (bool, int64, error) {
 	return false, 0, nil
 }
 
@@ -144,7 +148,7 @@ const (
 	// auxTestModel must exist in the router catalog: the point of the
 	// telemetry row is real cost, and an unpriced model would make the
 	// assertions pass on zeros.
-	auxTestModel = DefaultHandoverModel
+	auxTestModel = policy.HandoverSummaryDefaultModel
 )
 
 // auxTestUsage is a summarizer usage with tokens in every bucket, so a
@@ -211,9 +215,8 @@ func TestBillAuxiliaryInferenceTagsSessionAndCost(t *testing.T) {
 
 	pricing, ok := catalog.PrimaryPriceFor(auxTestModel)
 	require.True(t, ok, "the test model must be priced in the catalog")
-	wantInput := catalog.EffectiveInputCost(usage.InputTokens, usage.CacheCreation, usage.CacheRead,
-		pricing.InputUSDPer1M, pricing, usage.Provider)
-	wantOutput := catalog.EffectiveOutputCost(usage.OutputTokens, pricing.OutputUSDPer1M)
+	wantInput := catalog.EffectiveInputCost(usage.InputTokens, usage.CacheCreation, usage.CacheRead, pricing, usage.Provider, catalog.UsageModifiers{})
+	wantOutput := catalog.EffectiveOutputCost(usage.InputTokens, usage.OutputTokens, pricing, catalog.UsageModifiers{})
 	assert.Greater(t, wantInput+wantOutput, 0.0, "the fixture must produce a non-zero cost")
 	assert.InDelta(t, wantInput, row.ActualInputCostUSD, 1e-12)
 	assert.InDelta(t, wantOutput, row.ActualOutputCostUSD, 1e-12)
@@ -227,6 +230,23 @@ func TestBillAuxiliaryInferenceTagsSessionAndCost(t *testing.T) {
 	assert.Equal(t, int32(usage.CacheCreation), *row.CacheCreationTokens)
 	require.NotNil(t, row.CacheReadTokens)
 	assert.Equal(t, int32(usage.CacheRead), *row.CacheReadTokens)
+}
+
+func TestEscalationJudgeTelemetryIsPlatformFunded(t *testing.T) {
+	service, billingRepo, telemetryRepo := auxTestService(t)
+	job := llmescalation.Job{ID: "checkpoint-3", Lifetime: "classifier-session", Model: policy.EscalationJudgeModel, Provider: providers.ProviderFireworks}
+	judgment := llmescalation.Judgment{
+		Usage:   inference.Usage{Known: true, InputTokens: 1200, OutputTokens: 40},
+		CostUSD: 0.0042, CostKnown: true, CostSource: llmescalation.CostSourceProviderReported,
+	}
+	service.recordEscalationJudgeInference(uuid.NewString(), auxTestRequestID, job, judgment)
+	rows := telemetryRepo.waitForRows(1)
+	require.Len(t, rows, 1)
+	assert.Equal(t, SpanTypePlatformAuxiliaryInference, rows[0].SpanType)
+	assert.Equal(t, job.Lifetime, rows[0].SessionID)
+	assert.Equal(t, job.Model, rows[0].DecisionModel)
+	assert.InDelta(t, judgment.CostUSD, rows[0].ActualInputCostUSD+rows[0].ActualOutputCostUSD, 1e-12)
+	assert.Empty(t, billingRepo.snapshot(), "platform judge calls must never debit customer credit")
 }
 
 // TestBillAuxiliaryInferenceMatchesLedgerAmount proves the telemetry row's

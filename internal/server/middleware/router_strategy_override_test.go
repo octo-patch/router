@@ -5,16 +5,41 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/router"
-	"workweave/router/internal/server/middleware"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/server/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
 
 // runStrategyOverride reports the strategy observed on the request context after WithRouterStrategyOverride runs.
+// allRegisteredLive stands in for a deployment whose every registered lane has a loaded snapshot.
+func allRegisteredLive(router.Strategy) bool { return true }
+
+func TestClassifierCannotBeSelectedWithoutThreadAdmission(t *testing.T) {
+	installation := overrideEnabledInstallation()
+	installation.RoutingStrategy = router.StrategyLLMClassifier
+	for _, header := range []string{"", string(router.StrategyLLMClassifier)} {
+		observed := runStrategyOverride(t, installation, header, router.StrategyLLMClassifier)
+		assert.Equal(t, router.StrategyCluster, observed)
+	}
+	assert.Equal(t, router.StrategyCluster, middleware.NormalizeRouterStrategyDefault(router.StrategyLLMClassifier, router.StrategyLLMClassifier))
+}
+
 func runStrategyOverride(t *testing.T, installation *auth.Installation, header string, available ...router.Strategy) router.Strategy {
+	t.Helper()
+	return runStrategyOverrideWithAvailability(t, installation, header, allRegisteredLive, available...)
+}
+
+func runStrategyOverrideWithAvailability(
+	t *testing.T,
+	installation *auth.Installation,
+	header string,
+	liveAvailability middleware.StrategyAvailability,
+	available ...router.Strategy,
+) router.Strategy {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
@@ -24,7 +49,7 @@ func runStrategyOverride(t *testing.T, installation *auth.Installation, header s
 		}
 		c.Next()
 	})
-	engine.Use(middleware.WithRouterStrategyOverride(available...))
+	engine.Use(middleware.WithRouterStrategyDefault(router.StrategyCluster, liveAvailability, available...))
 
 	var observed router.Strategy
 	engine.GET("/probe", func(c *gin.Context) {
@@ -80,6 +105,7 @@ func TestRouterStrategyOverride_UsesDeploymentDefaultWithoutInstallationOverride
 	})
 	engine.Use(middleware.WithRouterStrategyDefault(
 		router.StrategyHMM,
+		nil,
 		router.StrategyHMM,
 	))
 	var observed router.Strategy
@@ -105,6 +131,7 @@ func TestRouterStrategyOverride_ExplicitClusterWinsOverDeploymentDefault(t *test
 	})
 	engine.Use(middleware.WithRouterStrategyDefault(
 		router.StrategyHMM,
+		nil,
 		router.StrategyHMM,
 	))
 	var observed router.Strategy
@@ -127,24 +154,90 @@ func TestNormalizeRouterStrategyDefault(t *testing.T) {
 		"beta cannot be activated by a deployment default")
 }
 
-func TestRouterStrategyOverride_BetaHeaderCannotActivateBeta(t *testing.T) {
+func TestRouterStrategyOverride_AuthorizedBetaHeaderActivatesBeta(t *testing.T) {
 	got := runStrategyOverride(
 		t,
 		&auth.Installation{ID: "inst-beta", PolicyHeaderOverridesEnabled: true},
 		string(router.StrategyHMMBeta),
 		router.StrategyHMMBeta,
 	)
-	assert.Equal(t, router.StrategyCluster, got)
+	assert.Equal(t, router.StrategyHMMBeta, got)
 }
 
-func TestRouterStrategyOverride_InstallationDefaultBetaCannotActivateBeta(t *testing.T) {
+func TestRouterStrategyOverride_PersistedInstallationBetaActivatesBeta(t *testing.T) {
 	got := runStrategyOverride(
 		t,
 		&auth.Installation{ID: "inst-beta", RoutingStrategy: router.StrategyHMMBeta},
 		"",
 		router.StrategyHMMBeta,
 	)
+	assert.Equal(t, router.StrategyHMMBeta, got)
+}
+
+func TestRouterStrategyOverride_PersistedBetaIgnoredWhenBetaUnregistered(t *testing.T) {
+	got := runStrategyOverride(
+		t,
+		&auth.Installation{ID: "inst-beta", RoutingStrategy: router.StrategyHMMBeta},
+		"",
+		router.StrategyHMM,
+	)
+	assert.Equal(t, router.StrategyCluster, got, "a beta lane that failed to load must not be selectable")
+}
+
+func TestRouterStrategyOverride_PersistedBetaClampsWhileBetaLaneEmpty(t *testing.T) {
+	betaLaneEmpty := func(strategy router.Strategy) bool { return strategy != router.StrategyHMMBeta }
+	got := runStrategyOverrideWithAvailability(
+		t,
+		&auth.Installation{ID: "inst-beta", RoutingStrategy: router.StrategyHMMBeta},
+		"",
+		betaLaneEmpty,
+		router.StrategyHMM,
+		router.StrategyHMMBeta,
+	)
+	assert.Equal(t, router.StrategyCluster, got, "a registered beta lane with no snapshot must not 503 a pinned installation")
+}
+
+func TestRouterStrategyOverride_BetaHeaderIgnoredWhileBetaLaneEmpty(t *testing.T) {
+	betaLaneEmpty := func(strategy router.Strategy) bool { return strategy != router.StrategyHMMBeta }
+	got := runStrategyOverrideWithAvailability(
+		t,
+		&auth.Installation{ID: "inst-beta", RoutingStrategy: router.StrategyHMM, PolicyHeaderOverridesEnabled: true},
+		string(router.StrategyHMMBeta),
+		betaLaneEmpty,
+		router.StrategyHMM,
+		router.StrategyHMMBeta,
+	)
+	assert.Equal(t, router.StrategyHMM, got)
+}
+
+func TestRouterStrategyOverride_BetaUnselectableWithoutAvailabilitySource(t *testing.T) {
+	got := runStrategyOverrideWithAvailability(
+		t,
+		&auth.Installation{ID: "inst-beta", RoutingStrategy: router.StrategyHMMBeta},
+		"",
+		nil,
+		router.StrategyHMMBeta,
+	)
 	assert.Equal(t, router.StrategyCluster, got)
+}
+
+func TestRouterStrategyOverride_DeploymentDefaultBetaClampsToCluster(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set("router_installation", &auth.Installation{ID: "inst-global"})
+		c.Next()
+	})
+	engine.Use(middleware.WithRouterStrategyDefault(router.StrategyHMMBeta, allRegisteredLive, router.StrategyHMMBeta))
+	var observed router.Strategy
+	engine.GET("/probe", func(c *gin.Context) {
+		observed = router.StrategyFromContext(c.Request.Context())
+		c.Status(http.StatusOK)
+	})
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/probe", nil))
+
+	assert.Equal(t, router.StrategyCluster, observed, "beta cannot be activated by a deployment default")
 }
 
 func TestRouterStrategyOverride_UnknownValueIgnored(t *testing.T) {
@@ -181,4 +274,77 @@ func TestRouterStrategyOverride_NoOpsWhenInstallationMissing(t *testing.T) {
 
 func overrideEnabledInstallation() *auth.Installation {
 	return &auth.Installation{ID: "inst-eval", PolicyHeaderOverridesEnabled: true}
+}
+
+type strategyProbe struct {
+	status   int
+	body     string
+	observed router.Strategy
+	reached  bool
+}
+
+func probeStrategyOverride(t *testing.T, installation *auth.Installation, managedServing bool, defaultStrategy router.Strategy, available ...router.Strategy) strategyProbe {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set("router_installation", installation)
+		if managedServing {
+			ctx := requestcontext.WithServingIdentity(c.Request.Context(), requestcontext.ServingIdentity{Target: "prod/stable"})
+			c.Request = c.Request.WithContext(ctx)
+		}
+		c.Next()
+	})
+	engine.Use(middleware.WithRouterStrategyDefault(defaultStrategy, allRegisteredLive, available...))
+	probe := strategyProbe{}
+	engine.GET("/probe", func(c *gin.Context) {
+		probe.reached = true
+		probe.observed = router.StrategyFromContext(c.Request.Context())
+		c.Status(http.StatusOK)
+	})
+
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/probe", nil))
+	probe.status = response.Code
+	probe.body = response.Body.String()
+	return probe
+}
+
+func TestRouterStrategyOverride_ManagedServingUnavailablePersistedStrategyFailsClosed(t *testing.T) {
+	installation := &auth.Installation{ID: "inst-managed", RoutingStrategy: router.StrategyRL}
+	probe := probeStrategyOverride(t, installation, true, router.StrategyHMMEmbedding, router.StrategyHMMEmbedding)
+
+	assert.Equal(t, http.StatusServiceUnavailable, probe.status)
+	assert.JSONEq(t, `{"error":"routing_strategy_unavailable"}`, probe.body)
+	assert.False(t, probe.reached, "a managed worker must not dispatch on the cluster fallback")
+}
+
+func TestRouterStrategyOverride_ManagedServingRemapsRetiredBetaToDeploymentDefault(t *testing.T) {
+	for _, persisted := range []router.Strategy{router.StrategyHMMBeta, ""} {
+		t.Run(string(persisted), func(t *testing.T) {
+			installation := &auth.Installation{ID: "inst-remap", RoutingStrategy: persisted}
+			probe := probeStrategyOverride(t, installation, true, router.StrategyHMMEmbedding, router.StrategyHMM, router.StrategyHMMEmbedding)
+
+			assert.Equal(t, http.StatusOK, probe.status)
+			assert.Equal(t, router.StrategyHMMEmbedding, probe.observed)
+		})
+	}
+}
+
+func TestRouterStrategyOverride_ManagedServingRemappedDefaultUnavailableFailsClosed(t *testing.T) {
+	// Legacy deployments clamp an unregistered default to cluster; a managed
+	// worker must surface it instead of scoring on cluster.
+	installation := &auth.Installation{ID: "inst-remap-unavailable", RoutingStrategy: router.StrategyHMMBeta}
+	probe := probeStrategyOverride(t, installation, true, router.StrategyHMMBeta, router.StrategyHMM)
+
+	assert.Equal(t, http.StatusServiceUnavailable, probe.status)
+	assert.False(t, probe.reached)
+}
+
+func TestRouterStrategyOverride_LegacyUnavailablePersistedStrategyFallsBackToCluster(t *testing.T) {
+	installation := &auth.Installation{ID: "inst-legacy", RoutingStrategy: router.StrategyRL}
+	probe := probeStrategyOverride(t, installation, false, router.StrategyHMMEmbedding, router.StrategyHMMEmbedding)
+
+	assert.Equal(t, http.StatusOK, probe.status)
+	assert.Equal(t, router.StrategyCluster, probe.observed)
 }

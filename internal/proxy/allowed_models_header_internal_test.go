@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
+	"weave-os/router/internal/translate"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -26,7 +26,7 @@ func ctxWithRequestSubset(ctx context.Context, models ...string) context.Context
 }
 
 func TestParseAllowedModelsHeader_ResolvesAliasesAndDedupes(t *testing.T) {
-	got, err := ParseAllowedModelsHeader(" sol, terra ,gpt-5.6-sol,", nil)
+	got, err := ParseAllowedModelsHeader(" gpt-5-6-sol, terra ,gpt-5.6-sol,", nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{testSol, testTerra}, got.Requested)
 	assert.Equal(t, []string{testSol, testTerra}, got.Effective)
@@ -46,7 +46,7 @@ func TestParseAllowedModelsHeader_BlankRejected(t *testing.T) {
 }
 
 func TestParseAllowedModelsHeader_IntersectsInstallationAllowlist(t *testing.T) {
-	got, err := ParseAllowedModelsHeader("sol,terra", []string{testSol, testOpus})
+	got, err := ParseAllowedModelsHeader("gpt-5-6-sol,terra", []string{testSol, testOpus})
 	require.NoError(t, err)
 	assert.Equal(t, []string{testSol, testTerra}, got.Requested)
 	assert.Equal(t, []string{testSol}, got.Effective)
@@ -135,6 +135,19 @@ func TestReadmitForcedModel_KeepsPolicyExclusion(t *testing.T) {
 	assert.Contains(t, got, testOpus)
 }
 
+func TestReadmitForcedModel_KeepsAdvisorPairingExclusion(t *testing.T) {
+	s := &Service{availableModels: map[string]struct{}{testSol: {}, "claude-fable-5-1": {}}}
+	ctx := ctxWithRequestSubset(context.Background(), testSol)
+	env, err := translate.ParseAnthropic([]byte(`{"model":"claude-opus-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"advisor_20260301","name":"advisor","model":"claude-opus-5"}]}`))
+	require.NoError(t, err)
+	req := router.Request{ExcludedModels: s.excludedModelsForRequest(ctx)}
+	require.Contains(t, req.ExcludedModels, "claude-fable-5-1")
+
+	pin := sessionpin.Pin{Model: "claude-fable-5-1", Provider: providers.ProviderAnthropic}
+	got := s.readmitForcedModel(ctx, req, env, translate.RoutingFeatures{MaxTokens: 16}, pin)
+	assert.Contains(t, got, "claude-fable-5-1", "an opus-5 advisor cannot advise fable-5.1")
+}
+
 func TestReadmitForcedModel_NoSubsetIsNoOp(t *testing.T) {
 	s := &Service{availableModels: map[string]struct{}{testSol: {}, testTerra: {}}}
 	req := router.Request{ExcludedModels: map[string]struct{}{testTerra: {}}}
@@ -200,4 +213,22 @@ func TestRequestAllowedModelsPresent(t *testing.T) {
 	assert.False(t, requestAllowedModelsPresent(context.Background()))
 	assert.True(t, requestAllowedModelsPresent(
 		ctxWithRequestSubset(context.Background(), testSol)))
+}
+
+func TestReadmitForcedModel_GatewayBypassKeepsUnsignedHistoryGeminiExclusion(t *testing.T) {
+	const gemini = "gemini-3.1-pro-preview"
+	s := &Service{availableModels: map[string]struct{}{testOpus: {}, gemini: {}}}
+	ctx := context.WithValue(gatewayKeyCtx(gemini), InstallationAllowedModelsContextKey{}, []string{testOpus})
+	req := router.Request{ExcludedModels: s.excludedModelsForRequest(ctx)}
+	require.Contains(t, req.ExcludedModels, gemini)
+	pin := sessionpin.Pin{Model: gemini, Provider: providers.ProviderAnthropicGateway}
+
+	fresh, err := translate.ParseAnthropic([]byte(`{"model":"x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	require.NoError(t, err)
+	assert.NotContains(t, s.readmitForcedModel(ctx, req, fresh, translate.RoutingFeatures{MaxTokens: 16}, pin), gemini)
+
+	unsigned, err := translate.ParseAnthropic([]byte(`{"model":"x","max_tokens":16,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}]}`))
+	require.NoError(t, err)
+	assert.Contains(t, s.readmitForcedModel(ctx, req, unsigned, translate.RoutingFeatures{MaxTokens: 16}, pin), gemini,
+		"gemini-3.x cannot take unsigned tool-call history")
 }

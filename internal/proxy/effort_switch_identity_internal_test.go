@@ -2,11 +2,12 @@ package proxy
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/sessionpin"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/sessionpin"
 )
 
 // An effort change on the same model invalidates thinking-block signatures
@@ -68,8 +69,10 @@ func TestServedIdentity_FoldsEffortAndOmitsWhenAbsent(t *testing.T) {
 // leaving effort on would silently disable loop-breaking for effort-carrying turns.
 func TestMaxedOutServedModel_StripsEffortSoExclusionMatches(t *testing.T) {
 	pin := sessionpin.Pin{
-		LastServedModel:  "claude-opus-5:xhigh",
-		LastOutputTokens: prevTurnMaxedOutThreshold,
+		LastServedModel:   "claude-opus-5:xhigh",
+		LastOutputTokens:  8192,
+		LastTurnEndedAt:   time.Unix(100, 0),
+		LastOutputLimitAt: time.Unix(100, 0),
 	}
 
 	assert.Equal(t, "claude-opus-5", maxedOutServedModel(pin),
@@ -78,8 +81,10 @@ func TestMaxedOutServedModel_StripsEffortSoExclusionMatches(t *testing.T) {
 
 func TestMaxedOutServedModel_BareIdentityUnchanged(t *testing.T) {
 	pin := sessionpin.Pin{
-		LastServedModel:  "claude-opus-5",
-		LastOutputTokens: prevTurnMaxedOutThreshold,
+		LastServedModel:   "claude-opus-5",
+		LastOutputTokens:  8192,
+		LastTurnEndedAt:   time.Unix(100, 0),
+		LastOutputLimitAt: time.Unix(100, 0),
 	}
 
 	assert.Equal(t, "claude-opus-5", maxedOutServedModel(pin))

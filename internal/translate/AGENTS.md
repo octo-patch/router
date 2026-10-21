@@ -1,6 +1,6 @@
 # internal/translate — AGENTS
 
-> **Mirror notice.** Verbatim sync with [CLAUDE.md](CLAUDE.md). **Update both together** — divergence = bug.
+> **Mirror notice.** Generated from [CLAUDE.md](CLAUDE.md). Edit CLAUDE.md, then run `make generate-agent-guides`; CI rejects drift.
 
 Cross-format wire-format conversion. Pure functions, no I/O, no provider knowledge, no domain types. Read [root CLAUDE.md](../../CLAUDE.md) first.
 
@@ -8,7 +8,7 @@ Cross-format wire-format conversion. Pure functions, no I/O, no provider knowled
 
 Covers all three directions: Anthropic ⇄ OpenAI and Gemini ⇄ {Anthropic, OpenAI} via a `RequestEnvelope` intermediate + per-target `emit_*.go` files.
 
-**Only [`../proxy`](../proxy) calls this package.** Providers stay ignorant of cross-format concerns.
+**[`../proxy`](../proxy) owns inference translation.** Direct worker admission preserves the original body. Providers stay ignorant of cross-format concerns.
 
 ## Adding a wire-format pair
 
@@ -47,7 +47,7 @@ Anthropic-only fields (`thinking`, `cache_control`, `metadata`, Anthropic beta h
 
 ## Prefix-stable system handling (load-bearing)
 
-Anthropic 400s on `role:"system"` inside `messages`, so `hoistAnthropicSystemMessages` clears them — but only the **leading** run is hoisted into `system`. A mid-conversation system message is demoted to `user` **in place**. Hoisting it instead would move its text in front of the whole history, so a client that emits a system reminder per turn (Claude Code) shifts the cached prefix on every turn and re-writes the entire prompt; prod traffic showed ~890k cache-creation tokens per turn against a flat 17.5k read.
+Anthropic 400s on `role:"system"` inside `messages`, so `hoistAnthropicSystemMessages` clears them — but only the **leading** run is hoisted into `system`. Any system-scoped `output_config` is hoisted to the request-level field (without overwriting an explicit request-level value), while a mid-conversation system message is demoted to `user` **in place** after its message-scoped `output_config` is removed. Hoisting it instead would move its text in front of the whole history, so a client that emits a system reminder per turn (Claude Code) shifts the cached prefix on every turn and re-writes the entire prompt; prod traffic showed ~890k cache-creation tokens per turn against a flat 17.5k read.
 
 ## `<think>` content-channel extraction (gated)
 
@@ -61,13 +61,32 @@ The router translator must **round-trip `thoughtSignature` on text / thinking bl
 
 ## Cross-format reasoning signatures on Anthropic `thinking` blocks (load-bearing)
 
-The Responses→Anthropic writers smuggle an OpenAI reasoning item (`id` + `encrypted_content`) into the Anthropic `signature` field ([`openai_reasoning_signature.go`](openai_reasoning_signature.go)) so the reasoning can be replayed to OpenAI next turn. Anthropic validates that opaque field and answers `Invalid signature in thinking block`, so `resolveAnthropicOverrides` drops those blocks unconditionally (`StripForeignSignedThinkingBlocks`) alongside unsigned ones — not only when `ModelSwitched` is set. The switch guard is not sufficient: a client-side compaction rewrites the first user message, which re-keys the session, so the pin (and with it the prior served model) is gone on exactly the turn that re-routes an OpenAI-served history to Anthropic.
+The Responses→Anthropic writers smuggle an OpenAI reasoning item (`id` + `encrypted_content`) into the Anthropic `signature` field ([`openai_reasoning_signature.go`](openai_reasoning_signature.go)) so the reasoning can be replayed to OpenAI next turn.
+
+**The envelope carries the minting upstream's scope, and a replay requires an exact match** (`EmitOptions.ReasoningReplayScope`, fingerprinted by `proxy.reasoningReplayScope` over provider + effective wire model + normalized endpoint + the credential's *stable* principal — the external-key identity, the ChatGPT or subscription account behind a lease, or the adapter's own deployment principal when the request carries no credential of its own; a credential known only by its key material is named by a password-grade KDF over that key, never a bare digest, since the scope travels back to the client). Never the bearer: a Cortex workload-identity credential mints a fresh token per request, and Cortex decrypted a Grok item under a freshly minted one (verified against prod's Snowflake account, 2026-09-21), so keying on token bytes would discard reasoning the upstream would have accepted. Encrypted reasoning is decryptable only by the account and model that produced it: replayed elsewhere, Cortex answers `encrypted reasoning was created for a different account or model` and xAI `Encrypted content could not be decrypted or parsed` — a 400 that kills the turn rather than degrading it, and with it the client session (prod 2026-09, a Cortex Grok turn re-routed mid-session to GPT). An envelope minted for another scope, or a turn whose scope is unknown, drops the reasoning item and sends the rest of the history — the tool calls and results still go out, and Cortex answers 200. This is why the scope must be a *dispatch-target* fingerprint, not a model name: the same model served through a second Cortex account cannot decrypt the first account's reasoning either. The guard covers only this Anthropic-carrier path; a native Responses/Codex client round-trips its own reasoning items and is unprotected by it.
+
+Anthropic validates that opaque field and answers `Invalid signature in thinking block`, so `resolveAnthropicOverrides` drops those blocks unconditionally (`StripForeignSignedThinkingBlocks`) alongside unsigned ones — not only when `ModelSwitched` is set. The switch guard is not sufficient: a client-side compaction rewrites the first user message, which re-keys the session, so the pin (and with it the prior served model) is gone on exactly the turn that re-routes an OpenAI-served history to Anthropic.
+
+## Output-token floor for reasoning targets (load-bearing)
+
+Hidden reasoning counts against the output budget on every vendor (Gemini `maxOutputTokens` includes thoughts; OpenAI `max_completion_tokens` / `max_output_tokens` include reasoning), so a caller's small `max_tokens` is forwarded verbatim only when the target will not think. `reasoningOutputFloor` ([`reasoning.go`](reasoning.go)) raises the budget to 16k whenever the resolved intent leaves reasoning on — Gemini 3.x always-on even under `thinking: disabled`, Gemini 2.5 with a positive budget or forced effort, OpenAI reasoning models unless effort resolves to `none` — and the result is still clamped to the model's output cap. Non-reasoning targets and explicitly-off reasoning keep the caller's number, and stop sequences are untouched. Without this, Claude Code's `max_tokens=64` security-monitor verdict on Gemini 3.x stopped at `max_tokens` with the budget spent on thoughts (99.5% of calls, prod 2026-09), and the client retried each one 5x.
+
+## Duplicate tool results (load-bearing)
+
+Codex code-mode records each `notify()` from an `exec` script as another `custom_tool_call_output` under the running call's `call_id`, so one tool call can arrive with N results. OpenAI accepts that; Anthropic 400s (`each tool_use must have a single result`) and Gemini needs one `functionResponse` per `functionCall`. Codex resends the full history every turn, so one such call bricks the session. `CoalesceDuplicateToolResults` ([`tool_result_coalesce.go`](tool_result_coalesce.go)) merges results answering the same call into the first one, in order (a later call reusing the id is its own group, and a moved `cache_control` never jumps another breakpoint), and the proxy runs it before `SanitizeOrphanedToolCalls` on every translated turn. A history without duplicates stays byte-identical, and native Responses dispatch keeps the caller's original body.
 
 ## Tool-call validation + strict decoding (load-bearing)
 
 Model-emitted tool_use arguments are validated against the inbound request's `tools[].input_schema` by [`toolcheck`](toolcheck/) at every response-translation point (OpenAI-compat and Gemini chains, streaming + non-streaming, and both Responses paths). The pipeline: normalize (drop empty-string/null OPTIONAL params) -> minimal JSON repair -> Draft-7 validation -> safe deterministic repair (drop unknown keys, lossless coercions), re-validated. Unrepairable schema mismatches forward as-emitted (the client's own tool error is the feedback loop); only unparseable JSON degrades to `{}`. Every finding surfaces via `ResponseSummary.ToolCallIssues`, which the proxy logs as `router.tool_call_invalid`. **Everything is fail-open** — a schema that won't compile must never fail a request.
 
 On the emit side the failure class is prevented at decode time where the upstream exposes a knob: OpenAI Responses tools go out with `strict:true` + a strictified schema ([`strictify_openai.go`](strictify_openai.go) — additionalProperties:false, all-required, optionals as null unions; non-strictifiable schemas fall back to non-strict). Gemini 3.x gets `functionCallingConfig.mode=VALIDATED` when the client didn't force a tool_choice. Proxy-side validation always checks against the ORIGINAL schema — the explicit nulls strict mode induces are dropped by toolcheck's normalize pass.
+
+## Router notices
+
+`RouterNotice` and `NoticeDelivery` provide the shared client-wire notice boundary.
+Policy and opt-outs stay in proxy; sinks reuse the existing protocol encoders after
+conversion. Read [the notice contract](../../docs/ROUTER_NOTICES.md) before adding
+notice kinds or changing prelude/retry behavior.
 
 ## Invariants
 

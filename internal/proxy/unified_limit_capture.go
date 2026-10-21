@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"workweave/router/internal/observability"
-	"workweave/router/internal/proxy/usage"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/proxy/usage"
 )
 
 // unifiedLimitCapture is a request-scoped holder for the raw
@@ -43,9 +43,6 @@ func captureUnifiedLimitHeaders(ctx context.Context, h http.Header) {
 		return
 	}
 	raw := usage.RawAnthropicUnifiedHeaders(h)
-	if raw == nil {
-		return
-	}
 	c.raw = raw
 }
 

@@ -7,12 +7,12 @@ import (
 	"sort"
 	"time"
 
-	"workweave/router/internal/observability/apm"
-	"workweave/router/internal/observability/otel"
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/catalog"
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/observability/apm"
+	"weave-os/router/internal/observability/otel"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/catalog"
+	"weave-os/router/internal/translate"
 )
 
 // TranslationCompatibilityMode controls whether broad compatibility filters
@@ -124,7 +124,12 @@ func (s *Service) planTranslation(req router.Request) TranslationPlan {
 		return plan
 	}
 
-	plan.Enforced = s.translationCompatibilityMode == TranslationCompatibilityEnforce ||
+	// A native search tool or result block cannot be translated to another
+	// provider family. Keep that safety boundary active independently of the
+	// broader compatibility rollout; scopeSearchRequirement has already removed
+	// advertised-only tools from this requirement.
+	plan.Enforced = requirements.CitationsOrSearch ||
+		s.translationCompatibilityMode == TranslationCompatibilityEnforce ||
 		((requirements.NativeOnly || requirements.SourceFormat == router.WireFormatGemini) && s.translationCompatibilityMode != TranslationCompatibilityOff)
 	constraints, valid := translationConstraints(requirements)
 	if !valid {
@@ -133,7 +138,7 @@ func (s *Service) planTranslation(req router.Request) TranslationPlan {
 	}
 	if len(constraints) > 0 {
 		plan.TargetFamily = constraints[0].TargetFamily
-		candidates := candidateProviders(req.EnabledProviders, s.providers)
+		candidates := candidateProviders(req.EnabledProviders, s.clients.NameSet())
 		for _, constraint := range constraints {
 			plan.Exclusions = append(plan.Exclusions, constraintExclusions(candidates, constraint, plan.Enforced)...)
 		}
@@ -142,7 +147,7 @@ func (s *Service) planTranslation(req router.Request) TranslationPlan {
 			// A candidate must also be registered locally. This distinguishes an
 			// unavailable compatible route from an intrinsic wire incompatibility
 			// before the scorer can turn it into a generic no-eligible-model error.
-			plan.Unavailable = len(configuredProviders(plan.EnabledProviders, s.providers)) == 0
+			plan.Unavailable = len(configuredProviders(plan.EnabledProviders, s.clients.NameSet())) == 0
 		}
 	}
 
@@ -227,7 +232,7 @@ func singletonProviderSet(provider string) map[string]struct{} {
 	return map[string]struct{}{provider: {}}
 }
 
-func candidateProviders(enabled map[string]struct{}, configured map[string]providers.Client) map[string]struct{} {
+func candidateProviders(enabled map[string]struct{}, configured map[string]struct{}) map[string]struct{} {
 	if enabled != nil {
 		return cloneStringSet(enabled)
 	}
@@ -248,7 +253,7 @@ func filterProvidersByConstraints(in map[string]struct{}, constraints []translat
 	return out
 }
 
-func configuredProviders(candidates map[string]struct{}, configured map[string]providers.Client) map[string]struct{} {
+func configuredProviders(candidates map[string]struct{}, configured map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(candidates))
 	for provider := range candidates {
 		if _, ok := configured[provider]; ok {

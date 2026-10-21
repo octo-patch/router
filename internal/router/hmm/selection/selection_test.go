@@ -8,8 +8,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/router/hmm/rosterdata"
-	"workweave/router/internal/router/hmm/selection"
+	"weave-os/router/internal/router/hmm/rosterdata"
+	"weave-os/router/internal/router/hmm/selection"
+	"weave-os/router/internal/router/policy"
 )
 
 func candidateSet(ids ...string) map[string]struct{} {
@@ -22,11 +23,11 @@ func candidateSet(ids ...string) map[string]struct{} {
 
 func testRoster() *rosterdata.Roster {
 	return &rosterdata.Roster{
-		SchemaVersion: "hmm_router_cluster_roster_v6",
+		SchemaVersion: rosterdata.SchemaVersionV6,
 		Clusters: map[string]rosterdata.Cluster{
 			"low": {
 				Arms: []string{"vendor-a/cheap", "vendor-b/cheap"},
-				ArmsByHarness: map[string][]string{
+				ArmsByHarness: map[rosterdata.Harness][]string{
 					"claude-code": {"vendor-b/cheap", "vendor-a/cheap"},
 					"codex_cli":   {"vendor-b/cheap"},
 				},
@@ -40,8 +41,99 @@ func testRoster() *rosterdata.Roster {
 			"effort": {
 				Arms: []string{"vendor-a/deep:high", "vendor-a/deep"},
 			},
+			"efforts": {
+				Arms: []string{"vendor-a/deep:xhigh", "vendor-a/deep:low", "vendor-a/deep"},
+			},
 		},
 	}
+}
+
+func dynamicRoster() *rosterdata.Roster {
+	return &rosterdata.Roster{
+		SchemaVersion: rosterdata.SchemaVersionV7,
+		Ranking: rosterdata.Ranking{
+			Alpha:              map[string]float64{"low": 0.4},
+			AlphaMin:           map[string]float64{"low": 0.05},
+			AlphaMax:           map[string]float64{"low": 0.8},
+			QualityBiasNeutral: 0.7,
+		},
+		Clusters: map[string]rosterdata.Cluster{
+			"low": {
+				Arms: []string{"vendor-a/quality", "vendor-b/cheap"},
+				ArmScores: map[string]float64{
+					"vendor-a/quality": 30,
+					"vendor-b/cheap":   25,
+				},
+				ArmIndices: map[string]rosterdata.ArmIndices{
+					"vendor-a/quality": {WII: 90, WPI: 10},
+					"vendor-b/cheap":   {WII: 55, WPI: 0},
+				},
+			},
+		},
+	}
+}
+
+func TestSelectGroupsWithPreferenceReweightsWithinClassifierBand(t *testing.T) {
+	roster := dynamicRoster()
+	candidates := candidateSet("vendor-a/quality", "vendor-b/cheap")
+	groups := []selection.Group{{Label: "low"}}
+
+	neutral := 0.7
+	pick, scores, ok := selection.SelectGroupsWithPreference(roster, groups, "", candidates, &neutral)
+	require.True(t, ok)
+	assert.Equal(t, "vendor-a/quality", pick.Arm)
+	assert.Equal(t, float32(30), scores["low"]["vendor-a/quality"])
+
+	priceHeavy := 0.0
+	pick, _, ok = selection.SelectGroupsWithPreference(roster, groups, "", candidates, &priceHeavy)
+	require.True(t, ok)
+	assert.Equal(t, "vendor-b/cheap", pick.Arm)
+
+	qualityHeavy := 1.0
+	pick, _, ok = selection.SelectGroupsWithPreference(roster, groups, "", candidates, &qualityHeavy)
+	require.True(t, ok)
+	assert.Equal(t, "vendor-a/quality", pick.Arm)
+}
+
+func TestSelectGroupsWithPreferencePreservesPolicyTiers(t *testing.T) {
+	roster := dynamicRoster()
+	cluster := roster.Clusters["low"]
+	cluster.ManualPinsByHarness = map[rosterdata.Harness][]string{rosterdata.HarnessPI: {"vendor-b/cheap"}}
+	cluster.PreferredVendorsByHarness = map[rosterdata.Harness][]string{rosterdata.HarnessCodex: {"vendor-b"}}
+	roster.Clusters["low"] = cluster
+	qualityHeavy := 1.0
+	candidates := candidateSet("vendor-a/quality", "vendor-b/cheap")
+
+	pick, _, ok := selection.SelectGroupsWithPreference(roster, []selection.Group{{Label: "low"}}, "pi", candidates, &qualityHeavy)
+	require.True(t, ok)
+	assert.Equal(t, "vendor-b/cheap", pick.Arm, "manual pin must outrank the dynamic score")
+
+	pick, _, ok = selection.SelectGroupsWithPreference(roster, []selection.Group{{Label: "low"}}, "codex", candidates, &qualityHeavy)
+	require.True(t, ok)
+	assert.Equal(t, "vendor-b/cheap", pick.Arm, "vendor affinity must outrank the dynamic score")
+}
+
+func TestSelectGroupsWithPreferenceKeepsFallbackOrder(t *testing.T) {
+	roster := dynamicRoster()
+	high := roster.Clusters["low"]
+	high.Arms = []string{"vendor-c/high"}
+	high.ArmScores = map[string]float64{"vendor-c/high": 80}
+	high.ArmIndices = map[string]rosterdata.ArmIndices{"vendor-c/high": {WII: 100, WPI: 100}}
+	roster.Clusters["high"] = high
+	roster.Ranking.Alpha["high"] = 0.85
+	roster.Ranking.AlphaMin["high"] = 0.6
+	roster.Ranking.AlphaMax["high"] = 0.98
+	qualityHeavy := 1.0
+
+	pick, _, ok := selection.SelectGroupsWithPreference(
+		roster,
+		[]selection.Group{{Label: "low"}, {Label: "high"}},
+		"",
+		candidateSet("vendor-a/quality", "vendor-c/high"),
+		&qualityHeavy,
+	)
+	require.True(t, ok)
+	assert.Equal(t, "low", pick.Group)
 }
 
 func TestArmOrder(t *testing.T) {
@@ -63,6 +155,29 @@ func TestArmOrder(t *testing.T) {
 	order, harnessSpecific = selection.ArmOrder(roster.Clusters["balanced"], "claude-code")
 	assert.False(t, harnessSpecific)
 	assert.Equal(t, []string{"vendor-a/mid", "vendor-b/mid", "vendor-a/cheap"}, order)
+}
+
+// OpenCode is its own policy identity: selection keys the roster on the
+// request's client_app, so the roster harness must spell it identically to
+// the sidecar vocabulary. Without a declared order (every promoted policy
+// today) OpenCode serves the pooled cluster order.
+func TestArmOrderOpenCodeHarness(t *testing.T) {
+	require.Equal(t, policy.HarnessOpenCode, string(rosterdata.HarnessOpenCode))
+
+	roster := testRoster()
+	order, harnessSpecific := selection.ArmOrder(roster.Clusters["low"], policy.HarnessOpenCode)
+	assert.False(t, harnessSpecific)
+	assert.Equal(t, []string{"vendor-a/cheap", "vendor-b/cheap"}, order)
+
+	low := roster.Clusters["low"]
+	low.ArmsByHarness[rosterdata.HarnessOpenCode] = []string{"vendor-b/cheap", "vendor-a/cheap"}
+	order, harnessSpecific = selection.ArmOrder(low, policy.HarnessOpenCode)
+	assert.True(t, harnessSpecific)
+	assert.Equal(t, []string{"vendor-b/cheap", "vendor-a/cheap"}, order)
+
+	pick, ok := selection.Select(roster, []string{"low"}, policy.HarnessOpenCode, candidateSet("vendor-a/cheap", "vendor-b/cheap"))
+	require.True(t, ok)
+	assert.Equal(t, selection.Pick{Group: "low", Arm: "vendor-b/cheap", HarnessOrder: true}, pick)
 }
 
 func TestSelect(t *testing.T) {
@@ -165,56 +280,6 @@ func TestSelect(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestSelectGroupsHonorsTheSidecarArmAllowlist(t *testing.T) {
-	roster := testRoster()
-	candidates := candidateSet("vendor-a/mid", "vendor-b/mid", "vendor-a/cheap")
-
-	// Rank one of the group is a candidate but the sidecar excluded it (e.g. a
-	// capability constraint), so the next allowed arm of the same group serves.
-	pick, ok := selection.SelectGroups(
-		roster,
-		[]selection.Group{{Label: "balanced", AllowedArms: []string{"vendor-b/mid"}}},
-		"",
-		candidates,
-	)
-	require.True(t, ok)
-	assert.Equal(t, selection.Pick{Group: "balanced", Arm: "vendor-b/mid"}, pick)
-
-	// A group whose allowlist excludes every candidate falls through.
-	pick, ok = selection.SelectGroups(
-		roster,
-		[]selection.Group{
-			{Label: "balanced", AllowedArms: []string{"vendor-c/other"}},
-			{Label: "low", AllowedArms: []string{"vendor-a/cheap"}},
-		},
-		"",
-		candidates,
-	)
-	require.True(t, ok)
-	assert.Equal(t, selection.Pick{Group: "low", Arm: "vendor-a/cheap", FallbackDepth: 1}, pick)
-
-	// An empty allowlist is "no restriction", not "no arms": a sidecar roster
-	// that disagrees with the router's must not shrink the candidate set.
-	pick, ok = selection.SelectGroups(
-		roster,
-		[]selection.Group{{Label: "balanced"}},
-		"",
-		candidates,
-	)
-	require.True(t, ok)
-	assert.Equal(t, selection.Pick{Group: "balanced", Arm: "vendor-a/mid"}, pick)
-
-	// Allowlist entries match effort-suffixed roster arms on their base ID.
-	pick, ok = selection.SelectGroups(
-		roster,
-		[]selection.Group{{Label: "effort", AllowedArms: []string{"vendor-a/deep"}}},
-		"",
-		candidateSet("vendor-a/deep"),
-	)
-	require.True(t, ok)
-	assert.Equal(t, selection.Pick{Group: "effort", Arm: "vendor-a/deep:high"}, pick)
 }
 
 func TestSelectIsDeterministic(t *testing.T) {

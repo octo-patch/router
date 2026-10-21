@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
+	"weave-os/router/internal/providers"
 )
 
 // TestEveryProviderHasFamilyAndEnvVar guards the three-map invariant: every
@@ -49,6 +49,7 @@ func TestFamilyForKnownProviders(t *testing.T) {
 		providers.ProviderGoogle:         providers.FamilyGemini,
 		providers.ProviderOpenRouter:     providers.FamilyOpenAICompat,
 		providers.ProviderFireworks:      providers.FamilyOpenAICompat,
+		providers.ProviderDeepInfra:      providers.FamilyOpenAICompat,
 		providers.ProviderBedrock:        providers.FamilyOpenAICompat,
 		providers.ProviderMakora:         providers.FamilyOpenAICompat,
 		providers.ProviderMiniMax:        providers.FamilyOpenAICompat,

@@ -1,6 +1,6 @@
 # internal/router/planner — CLAUDE
 
-> **Mirror notice.** Verbatim sync with [AGENTS.md](AGENTS.md). **Update both together** — divergence = bug.
+> **Mirror notice.** Source for generated [AGENTS.md](AGENTS.md). Edit this file, then run `make generate-agent-guides`; CI rejects drift.
 
 Prism-style cache-aware EV policy. Decides STAY (preserve pinned model's upstream prompt cache) vs SWITCH (take cluster scorer's fresh decision + eat one-time cache miss) per action. Read [root CLAUDE.md](../../../CLAUDE.md) first.
 
@@ -46,7 +46,11 @@ exposure-weighted remaining horizon of ~253) but a sweep showed correcting it is
 worth ~1.4 points against the economics' ~12, so it is a follow-up, not part of
 this change.
 
-Evidence: `router-internal/eval/cache_eviction/` in the WorkWeave repo (E0-E6);
+Catalog prices are selected using `EstimatedInputTokens` before evaluating
+either model, so long-context input, output, read, and write rates stay aligned
+with billing.
+
+Evidence: `router-internal/eval/cache_eviction/` in the Weave repo (E0-E6);
 `corrected_test.go` cross-validates the Go implementation against that harness's
 Python reference to 1e-9.
 

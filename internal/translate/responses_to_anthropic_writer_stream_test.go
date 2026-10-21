@@ -1,6 +1,7 @@
 package translate_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
@@ -10,9 +11,9 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/translate"
-	"workweave/router/internal/translate/toolcheck"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/translate"
+	"weave-os/router/internal/translate/toolcheck"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -457,7 +458,7 @@ data: {"type":"response.completed","response":{"id":"r","status":"completed","ou
 }
 
 // A function_call with no name is dropped, never opened as a tool_use block;
-// the turn demotes to end_turn.
+// with no other output, the turn is retryable rather than an empty success.
 func TestResponsesToAnthropicWriter_NamelessToolDropped(t *testing.T) {
 	const fixture = `event: response.output_item.added
 data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_x","type":"function_call","call_id":"call_x","name":"","arguments":"","status":"in_progress"}}
@@ -476,14 +477,13 @@ data: {"type":"response.completed","response":{"id":"r","status":"completed","ou
 	w := translate.NewResponsesToAnthropicWriter(rec, "gpt-5.5", nil)
 	require.NoError(t, w.Prelude(true))
 	_, err := w.Write([]byte(fixture))
-	require.NoError(t, err)
-	require.NoError(t, w.Finalize())
+	require.ErrorIs(t, err, providers.ErrUpstreamEmptyCompletion)
 
 	body := rec.Body.String()
 	assert.NotContains(t, body, `"type":"tool_use"`, "nameless function_call must not open a tool_use block")
 	assert.NotContains(t, body, "input_json_delta")
-	assert.Contains(t, body, `"stop_reason":"end_turn"`, "no surviving tool_use block → demote to end_turn")
-	assert.Contains(t, body, "event: message_stop")
+	assert.NotContains(t, body, `"stop_reason":"end_turn"`, "no surviving tool_use block must not become a successful turn")
+	assert.NotContains(t, body, "event: message_stop")
 }
 
 // Non-streaming: an `error` event with no terminal response event still
@@ -741,7 +741,10 @@ data: {"type":"response.failed","response":{"id":"r","status":"failed","output":
 // at block 1.
 func TestResponsesToAnthropicWriter_RoutingMarker(t *testing.T) {
 	rec := httptest.NewRecorder()
-	w := translate.NewResponsesToAnthropicWriter(rec, "gpt-5.5", nil).WithRoutingMarker("[routed: gpt-5.5]")
+	delivery := noticeDelivery(context.Background(), rec, translate.FormatAnthropic)
+	_, noticeErr := delivery.Deliver(translate.NewRouterNotice(translate.NoticeModelSelection, "[routed: gpt-5.5]", "gpt-5.5", ""))
+	require.NoError(t, noticeErr)
+	w := translate.NewResponsesToAnthropicWriter(delivery, "gpt-5.5", nil)
 
 	require.NoError(t, w.Prelude(true))
 	_, err := w.Write([]byte(responsesStreamFixture))

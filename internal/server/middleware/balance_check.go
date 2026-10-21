@@ -5,9 +5,9 @@ import (
 	"errors"
 	"net/http"
 
-	"workweave/router/internal/billing"
-	"workweave/router/internal/observability"
-	"workweave/router/internal/proxy"
+	"weave-os/router/internal/billing"
+	"weave-os/router/internal/observability"
+	"weave-os/router/internal/proxy"
 
 	"github.com/gin-gonic/gin"
 )
@@ -40,7 +40,29 @@ const TopUpURL = "https://app.workweave.ai/organization/settings/weave-router"
 func WithBalanceCheck(svc *billing.Service, minBalanceMicros int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		log := observability.FromGin(c)
+		if owner, ok := billing.InternalTestOwnerFrom(c.Request.Context()); ok {
+			balance, err := svc.PrepaidBalance(c.Request.Context(), owner)
+			if err != nil {
+				log.Error("Internal test budget unavailable", "subject_id", owner.TestSubjectID, "err", err)
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "test_budget_unavailable"})
+				return
+			}
+			if balance <= minBalanceMicros {
+				c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{"error": "test_budget_depleted"})
+				return
+			}
+			c.Next()
+			return
+		}
 		if _, ok := proxy.AgentShadowEvalFromContext(c.Request.Context()); ok {
+			c.Next()
+			return
+		}
+
+		// A turn covered by an individual Max/Boost allowance debits 0 on the
+		// org balance, so gating it on prepaid credits would 402 usage the
+		// subscription already bought.
+		if subscriberAllowanceCovers(c) {
 			c.Next()
 			return
 		}
@@ -71,7 +93,7 @@ func WithBalanceCheck(svc *billing.Service, minBalanceMicros int64) gin.HandlerF
 				if subscriptionExempt {
 					log.Warn("Balance row missing: serving subscription-only, paid failover disabled",
 						"organization_id", orgID)
-					c.Request = c.Request.WithContext(billing.WithSubscriptionOnly(c.Request.Context()))
+					c.Request = c.Request.WithContext(billing.WithSubscriptionOnly(c.Request.Context(), billing.SubscriptionOnlyCreditsDepleted))
 					c.Next()
 					return
 				}
@@ -117,7 +139,7 @@ func WithBalanceCheck(svc *billing.Service, minBalanceMicros int64) gin.HandlerF
 					"balance_usd_micros", result.BalanceMicros,
 					"threshold_usd_micros", threshold,
 				)
-				c.Request = c.Request.WithContext(billing.WithSubscriptionOnly(c.Request.Context()))
+				c.Request = c.Request.WithContext(billing.WithSubscriptionOnly(c.Request.Context(), billing.SubscriptionOnlyCreditsDepleted))
 				c.Next()
 				return
 			}

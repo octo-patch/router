@@ -16,10 +16,11 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"workweave/router/internal/auth"
-	"workweave/router/internal/providers/httputil"
-	"workweave/router/internal/proxy"
-	"workweave/router/internal/websearch"
+	"weave-os/router/internal/auth"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/providers/httputil"
+	"weave-os/router/internal/requestcontext"
+	"weave-os/router/internal/websearch"
 )
 
 // runPath is the stateless agent endpoint: no agent object required, the spec
@@ -102,11 +103,11 @@ func (c *Client) Search(ctx context.Context, q websearch.Query) (websearch.Respo
 	if query == "" {
 		return websearch.Response{}, fmt.Errorf("cortexagents: empty query")
 	}
-	creds := proxy.CredentialsFromContext(ctx)
+	creds := requestcontext.CredentialsFromContext(ctx)
 	if creds == nil || len(creds.APIKey) == 0 {
 		return websearch.Response{}, fmt.Errorf("cortexagents: no credential on request")
 	}
-	baseURL := proxy.EffectiveBaseURL(ctx, c.baseURL)
+	baseURL := requestcontext.EffectiveBaseURL(ctx, c.baseURL)
 	if baseURL == "" {
 		return websearch.Response{}, fmt.Errorf("cortexagents: no base URL configured")
 	}
@@ -136,7 +137,7 @@ func (c *Client) Search(ctx context.Context, q websearch.Query) (websearch.Respo
 		req.Header.Set("X-Snowflake-Role", c.role)
 	}
 	// Correlation headers aren't on req; pull them from the ingress snapshot on ctx.
-	proxy.ApplyForwardedClientHeaders(ctx, req, nil)
+	requestcontext.ApplyForwardedClientHeaders(ctx, req, nil)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -172,11 +173,11 @@ func (c *Client) checkHost(baseURL string) error {
 	return nil
 }
 
-// agentRunURL places agent:run under the Cortex root. The inference surfaces
-// hang off /v1 and a tenant's configured base URL may include that segment,
-// but agent:run does not live under it.
+// agentRunURL places agent:run under the Cortex REST root. The inference
+// surfaces hang off /v1 and a tenant's configured base URL may include that
+// segment, or point at an AI Gateway, but agent:run lives under neither.
 func agentRunURL(baseURL string) string {
-	return strings.TrimSuffix(strings.TrimRight(baseURL, "/"), "/v1") + runPath
+	return providers.CortexRESTRoot(baseURL) + runPath
 }
 
 // maxResponseBytes caps the buffered agent response; an agent answer plus

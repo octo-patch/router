@@ -1,36 +1,41 @@
 # Weave Router pi extension
 
-> Bundled inside the [`@workweave/router`](https://www.npmjs.com/package/@workweave/router) package — not published separately. `src/` here is the source of truth; `npm run prepack` copies it into the package.
+> Bundled inside the [`@weave-os/router`](https://www.npmjs.com/package/@weave-os/router) package — not published separately. `src/` here is the source of truth; `npm run prepack` copies it into the package.
 
 A [pi](https://pi.dev) extension that routes every request through the
-[WorkWeave Router](https://github.com/workweave/router) — a trained, per-request
+[WorkWeave Router](https://github.com/weave-os/router) — a trained, per-request
 LLM proxy that picks the most cost-efficient model that still solves each task.
 
 Installed automatically by the Weave Router installer:
 
 ```bash
-WEAVE_ROUTER_KEY=rk_… npx --package @workweave/router -y -- weave-router --pi
-WEAVE_ROUTER_KEY=rk_… npx --package @workweave/router -y -- weave-router --pi --local  # local router
-WEAVE_ROUTER_KEY=rk_… npx --package @workweave/router -y -- weave-router --pi --lsp go,typescript  # + language servers for the lsp tool
+WEAVE_ROUTER_KEY=rk_… npx --package @weave-os/router -y -- weave-router --pi
+WEAVE_ROUTER_KEY=rk_… npx --package @weave-os/router -y -- weave-router --pi --local  # local router
+WEAVE_ROUTER_KEY=rk_… npx --package @weave-os/router -y -- weave-router --pi --lsp go,typescript  # + language servers for the lsp tool
 ```
 
 That writes `~/.pi/agent/models.json` (the `weave` provider), adds
-`npm:@workweave/router` to `~/.pi/agent/settings.json` `packages`, and stores
-the key in `~/.pi/agent/.weave_router_key`. pi auto-installs `@workweave/router`
+`npm:@weave-os/router` to `~/.pi/agent/settings.json` `packages`, and stores
+the key in `~/.pi/agent/.weave_router_key`. pi auto-installs `@weave-os/router`
 from npm on next start and loads this extension via its `pi.extensions` field.
+Plain `pi` then connects to the installed endpoint, normally
+`https://router.workweave.ai`; it does not start a local Python proxy.
 
 ## What it does
 
 - **Loom experience on stock pi.** Replaces pi's startup header through the
-  public extension API, adds Wooly's responsive orange terminal animation, and
-  keeps pi's own runtime/footer intact. Wooly is visual only: there is no
+  public extension API and keeps pi's own runtime/footer intact. Wooly is hidden
+  by default; `/wooly` toggles the orange terminal animation for the current
+  session. Wooly is visual only: there is no
   dialogue box, narration, coaching request, or separate Loom runtime.
 - **Automatic model selection.** All pi traffic flows through the router, which
   selects the model per request. You don't pick a model — the router does.
 - **Force-model commands.** `/fm <model>` and `/force-model <model>` pin the
   current router session; `/ufm` and `/unforce-model` resume automatic routing.
-  The persistent status changes to `WEAVE ROUTER — <model> [forced]` after the
-  router validates and canonicalizes the requested model.
+  The status records `last pin: <model>` alongside response attribution after
+  a completed acknowledgment. This is reachable branch history, not a query
+  of the router's current pin. Structured response headers drive new history;
+  older transcripts retain explicit force/clear command acknowledgment support.
 - **Beta routing toggle.** `/beta` toggles the router's beta HMM strategy for
   the current session. The router confirms whether beta routing is enabled or
   disabled; run `/beta` again to switch back.
@@ -83,7 +88,7 @@ from npm on next start and loads this extension via its `pi.extensions` field.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WEAVE_ROUTER_URL` | `http://localhost:8080` | Router base URL (children inherit it) |
+| `WEAVE_ROUTER_URL` | installed `models.json` endpoint, normally hosted | Override router base URL (children inherit it); an unconfigured extension falls back to `http://localhost:8080` |
 | `WEAVE_ROUTER_KEY` | — | Router key (else read from `.weave_router_key`) |
 | `WEAVE_ROUTER_KEY_FILE` | `<agentDir>/.weave_router_key` | Override key file path |
 | `WEAVE_USER_EMAIL` / `WEAVE_USER_NAME` | from `git config` | Identity headers for attribution |
@@ -94,6 +99,7 @@ from npm on next start and loads this extension via its `pi.extensions` field.
 | `WEAVE_ROUTING_ALPHA` / `…_SPEED_WEIGHT` / `…_OUTPUT_COST_RATIO` / `…_EXPECTED_OUTPUT_TOKENS` | role preset | Override individual routing knobs (main process only — children always use their role preset) |
 | `WEAVE_NO_SAFETY` | unset | `1` disables the catastrophic-bash gate |
 | `WEAVE_PI_AUTO_COMPACTION` | unset | `0` disables the routed tool-loop compaction safeguard |
+| `WEAVE_PI_ESCALATION_COMPACTION` | enabled | `0` disables preparation and compaction before upward complexity model changes; requires Pi 0.83+ and the matching router deployment |
 | `WEAVE_PI_NO_LSP` | unset | `1` disables the `lsp` tool, the server pool, and the subagent broker |
 | `WEAVE_PI_LSP_IDLE_MS` | `300000` | Idle window before an unused language server is shut down |
 | `WEAVE_PI_LSP_REQUEST_TIMEOUT_MS` | `15000` | Per-request budget once a server is warm |
@@ -105,6 +111,68 @@ from npm on next start and loads this extension via its `pi.extensions` field.
 Internal: `WEAVE_PI_SUBAGENT=1`, `WEAVE_PI_SUBAGENT_ID`, `WEAVE_PI_LSP_BROKER`,
 and `WEAVE_PI_LSP_BROKER_TOKEN` are set by `dispatch` on child processes; don't
 set them yourself.
+
+## Escalation compaction
+
+Escalation compaction is enabled by default on Pi 0.83 or newer. Older Pi
+versions warn at startup and continue routing without escalation compaction.
+The router requires the same
+`ROUTER_PI_HANDOFF_SECRET` (at least 32 bytes) on every replica. Set
+`WEAVE_PI_ESCALATION_COMPACTION=0` to opt out. An enabled client stops
+with a visible error if preparation is unavailable; it never falls back to
+silently sending the full unreserved request.
+
+`POST /v1/route/handoff` uses the authenticated Messages middleware and serving
+route selection, including session pins and confidence guards. It stops before
+provider dispatch and returns a signed continuation ticket valid for ten
+minutes. Preparation can update routing pins; it is not a side-effect-free
+preview. The ticket is bound to the key, installation, session, strategy,
+requested model, tools and reasoning configuration. Dispatch rechecks current
+model eligibility and explicit force state. Expired or stale tickets return
+409; a new user turn prepares again. Model-selection tickets remain in memory
+and are never saved in the Pi transcript.
+
+Preparation also returns a signed thread-continuity token (`session_token`).
+Pi saves it as a session entry and sends it as `weave_session` on preparation,
+summary and continuation requests. It preserves the original first-message
+digest across compaction and process restarts, and binds it to the API key,
+installation, client session and metadata identity. A `pi:` prefix alone never
+bypasses the first-message discriminator. This token has no model selection or
+credentials and lasts for the conversation; signing-secret rotation invalidates
+it. Every request still requires normal authentication. Deploy the router before
+using the updated extension, which requires this field in preparation responses.
+
+The main Pi session compacts when the observed class increases through
+`low → medium → high → maximum`, the served model changes, and estimated context
+is at least 32,768 tokens. Unknown classes and the initial turn establish a
+baseline. Utility turns, forced models, subagents, subscription bypass, native
+server tools and non-authoritative routing retain their existing behavior.
+
+A separate ticket directs summarization to the previously served model without
+repinning the session. The summary request preserves the original system,
+tools, thinking settings and message prefix, appending a checkpoint instruction
+so existing provider caches can be reused. Pi owns the compaction boundary and
+retained recent messages; the original transcript remains on disk. Its normal
+summary generation can use separate summaries for a split turn. Compaction
+failure stops the handoff and leaves the transcript available. New user input,
+session navigation or model selection cancels a pending continuation.
+
+The continuation carries the selected model ticket, so the shortened history
+is not reclassified. Summarization still costs tokens and adds latency; actual
+cache hits and net savings require a provider-backed measurement. The client
+savings display does not yet include these auxiliary summary calls.
+
+Offline validation:
+
+```bash
+bash install/pi-router/test/e2e.sh
+python3 install/pi-router/test/handoff-e2e.py
+go test ./internal/proxy ./internal/api/anthropic ./internal/server
+```
+
+Development dependencies alias the legacy Pi module names to Pi 0.83. The
+TypeScript `pi-ai` path targets its compatibility entrypoint, matching Pi's
+extension loader; this preserves the runtime's shared provider registry.
 
 ## Billing
 

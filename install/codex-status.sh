@@ -18,6 +18,7 @@
 # blocks on the network, and every failure path leaves the title model-only.
 
 set -euo pipefail
+export PATH="$PATH:$HOME/.weave/bin"
 
 # ---------- background self-refresh ----------
 #
@@ -32,6 +33,9 @@ set -euo pipefail
 # WEAVE_STATUSLINE_UPDATE and WEAVE_STATUSLINE_UPDATE_INTERVAL_DAYS variables
 # remain accepted as aliases for users who configure both clients together.
 weave_self_refresh() {
+  # The published helper may predate classifier lifecycle forwarding. Do not
+  # replace the hook implementation underneath an opted-in session.
+  [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ] && return 0
   [ "${WEAVE_CODEX_STATUS_UPDATE:-${WEAVE_STATUSLINE_UPDATE:-1}}" = "0" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
 
@@ -67,7 +71,7 @@ weave_self_refresh() {
   # download. A failed download consumes the interval; the next hook retries.
   : >"$stamp" 2>/dev/null || return 0
 
-  local url="${WEAVE_CODEX_STATUS_URL:-https://raw.githubusercontent.com/workweave/router/main/install/codex-status.sh}"
+  local url="${WEAVE_CODEX_STATUS_URL:-https://raw.githubusercontent.com/weave-os/router/main/install/codex-status.sh}"
   local tmp="${self}.tmp.$$"
   (
     exec </dev/null
@@ -89,23 +93,22 @@ weave_self_refresh() {
   return 0
 }
 
+async_title_enabled=0
+[ ! -t 2 ] || async_title_enabled=1
+
 state_root="${XDG_CACHE_HOME:-$HOME/.cache}/weave-router/codex"
 helper_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
 disabled_marker="$helper_dir/.weave-router-disabled"
 router_badge_sentinel=$'⁣⁠⁣⁠'
-# Must stay verbatim in sync with install.sh / uninstall.sh: the endpoint read
-# below is scoped to this block so a key-shaped string elsewhere in the user's
-# config.toml is never adopted.
-codex_begin_marker="# >>> weave-router managed (do not edit between markers) >>>"
-codex_end_marker="# <<< weave-router managed <<<"
 
 emit_title() {
   local title="$1"
   if [ -n "${WEAVE_CODEX_STATUS_TITLE_FILE:-}" ]; then
     printf '%s\n' "$title" >"$WEAVE_CODEX_STATUS_TITLE_FILE"
-  elif [ -w /dev/tty ]; then
+  elif { [ -t 2 ] || [ "${async_title_enabled:-0}" = "1" ]; } && [ -w /dev/tty ]; then
     printf '\033]0;%s\007' "$title" >/dev/tty
   fi
+  return 0
 }
 
 safe_session_id() {
@@ -118,13 +121,14 @@ safe_session_id() {
 }
 
 safe_display_value() {
-  printf '%s' "$1" | sed 's/[^A-Za-z0-9._:\/-]//g' | cut -c1-128
+  printf '%s' "$1" | sed 's/[^A-Za-z0-9._:\/-]//g' | cut -c1-64
 }
 
 state_file_for() {
-  local id
+  local id scope
   id="$(safe_session_id "$1")" || return 1
-  printf '%s/%s.state' "$state_root" "$id"
+  scope="$(printf '%s' "$helper_dir" | cksum | awk '{print $1}')"
+  printf '%s/%s-%s.state' "$state_root" "$scope" "$id"
 }
 
 read_state() {
@@ -133,6 +137,8 @@ read_state() {
   while IFS='=' read -r key value; do
     case "$key" in
       routed_model) routed_model="$value" ;;
+      last_pin_model) last_pin_model="$value" ;;
+      command_ids) command_ids="$value" ;;
     esac
   done <"$file"
 }
@@ -142,7 +148,7 @@ write_state() {
   mkdir -p "$state_root"
   chmod 700 "$state_root"
   tmp="$(mktemp "$state_root/.state.XXXXXX")"
-  printf 'requested_model=%s\nrouted_model=%s\n' "$requested_model" "$routed_model" >"$tmp"
+  printf 'requested_model=%s\nrouted_model=%s\nlast_pin_model=%s\ncommand_ids=%s\n' "$requested_model" "$routed_model" "$last_pin_model" "$command_ids" >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$file"
 }
@@ -153,14 +159,115 @@ cost_file_for() {
   printf '%s/%s.cost' "$state_root" "$id"
 }
 
+context_file_for() {
+  local id scope
+  id="$(safe_session_id "$1")" || return 1
+  scope="$(printf '%s' "$helper_dir" | cksum | awk '{print $1}')"
+  printf '%s/%s-%s.context' "$state_root" "$scope" "$id"
+}
+
+generation_file_for() {
+  local id scope
+  id="$(safe_session_id "$1")" || return 1
+  scope="$(printf '%s' "$helper_dir" | cksum | awk '{print $1}')"
+  printf '%s/active-%s-%s' "$state_root" "$scope" "$id"
+}
+
+state_lock_for() {
+  local id scope
+  id="$(safe_session_id "$1")" || return 1
+  scope="$(printf '%s' "$helper_dir" | cksum | awk '{print $1}')"
+  printf '%s/state-%s-%s.lock' "$state_root" "$scope" "$id"
+}
+
+acquire_state_lock() {
+  local lock="$1" attempt=0 lock_mtime now dead
+  while ! mkdir "$lock" 2>/dev/null; do
+    lock_mtime="$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null)" || lock_mtime=0
+    now="$(date +%s 2>/dev/null)" || now=0
+    if [ "$lock_mtime" -gt 0 ] && [ $((now - lock_mtime)) -gt 30 ]; then
+      dead="${lock}.dead.$$"
+      mv "$lock" "$dead" 2>/dev/null || continue
+      rmdir "$dead" 2>/dev/null || true
+      continue
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 1000 ] || return 1
+    sleep 0.01
+  done
+  return 0
+}
+
+release_state_lock() {
+  rmdir "$1" 2>/dev/null || true
+}
+
+context_snapshot() {
+  local file="$1" id="$2" now
+  [ -f "$file" ] || return 0
+  [ "$(wc -c <"$file")" -le 4096 ] || return 0
+  now="$(date +%s)"
+  jq -ce --arg session "$id" --argjson now "$now" '
+
+    def tokens: type == "number" and floor == . and . > 0 and . <= 2147483647;
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    .context_snapshot as $s |
+    select(.session_id == $session and $s.version == 1 and $s.estimate_kind == "approximate") |
+    select(($s.estimate_tokens | tokens) and ($s.context_window | tokens) and ($s.output_reserve_tokens | tokens)) |
+    select(($s.served_model | type) == "string" and ($s.served_model | test("^[A-Za-z0-9._:/-]{1,128}$"))) |
+    select(($s.request_id | type) == "string" and ($s.request_id | length) > 0 and ($s.request_id | length) <= 128) |
+    ($s.recorded_at | epoch) as $recorded | ($s.requested_at | epoch) as $requested |
+    select($requested > 0 and $requested <= $recorded and $recorded <= $now and $now - $recorded <= 300) |
+    $s
+  ' "$file" 2>/dev/null || true
+}
+
+# The Stop payload preserves this exact router wire record in raw Markdown.
+# A general Markdown parser would add a runtime dependency to standalone installs.
+command_outcome() {
+  printf '%s' "$1" | jq -Rsec '
+    def safe_identifier: type == "string" and test("^[A-Za-z0-9._:/-]{1,128}$");
+    capture("(?:^|\n)\\[weave-router-command-v1\\]: <weave-router:(?<encoded>[A-Za-z0-9_-]{1,8192})>(?:\n|$)").encoded |
+    gsub("-"; "+") | gsub("_"; "/") | @base64d | fromjson |
+    select(.version == 1 and (.id | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))) |
+    select(.command == "force_model" or .command == "router_session" or .command == "router_models" or .command == "router_feedback" or .command == "loop_stop") |
+    select(.disposition == "accepted" or .disposition == "rejected") |
+    select(.pin.transition == "unchanged" or
+      (.command == "force_model" and .disposition == "accepted" and
+        (.pin.transition == "cleared" or (.pin.transition == "applied" and
+          (.pin.model | safe_identifier) and (.pin.provider | safe_identifier) and
+          (.pin.effort == null or (.pin.effort | safe_identifier))))))
+  ' 2>/dev/null || true
+}
+
+pin_clause() {
+  [ -z "$last_pin_model" ] || printf ' · last pin: %s' "$(safe_display_value "$last_pin_model")"
+}
+
+context_clause() {
+  local snapshot="$1"
+  [ -n "$snapshot" ] || return 0
+  awk -v estimate="$(jq -r '.estimate_tokens' <<<"$snapshot")" -v window="$(jq -r '.context_window' <<<"$snapshot")" 'BEGIN {
+    printf " · last Router ctx est. ~%s/%s", (estimate < 1000 ? estimate : sprintf("%.0fk", estimate/1000)), (window < 1000 ? window : sprintf("%.0fk", window/1000))
+  }'
+}
+
 # Reads the router base URL and key out of the Codex config this install owns.
 # Resolved from the helper's own location first so a project-scope install never
 # reads (or leaks) the user-scope key: the project helper lives in the same
 # .codex directory as its config, while the user-scope helper sits in ~/.weave
-# and reads ~/.codex. Values are scoped to the managed block so a key-shaped
-# string the user wrote elsewhere in the file is never adopted. awk, not a TOML
-# parser, because the Codex target deliberately does not require jq for config
-# reads.
+# and reads ~/.codex. Values are scoped to the [model_providers.weave] table so
+# a key-shaped string the user wrote elsewhere in the file is never adopted. awk,
+# not a TOML parser, because the Codex target deliberately does not require jq
+# for config reads.
+#
+# Scoped to the table rather than the managed comment markers, and matching the
+# header name quoted or bare, because Codex rewrites config.toml through a TOML
+# serializer whenever it persists its own state: comments do not survive, so the
+# markers vanish while the table remains, and the inline http_headers come back
+# as a subtable with the header name unquoted. A marker-scoped, quoted-only read
+# resolved nothing on any config Codex had touched, which silently dropped the
+# savings figure from the title with no error anywhere.
 read_codex_endpoint() {
   local config=""
   # Project/custom installs name the helper weave-status.sh and keep it next
@@ -173,19 +280,45 @@ read_codex_endpoint() {
     config="$HOME/.codex/config.toml"
   fi
   [ -n "$config" ] || return 0
-  awk -v begin="$codex_begin_marker" -v end="$codex_end_marker" '
-    $0 == begin { inblk = 1; next }
-    $0 == end   { inblk = 0; next }
-    !inblk { next }
+  awk '
+    # Cut a TOML comment, honouring quoted strings so a # inside a value stays.
+    # A full-line comment reduces to empty and matches nothing below, so this
+    # replaces a separate skip rule -- and unlike one, it also catches a comment
+    # trailing another assignment, which the unanchored matches would otherwise
+    # read as live config on any line preceding the real value.
+    function weave_strip_comment(line,   i, c, out, indq, insq, esc) {
+      out = ""
+      indq = 0
+      insq = 0
+      esc = 0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (esc) { out = out c; esc = 0; continue }
+        # Only basic strings have escapes; a backslash in a literal string is
+        # data, so consuming the next character there would mis-track the quote.
+        if (indq && c == "\\") { out = out c; esc = 1; continue }
+        if (!insq && c == "\"") { indq = !indq; out = out c; continue }
+        if (!indq && c == "'"'"'") { insq = !insq; out = out c; continue }
+        if (c == "#" && !indq && !insq) break
+        out = out c
+      }
+      return out
+    }
+    { $0 = weave_strip_comment($0) }
+    /^[[:space:]]*\[/ {
+      in_provider = ($0 ~ /^[[:space:]]*\[[[:space:]]*model_providers[[:space:]]*\.[[:space:]]*weave[[:space:]]*(\.[^]]*)?\][[:space:]]*(#.*)?$/)
+      next
+    }
+    !in_provider { next }
     match($0, /base_url[[:space:]]*=[[:space:]]*"[^"]*"/) {
       v = substr($0, RSTART, RLENGTH)
       sub(/^.*=[[:space:]]*"/, "", v); sub(/"$/, "", v)
-      url = v
+      if (url == "") url = v
     }
-    match($0, /"X-Weave-Router-Key"[[:space:]]*=[[:space:]]*"[^"]*"/) {
+    match($0, /"?X-Weave-Router-Key"?[[:space:]]*=[[:space:]]*"[^"]*"/) {
       v = substr($0, RSTART, RLENGTH)
       sub(/^.*=[[:space:]]*"/, "", v); sub(/"$/, "", v)
-      key = v
+      if (key == "") key = v
     }
     END { if (url != "" && key != "") printf "%s\n%s\n", url, key }
   ' "$config" 2>/dev/null || true
@@ -196,11 +329,11 @@ read_codex_endpoint() {
 # Fire-and-forget on purpose — a slow or unreachable router must never stall a
 # Codex turn, and every failure simply leaves the previous cache in place.
 refresh_session_cost() {
-  local id="$1" file="$2"
-  [ "${WEAVE_CODEX_STATUS_SAVINGS:-1}" = "0" ] && return 0
+  local id="$1" file="$2" context_file="$3" generation="$4"
+  [ "${WEAVE_CODEX_STATUS_SAVINGS:-1}" = "0" ] && [ "${WEAVE_CODEX_STATUS_CONTEXT:-1}" = "0" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
 
-  local endpoint base_url key
+  local endpoint base_url key active_file state_lock
   endpoint="$(read_codex_endpoint)" || return 0
   base_url="$(printf '%s' "$endpoint" | sed -n 1p)"
   key="$(printf '%s' "$endpoint" | sed -n 2p)"
@@ -208,6 +341,8 @@ refresh_session_cost() {
 
   mkdir -p "$state_root" 2>/dev/null || return 0
   chmod 700 "$state_root" 2>/dev/null || true
+  active_file="$(generation_file_for "$id")" || return 0
+  state_lock="$(state_lock_for "$id")" || return 0
 
   (
     exec </dev/null
@@ -232,20 +367,103 @@ refresh_session_cost() {
       file://*) ;;
       *) url="${url%/v1}/v1/sessions/$id/cost" ;;
     esac
-    body="$(curl -fsS --max-time 5 -H "X-Weave-Router-Key: $key" "$url" 2>/dev/null)" || exit 0
-    # savings_usd is the router's own (requested - actual). A body without it
-    # (404, error envelope, older router) writes nothing and leaves the cache.
-    savings="$(printf '%s' "$body" | jq -r '.savings_usd // empty' 2>/dev/null)" || exit 0
-    case "$savings" in
-      ''|*[!0-9.eE+-]*) exit 0 ;;
-    esac
-    tmp="$file.tmp.$$"
-    mkdir -p "$(dirname "$file")" 2>/dev/null
-    if printf '%s' "$savings" >"$tmp" 2>/dev/null; then
-      chmod 600 "$tmp" 2>/dev/null
-      mv "$tmp" "$file" 2>/dev/null
+    header_file="$(mktemp "$state_root/.headers.XXXXXX")" || exit 0
+    chmod 600 "$header_file"
+    printf 'header = "X-Weave-Router-Key: %s"\n' "$key" >"$header_file"
+    if ! body="$(curl -fsS --max-time 5 --max-filesize 8192 -K "$header_file" "$url" 2>/dev/null)"; then
+      rm -f "$header_file"
+      exit 0
     fi
-    rm -f "$tmp" 2>/dev/null
+    rm -f "$header_file"
+    [ "$(printf '%s' "$body" | wc -c)" -le 8192 ] || exit 0
+    response_session="$(jq -r '.session_id // empty' <<<"$body" 2>/dev/null)" || exit 0
+    [ -z "$response_session" ] || [ "$response_session" = "$id" ] || exit 0
+    context_tmp=""
+    fresh_snapshot=""
+    fresh_title=""
+    savings_tmp=""
+    savings=""
+    fresh_model=""
+    fresh_requested=""
+    if [ "${WEAVE_CODEX_STATUS_CONTEXT:-1}" != "0" ]; then
+      context_tmp="$(mktemp "$state_root/.context.XXXXXX")" || exit 0
+      chmod 600 "$context_tmp"
+      printf '%s' "$body" >"$context_tmp" || { rm -f "$context_tmp"; exit 0; }
+      fresh_snapshot="$(context_snapshot "$context_tmp" "$id")"
+      if [ -n "$fresh_snapshot" ]; then
+        fresh_model="$(safe_display_value "$(jq -r '.served_model' <<<"$fresh_snapshot")")"
+        fresh_requested="$(jq -r '.requested_model // empty' <<<"$fresh_snapshot")"
+        if { [ -z "$requested_model" ] || [ "$fresh_requested" = "$requested_model" ]; } \
+           && { [ -z "$force_model" ] || [ "$fresh_model" = "$(safe_display_value "$force_model")" ]; } \
+           && { [ -z "$marker_model" ] || [ "$fresh_model" = "$routed_model" ]; }; then
+          shown_requested="$requested_model"
+          [ -n "$shown_requested" ] || shown_requested="$(safe_display_value "$fresh_requested")"
+          if [ -n "$shown_requested" ] && [ "$fresh_model" != "$shown_requested" ]; then
+            fresh_title="Weave Router · $shown_requested → $fresh_model"
+          else
+            fresh_title="Weave Router · $fresh_model"
+          fi
+        fi
+      fi
+    fi
+    if [ "${WEAVE_CODEX_STATUS_SAVINGS:-1}" != "0" ]; then
+      # savings_usd is the router's own (requested - actual). A body without it
+      # (404, error envelope, older router) leaves the cache untouched.
+      savings="$(printf '%s' "$body" | jq -r '.savings_usd // empty' 2>/dev/null)" || savings=""
+      case "$savings" in ''|*[!0-9.eE+-]*) savings="" ;; esac
+      if [ -n "$savings" ]; then
+        savings_tmp="$(mktemp "$state_root/.cost.XXXXXX")" || savings=""
+        if [ -n "$savings" ]; then
+          if ! chmod 600 "$savings_tmp" 2>/dev/null || ! printf '%s' "$savings" >"$savings_tmp" 2>/dev/null; then
+            rm -f "$savings_tmp"
+            savings_tmp=""
+          fi
+        fi
+      fi
+    fi
+    if ! acquire_state_lock "$state_lock"; then
+      rm -f "$context_tmp" "$savings_tmp"
+      exit 0
+    fi
+    trap 'release_state_lock "$state_lock"; rmdir "$lock" 2>/dev/null || true' EXIT
+    if [ "$(cat "$active_file" 2>/dev/null)" = "$generation" ]; then
+      if [ "${WEAVE_CODEX_STATUS_CONTEXT:-1}" != "0" ]; then
+        if [ -n "$fresh_snapshot" ]; then
+          existing_snapshot="$(context_snapshot "$context_file" "$id")"
+          if [ -n "$existing_snapshot" ] && ! jq -en --argjson incoming "$fresh_snapshot" --argjson existing "$existing_snapshot" '
+            def instant:
+              capture("^(?<whole>[0-9-]+T[0-9:]+)(?:\\.(?<fraction>[0-9]{1,9}))?Z$") |
+              [.whole, ((.fraction // "") + "000000000" | .[:9])];
+            [($incoming.requested_at | instant), ($incoming.recorded_at | instant)] as $incoming_time |
+            [($existing.requested_at | instant), ($existing.recorded_at | instant)] as $existing_time |
+            $incoming_time > $existing_time or
+              ($incoming_time == $existing_time and $incoming.request_id == $existing.request_id)
+          ' >/dev/null 2>&1; then
+            rm -f "$context_tmp" "$savings_tmp"
+            exit 0
+          elif mv "$context_tmp" "$context_file" 2>/dev/null; then
+            context_tmp=""
+          else
+            fresh_title=""
+          fi
+        else
+          rm -f "$context_file"
+        fi
+      fi
+      if [ -n "$savings_tmp" ]; then
+        if mv "$savings_tmp" "$file" 2>/dev/null; then
+          savings_tmp=""
+        else
+          rm -f "$savings_tmp"
+          savings_tmp=""
+        fi
+      fi
+      if [ -n "$fresh_title" ] && [ ! -f "$disabled_marker" ]; then
+        emit_title "$fresh_title$(savings_clause "$file")$(context_clause "$fresh_snapshot")$(pin_clause)"
+      fi
+    fi
+    release_state_lock "$state_lock"
+    rm -f "$context_tmp" "$savings_tmp"
   ) >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
@@ -299,6 +517,53 @@ command -v jq >/dev/null 2>&1 || exit 0
 jq -e . >/dev/null 2>&1 <<<"$payload" || exit 0
 
 hook_event_name="$(jq -r '.hook_event_name // ""' <<<"$payload")"
+if [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ] && [ -n "${WEAVE_CAPTURE_HOOK_TOKEN:-}" ]; then
+  classifier_hook_url="${WEAVE_CAPTURE_HOOK_URL:-http://127.0.0.1:41984/classifier/hook}"
+  if [[ "$classifier_hook_url" =~ ^http://(127\.0\.0\.1|localhost|\[::1\]):[0-9]+/classifier/hook$ ]]; then
+  case "$hook_event_name" in
+    SessionStart|PreToolUse|PreCompact)
+      # Send lifecycle identifiers only. A failed hook cannot enroll a thread;
+      # the opted-in capture proxy rejects its inference request instead.
+      jq -c '{hook_event_name,session_id,source,tool_name}' <<<"$payload" |
+        curl -fsS --max-time 2 -H 'Content-Type: application/json' \
+          -H "X-Weave-Capture-Hook-Token: $WEAVE_CAPTURE_HOOK_TOKEN" \
+          --data-binary @- "$classifier_hook_url" >/dev/null 2>&1 || true
+      ;;
+  esac
+  fi
+fi
+session_id="$(safe_session_id "$(jq -r '.session_id // empty' <<<"$payload")")" || exit 0
+active_file="$(generation_file_for "$session_id")"
+state_lock="$(state_lock_for "$session_id")"
+mkdir -p "$state_root"
+chmod 700 "$state_root"
+acquire_state_lock "$state_lock" || exit 0
+trap 'release_state_lock "$state_lock"' EXIT
+turn_file="${active_file}.turn"
+turn_id="$(safe_session_id "$(jq -r '.turn_id // empty' <<<"$payload")")" || turn_id=""
+if [ "$hook_event_name" = "SessionStart" ]; then
+  rm -f "$turn_file"
+elif [ "$hook_event_name" = "UserPromptSubmit" ]; then
+  if [ -n "$turn_id" ]; then
+    printf '%s' "$turn_id" >"$turn_file"
+    chmod 600 "$turn_file"
+  else
+    rm -f "$turn_file"
+  fi
+elif [ "$hook_event_name" = "Stop" ] && [ -n "$turn_id" ] && [ -f "$turn_file" ] && [ "$(cat "$turn_file")" != "$turn_id" ]; then
+  exit 0
+fi
+generation="$(mktemp "$state_root/.generation.XXXXXX")"
+printf '%s' "$generation" >"$generation"
+chmod 600 "$generation"
+mv "$generation" "$active_file"
+if [ "$hook_event_name" = "SessionStart" ] || [ "$hook_event_name" = "PreCompact" ]; then
+  reset_context="$(context_file_for "$session_id")" || reset_context=""
+  [ -z "$reset_context" ] || rm -f "$reset_context"
+fi
+if [ "$hook_event_name" = "UserPromptSubmit" ]; then
+  exit 0
+fi
 if [ "$hook_event_name" = "SessionStart" ]; then
   if [ -f "$disabled_marker" ]; then
     emit_title "Codex · direct"
@@ -308,12 +573,22 @@ if [ "$hook_event_name" = "SessionStart" ]; then
   exit 0
 fi
 
+if [ "$hook_event_name" = "PreCompact" ]; then
+  [ -f "$disabled_marker" ] || emit_title "Weave Router · active"
+  exit 0
+fi
+if [ "$hook_event_name" = "PreToolUse" ]; then
+  exit 0
+fi
+
 if [ -f "$disabled_marker" ]; then
   exit 0
 fi
 
 requested_model="$(safe_display_value "$(jq -r '.model // ""' <<<"$payload")")"
 routed_model=""
+last_pin_model=""
+command_ids=""
 session_id="$(jq -r '.session_id // ""' <<<"$payload")"
 last_assistant_message="$(jq -r '.last_assistant_message // ""' <<<"$payload")"
 
@@ -322,31 +597,52 @@ if file="$(state_file_for "$session_id" 2>/dev/null)"; then
   read_state "$file"
 fi
 
-# The marker is intentionally matched only at the beginning of the assistant
-# message. Do not treat ordinary prose that mentions the heading as metadata.
 first_line="${last_assistant_message%%$'\n'*}"
 marker_model=""
 force_model=""
-case "$first_line" in
-  "${router_badge_sentinel}✦ **Weave Router** → "*)
-    marker_model="${first_line#"${router_badge_sentinel}✦ **Weave Router** → "}"
-    marker_model="${marker_model%% ·*}"
-    ;;
-  "✦ **Weave Router** → "*)
-    marker_model="${first_line#"✦ **Weave Router** → "}"
-    marker_model="${marker_model%% ·*}"
-    ;;
+structured_command=0
+case "$last_assistant_message" in
+  *'[weave-router-command-v'*) structured_command=1 ;;
 esac
-case "$first_line" in
-  "Weave Router: force-model applied: "*" ("*)
-    force_model="${first_line#"Weave Router: force-model applied: "}"
-    force_model="${force_model%% (*}"
-    ;;
-esac
+if [ "$structured_command" = 1 ]; then
+  outcome="$(command_outcome "$last_assistant_message")"
+  if [ -n "$outcome" ]; then
+    outcome_id="$(jq -r '.id' <<<"$outcome")"
+    case " $command_ids " in
+      *" $outcome_id "*) ;;
+      *)
+        command_ids="${command_ids:+$command_ids }$outcome_id"
+        case "$(jq -r '.pin.transition' <<<"$outcome")" in
+          applied)
+            last_pin_model="$(jq -r '.pin.model + (if (.pin.effort // "") == "" then "" else ":" + .pin.effort end)' <<<"$outcome")"
+            force_model="$(jq -r '.pin.model' <<<"$outcome")"
+            ;;
+          cleared) last_pin_model="" ;;
+        esac
+        ;;
+    esac
+  fi
+else
+  # Legacy acknowledgments remain readable; only explicit force and clear mutate history.
+  case "$first_line" in
+    "Weave Router: force-model applied: "*" ("*|"✦ **Weave Router** → force-model applied: "*" ("*|"Weave Router: force-parent applied: "*" ("*|"✦ **Weave Router** → force-parent applied: "*" ("*)
+      force_model="${first_line#*applied: }"
+      force_model="${force_model%% (*}"
+      last_pin_model="$(safe_display_value "$force_model")"
+      ;;
+    "Weave Router: force-model cleared"*|"✦ **Weave Router** → force-model cleared"*) last_pin_model="" ;;
+    *)
+      case "$first_line" in
+        "${router_badge_sentinel}✦ **Weave Router** → "*) marker_model="${first_line#"${router_badge_sentinel}✦ **Weave Router** → "}" ;;
+        "✦ **Weave Router** → "*) marker_model="${first_line#"✦ **Weave Router** → "}" ;;
+      esac
+      marker_model="${marker_model%% ·*}"
+      case "$marker_model" in ''|*[!A-Za-z0-9._:/-]*) marker_model="" ;; esac
+      ;;
+  esac
+fi
 if [ -n "$marker_model" ]; then
   routed_model="$(safe_display_value "$marker_model")"
-elif [ -n "$force_model" ]; then
-  routed_model="$(safe_display_value "$force_model")"
 else
   routed_model="$(safe_display_value "$routed_model")"
 fi
@@ -360,19 +656,38 @@ fi
 # turn would not be included even in a blocking read — reading first and
 # refreshing after costs a turn of freshness and buys never blocking Codex.
 savings=""
+context=""
+context_file="$(context_file_for "$session_id" 2>/dev/null)" || context_file=""
+if [ -n "$context_file" ] && [ "${WEAVE_CODEX_STATUS_CONTEXT:-1}" != "0" ]; then
+  snapshot="$(context_snapshot "$context_file" "$session_id")"
+  if [ -n "$snapshot" ]; then
+    snapshot_model="$(safe_display_value "$(jq -r '.served_model' <<<"$snapshot")")"
+    snapshot_requested="$(jq -r '.requested_model // empty' <<<"$snapshot")"
+    if { [ -z "$marker_model" ] || [ "$snapshot_model" = "$routed_model" ]; } && { [ -z "$requested_model" ] || [ "$snapshot_requested" = "$requested_model" ]; } && { [ -z "$force_model" ] || [ "$snapshot_model" = "$(safe_display_value "$force_model")" ]; }; then
+      routed_model="$snapshot_model"
+      [ -n "$requested_model" ] || requested_model="$(safe_display_value "$snapshot_requested")"
+      context="$(context_clause "$snapshot")"
+    fi
+  fi
+fi
 cost_file=""
 if cost_file="$(cost_file_for "$session_id" 2>/dev/null)"; then
   savings="$(savings_clause "$cost_file")"
-  refresh_session_cost "$(safe_session_id "$session_id")" "$cost_file"
+
 fi
 
 if [ -n "$routed_model" ] && [ -n "$requested_model" ] && [ "$routed_model" != "$requested_model" ]; then
-  title="Weave Router · $routed_model ← $requested_model$savings"
+  title="Weave Router · $requested_model → $routed_model$savings"
 elif [ -n "$routed_model" ]; then
   title="Weave Router · $routed_model$savings"
 elif [ -n "$requested_model" ]; then
-  title="Weave Router · active ← $requested_model$savings"
+  title="Weave Router · $requested_model → active$savings"
 else
   title="Weave Router · active$savings"
 fi
-emit_title "$title"
+emit_title "$title$context$(pin_clause)"
+release_state_lock "$state_lock"
+trap - EXIT
+if [ -n "$cost_file" ] && [ -n "$context_file" ]; then
+  refresh_session_cost "$(safe_session_id "$session_id")" "$cost_file" "$context_file" "$generation"
+fi

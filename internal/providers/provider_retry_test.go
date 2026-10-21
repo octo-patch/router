@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
+	"weave-os/router/internal/providers"
 )
 
 // TestIsRetryable_UpstreamIdleTimeout pins the classification of the SSE
@@ -23,6 +23,15 @@ import (
 func TestIsRetryable_UpstreamIdleTimeout(t *testing.T) {
 	assert.True(t, providers.IsRetryable(providers.ErrUpstreamIdleTimeout))
 	assert.True(t, providers.IsRetryable(fmt.Errorf("stream upstream response: %w", providers.ErrUpstreamIdleTimeout)))
+}
+
+func TestIsRetryable_EmptyCompletion(t *testing.T) {
+	assert.True(t, providers.IsRetryable(providers.ErrUpstreamEmptyCompletion))
+	assert.True(t, providers.IsRetryable(fmt.Errorf("translated response: %w", providers.ErrUpstreamEmptyCompletion)))
+	assert.True(t, providers.IsRetryable(&providers.UpstreamErrorResponse{
+		Status: http.StatusBadGateway,
+		Cause:  providers.ErrUpstreamEmptyCompletion,
+	}))
 }
 
 func TestIsRetryable_ResponseHeaderTimeout(t *testing.T) {
@@ -43,6 +52,7 @@ func TestIsRetryable_ResponseHeaderTimeout(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Contains(t, err.Error(), "timeout awaiting response headers")
 	assert.True(t, providers.IsRetryable(err))
+	assert.True(t, providers.IsResponseHeaderTimeout(err))
 }
 
 func TestIsRetryable_RequestDeadlineExceeded(t *testing.T) {
@@ -65,6 +75,7 @@ func TestIsRetryable_RequestDeadlineExceeded(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.False(t, providers.IsRetryable(err))
+	assert.False(t, providers.IsResponseHeaderTimeout(err))
 }
 
 // TestIsUpstreamCapabilityRejection checks phrase matching and asserts that
@@ -142,6 +153,12 @@ func TestIsUpstreamSchemaRejection(t *testing.T) {
 		want   bool
 	}{
 		{
+			name:   "OpenAI function parameters schema rejection",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"Invalid schema for function 'configuration': schema must have a 'type' key.","type":"invalid_request_error","code":"invalid_function_parameters"}}`,
+			want:   true,
+		},
+		{
 			name:   "fireworks schema-definition conflict",
 			status: http.StatusBadRequest,
 			body:   `{"error":{"message":"Conflict in schema definitions for key ‘description’. Previous: (pattern: ^[^\\n\\r]*$), New: (pattern: ^[\\s\\S]{0,300}$)"}}`,
@@ -193,6 +210,59 @@ func TestIsUpstreamSchemaRejection(t *testing.T) {
 	}
 	assert.False(t, providers.IsUpstreamSchemaRejection(nil))
 	assert.False(t, providers.IsUpstreamSchemaRejection(fmt.Errorf("transport blew up")))
+}
+
+// TestIsUpstreamThoughtSignatureRejection pins the Gemini 3.x 400 that rejects
+// a replayed thoughtSignature ("Corrupted thought signature.", prod
+// 2026-09-08). Cross-binding rescue only: the same bytes 400 on every Gemini
+// re-POST, but a non-Gemini model ignores the signature entirely.
+func TestIsUpstreamThoughtSignatureRejection(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{
+			name:   "corrupted thought signature",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"code":400,"message":"Corrupted thought signature.","status":"INVALID_ARGUMENT"}}`,
+			want:   true,
+		},
+		{
+			name:   "missing thought signature on function call",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"code":400,"message":"Function call is missing a thought_signature in functionCall parts.","status":"INVALID_ARGUMENT"}}`,
+			want:   true,
+		},
+		{
+			name:   "unrelated 400",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"code":400,"message":"Invalid JSON payload received.","status":"INVALID_ARGUMENT"}}`,
+			want:   false,
+		},
+		{
+			name:   "same phrase on a non-400",
+			status: http.StatusInternalServerError,
+			body:   `{"error":{"message":"Corrupted thought signature."}}`,
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &providers.UpstreamErrorResponse{Status: tc.status, Body: []byte(tc.body)}
+			assert.Equal(t, tc.want, providers.IsUpstreamThoughtSignatureRejection(err))
+			if tc.want {
+				assert.False(t, providers.IsRetryable(err),
+					"a signature rejection must not trigger same-binding retries (identical re-POST 400s)")
+				assert.False(t, providers.IsUpstreamSchemaRejection(err))
+				assert.False(t, providers.IsUpstreamCapabilityRejection(err))
+			}
+		})
+	}
+	assert.False(t, providers.IsUpstreamThoughtSignatureRejection(nil))
+	assert.False(t, providers.IsUpstreamThoughtSignatureRejection(&providers.UpstreamStatusError{Status: http.StatusBadRequest}),
+		"a flushed 400 has already reached the client and cannot be rescued")
 }
 
 // TestIsUpstreamOutputConfigFormatRejection pins the gateway 400 that names

@@ -9,7 +9,8 @@ INSERT INTO router.model_router_api_keys (
     key_hash,
     key_suffix,
     created_by,
-    scope
+    scope,
+    harness
 )
 VALUES (
     @installation_id::uuid,
@@ -19,7 +20,8 @@ VALUES (
     @key_hash::varchar,
     @key_suffix::varchar,
     @created_by,
-    @scope::varchar
+    @scope::varchar,
+    @harness
 )
 RETURNING *;
 
@@ -44,13 +46,21 @@ WHERE installation_id = @installation_id::uuid
   AND deleted_at IS NULL
 ORDER BY created_at DESC;
 
--- Records that a key was used. Called fire-and-forget by the Service after successful
--- auth. Idempotent on retry.
--- name: MarkModelRouterAPIKeyUsed :exec
+-- Only one concurrent caller can make the first-use transition.
+-- name: MarkModelRouterAPIKeyFirstUsed :execrows
 UPDATE router.model_router_api_keys
 SET last_used_at = NOW()
 WHERE id = @id::uuid
-  AND deleted_at IS NULL;
+  AND deleted_at IS NULL
+  AND last_used_at IS NULL;
+
+-- Coalesce subsequent usage writes to at most one per minute per key.
+-- name: RefreshModelRouterAPIKeyLastUsed :exec
+UPDATE router.model_router_api_keys
+SET last_used_at = NOW()
+WHERE id = @id::uuid
+  AND deleted_at IS NULL
+  AND last_used_at < NOW() - INTERVAL '1 minute';
 
 -- Fresh per-request read of a key's lifetime spend cap and spend-to-date for
 -- the spend-cap gate. Read straight from Postgres (not the auth cache) so a

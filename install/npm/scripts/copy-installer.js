@@ -11,7 +11,7 @@ const root = path.resolve(__dirname, "..");
 const installDir = path.resolve(root, "..");
 const repoRoot = path.resolve(installDir, "..");
 
-const files = ["install.sh", "uninstall.sh", "cc-statusline.sh", "codex-status.sh", "registry.sh", "directives.tsv"];
+const files = ["install.sh", "uninstall.sh", "cc-statusline.sh", "codex-status.sh", "codex-toggle.sh", "registry.sh", "directives.tsv"];
 for (const f of files) {
   const src = path.join(installDir, f);
   const dst = path.join(root, f);
@@ -24,7 +24,7 @@ const registry = path.join(installDir, "directives.tsv");
 const registryText = require("node:fs").readFileSync(registry, "utf8");
 
 // commands dir relative to its own location, so colocating it alongside the
-// script makes the bundle self-contained for `npx @workweave/router`.
+// script makes the bundle self-contained for `npx @weave-os/router`.
 const commandsSrc = path.join(installDir, "commands");
 const commandsDst = path.join(root, "commands");
 const commandsSrcReal = realpathSync(commandsSrc);
@@ -97,7 +97,7 @@ for (const line of registryText.split(/\r?\n/)) {
 }
 
 // installer and the pi-router extension: pi loads it via the "pi.extensions"
-// field in package.json, and install.sh adds `npm:@workweave/router` to pi's
+// field in package.json, and install.sh adds `npm:@weave-os/router` to pi's
 // settings. Source of truth lives at install/pi-router/src.
 const piSrc = path.join(installDir, "pi-router", "src");
 const piDst = path.join(root, "pi-router", "src");
@@ -112,20 +112,7 @@ for (const f of ["package.json", "README.md"]) {
 }
 console.log("Copied pi-router/ (extension + skills).");
 
-// Bundle the opencode Codex-subscription plugin the same way. install.sh
-// (--codex/--opencode) drops opencode-weave/src/index.ts into the user's
-// opencode plugins dir and registers it via opencode.json's "plugin" array.
-// Source of truth lives at install/opencode-weave/src.
-const ocSrc = path.join(installDir, "opencode-weave", "src");
-const ocDst = path.join(root, "opencode-weave", "src");
-mkdirSync(path.dirname(ocDst), { recursive: true });
-cpSync(ocSrc, ocDst, { recursive: true });
-for (const f of ["package.json", "README.md"]) {
-  copyFileSync(path.join(installDir, "opencode-weave", f), path.join(root, "opencode-weave", f));
+for (const f of ["LICENSE", "NOTICE"]) {
+  copyFileSync(path.join(repoRoot, f), path.join(root, f));
+  console.log(`Copied ${f}.`);
 }
-console.log("Copied opencode-weave/ (plugin).");
-
-// LICENSE lives at the repo root and applies to the whole project. npm
-// surfaces it on the package page when bundled alongside package.json.
-copyFileSync(path.join(repoRoot, "LICENSE"), path.join(root, "LICENSE"));
-console.log("Copied LICENSE.");

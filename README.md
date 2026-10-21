@@ -24,10 +24,13 @@ A drop-in proxy for Anthropic, OpenAI, and Gemini that picks the best model
 for *every* request: using a tiny on-box embedder, not a vibes-based prompt.
 
 [![Weave Badge](https://img.shields.io/endpoint?url=https%3A%2F%2Fapp.workweave.ai%2Fapi%2Frepository%2Fbadge%2Forg_QWsHDcRQWQEs6RpkdEZrlFK8%2F1222789989%2Fhttps%253A%252F%252Fgithub.com&cacheSeconds=3600)](https://app.workweave.ai/reports/repository/org_QWsHDcRQWQEs6RpkdEZrlFK8/https%3A%2F%2Fgithub.com/1222789989)
-[![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](go.mod)
-[![Tests](https://github.com/workweave/router/actions/workflows/test.yml/badge.svg)](https://github.com/workweave/router/actions/workflows/test.yml)
-[![License: ELv2](https://img.shields.io/badge/License-ELv2-00BFB3.svg)](https://www.elastic.co/licensing/elastic-license)
-[![Managed deployment](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Frouter.workweave.ai%2Fv1%2Fversion&query=%24.display&label=managed%20deployment&color=EC6341&cacheSeconds=1800)](https://github.com/workweave/router/deployments)
+[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](go.mod)
+[![Tests](https://github.com/weave-os/router/actions/workflows/test.yml/badge.svg)](https://github.com/weave-os/router/actions/workflows/test.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Managed deployment](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Frouter.workweave.ai%2Fv1%2Fversion&query=%24.display&label=managed%20deployment&color=EC6341&cacheSeconds=1800)](https://github.com/weave-os/router/deployments)
+
+
+[![#1 Product of the Day on Product Hunt](https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=1247729&theme=light&period=daily)](https://www.producthunt.com/posts/weave-router-2-0?embed=true&utm_source=badge-top-post-badge&utm_medium=badge&utm_campaign=badge-weave-router-2-0)
 
 *Built by [Weave](https://www.workweave.ai): The #1 engineering intelligence platform,
 loved by Robinhood, PostHog, Reducto, and hundreds of others.*
@@ -59,26 +62,31 @@ The fastest way: point Claude Code, Codex, opencode, or pi at the **hosted**
 Weave Router with one command. No clone, no Docker, no Postgres.
 
 ```bash
-npx @workweave/router
+npx @weave-os/router
 ```
 
-That's it. The installer asks which tool (Claude Code, Codex, opencode, or pi),
-walks you through scope (user vs. project), grabs a router key, and wires
-the right config file. Other flavors:
+That's it. Your browser opens the hosted setup page. To install directly from
+the terminal, choose a target explicitly. Other flavors:
 
 ```bash
-npx @workweave/router --claude              # skip the picker, Claude Code
-npx @workweave/router --codex               # skip the picker, OpenAI Codex CLI
-npx @workweave/router --opencode            # skip the picker, opencode
-npx @workweave/router --pi                  # skip the picker, pi + Loom UI
-npx @workweave/router --scope project       # per-repo, commits settings.json (or .codex/ / opencode.json)
-npx @workweave/router --local               # self-hosted localhost:8080
-npx @workweave/router --base-url https://router.acme.internal
-npx @workweave/router@0.1.0                 # pin a version
+npx @weave-os/router --claude              # skip the picker, Claude Code
+npx @weave-os/router --codex               # skip the picker, OpenAI Codex CLI
+npx @weave-os/router --opencode            # skip the picker, opencode
+npx @weave-os/router --pi                  # skip the picker, pi + Loom UI
+npx @weave-os/router --scope project       # per-repo, commits settings.json (or .codex/ / opencode.json)
+npx @weave-os/router --local               # self-hosted localhost:8080
+npx @weave-os/router --base-url https://router.acme.internal
+npx @weave-os/router --email you@example.com # set identity without prompting
+npx @weave-os/router --claude --return-url https://app.example.com/onboarding # continue after health + key verification
+npx @weave-os/router@0.1.0                 # pin a version
 ```
 
 Requires Node ≥ 18 (Claude Code, opencode, and pi paths also need `jq`). Full
 flag reference: [install/npm/README.md](install/npm/README.md).
+
+The npm package is published as `@weave-os/router`. The former
+`@workweave/router` package remains available as a compatibility alias and
+continues to receive the same releases.
 
 ### Or: self-host the whole stack
 
@@ -88,13 +96,16 @@ If you want the router (and dashboard) running on your own box:
 # 1. Drop a provider key in. OpenRouter is the recommended baseline.
 echo "OPENROUTER_API_KEY=sk-or-v1-..." >> .env.local
 
-# 2. Boot Postgres + router on :8080 and seed an rk_ key.
+# 2. Set a dashboard password. Without one, inference still runs but
+# dashboard administration is disabled.
+echo "ROUTER_ADMIN_PASSWORD=replace-with-a-strong-password" >> .env.local
+
+# 3. Boot Postgres + router on :8080 and seed an rk_ key.
 make full-setup
 ```
 
 The router is up at <http://localhost:8080>, the dashboard at
-<http://localhost:8080/ui/> (password: `admin`), and your `rk_...` key
-prints in the logs.
+<http://localhost:8080/ui/>, and your `rk_...` key prints in the logs.
 
 ```bash
 # Call it like Anthropic
@@ -163,10 +174,10 @@ embedding compatibility, and explicit HMM selection.
 
 **Claude Code.** Run `make install-cc` to wire Claude Code at the local
 self-hosted router (it's also invoked automatically at the end of
-`make full-setup`). For the hosted router, use `npx @workweave/router`
+`make full-setup`). For the hosted router, use `npx @weave-os/router`
 above.
 
-**Codex** (OpenAI CLI). `npx @workweave/router --codex` patches
+**Codex** (OpenAI CLI). `npx @weave-os/router --codex` patches
 `~/.codex/config.toml` (or `<repo>/.codex/config.toml` with `--scope project`)
 with a managed `[model_providers.weave]` block and sets `model_provider = "weave"`.
 The provider preserves Codex's existing ChatGPT OAuth login while the router
@@ -177,30 +188,30 @@ sidecar is optional. HMM and forced selections in the native Codex family
 (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) use that OAuth credential;
 every other selected model uses its WorkWeave deployment or BYOK credential,
 matching the Claude Code plugin's model-to-credential dispatch.
-Codex does not load third-party slash-command files, so the installer ships the
-router directives as native Codex skills: `$force-model <model-id>` (alias
-`$fm <model-id>`), `$unforce-model` (alias `$ufm`), and
-`$router-feedback <text>` (alias `$rf <text>`). Each skill runs a local
-`scripts/emit.sh` that prints the leading-space directive (for example,
-` /force-model gpt-5.6-terra`); the router intercepts that exec output.
-You can type that form directly instead. Re-install
-and `--uninstall --codex` rewrite/remove only the managed block, leaving the
-rest of your Codex config untouched. Codex also gets `$router-status`,
+Codex does not load third-party slash-command files, so the installer ships
+`$force-model <model-id>` (alias `$fm <model-id>`), `$unforce-model` (alias
+`$ufm`), and `$router-feedback <text>` (alias `$rf <text>`) as native Codex
+skills. Their invocations are handled by the router directly. Re-install and
+`--uninstall --codex` rewrite/remove only the managed block, leaving the rest
+of your Codex config untouched. Codex also gets `$router-status`,
 `$router-off`, `$router-on`, and `$router-models` as skills that call this
 installer's own verbs. Invoke `$disable-routing` (or `$router-off`) to switch the
 next Codex session back to its normal provider, or run
-`npx @workweave/router disable-routing` in a shell; a literal
+`npx @weave-os/router disable-routing` in a shell; a literal
 `/disable-routing` is not a third-party extension point in Codex.
 
-**opencode.** `npx @workweave/router --opencode` merges a `provider.weave`
-entry into `~/.config/opencode/opencode.json` (or `<repo>/opencode.json`
-with `--scope project`). It uses opencode's bundled `@ai-sdk/anthropic`
-provider pointed at the router's `/v1` endpoint — the router speaks the
-Anthropic Messages API natively, so opencode works unmodified. The router
-key and identity headers ride alongside the provider config; re-install
-rewrites only the managed block and `--uninstall --opencode` strips it.
+**opencode.** `npx @weave-os/router --opencode` requires OpenCode major version
+2 when the CLI is installed and available on `PATH`. It merges a
+`provider.weave` entry into `~/.config/opencode/opencode.json` (or
+`<repo>/opencode.json` with `--scope project`) and makes `weave/auto` the active
+model while saving any prior default for off/uninstall. OpenCode v2 sends
+Responses requests through its bundled `@ai-sdk/openai` provider; the router
+selects and translates to the upstream model. The router key, identity, and
+session headers ride alongside the provider config. No plugin is installed;
+re-install removes stale v1 plugin registrations/files, and
+`--uninstall --opencode` removes the provider and restores the prior model.
 
-**pi.** `npx @workweave/router --pi` keeps stock pi as the runtime and installs
+**pi.** `npx @weave-os/router --pi` keeps stock pi as the runtime and installs
 the router's pi extension. It adds the Loom header, Wooly's animated terminal
 mascot, a persistent `WEAVE ROUTER` route/savings line, `/fm` + `/ufm`
 model-pin commands with a `[forced]` status, and context-isolated subagents
@@ -210,14 +221,14 @@ without shipping or maintaining a forked pi binary.
 Models → *Override OpenAI Base URL* → `http://localhost:8080/v1`, paste
 `rk_...` as the API key.
 
-**Switching on/off.** After installing, `npx @workweave/router off --claude`
+**Switching on/off.** After installing, `npx @weave-os/router off --claude`
 (or `--codex` / `--opencode`) routes that client straight to its provider
 again without discarding the router config; `on` flips it back, and `status`
 reports which way it's pointing. Claude Code also gets `/router-off`,
 `/router-on`, and `/router-status` slash commands. Cursor toggles via the same
 Settings → Models override above. See [install/README.md](install/README.md#switching-on-and-off).
 
-**Choosing which models the router may pick.** `npx @workweave/router models
+**Choosing which models the router may pick.** `npx @weave-os/router models
 --claude` lists every deployed model with its on/off state, and `models enable`
 / `models disable` change it — the same setting as the dashboard's settings
 page, edited from the terminal. Claude Code gets this as `/router-models`
@@ -239,13 +250,21 @@ dashboard, where selection is an organization-wide setting. See
 | `POST /v1beta/models/:action`  | Gemini `generateContent`, routed         |
 | `POST /v1/route`               | Returns the decision, no upstream call   |
 | `GET /v1/models` &nbsp;·&nbsp; `POST /v1/messages/count_tokens` | Anthropic passthrough |
-| `GET /health` &nbsp;·&nbsp; `GET /readyz` &nbsp;·&nbsp; `GET /validate` | liveness + dependency readiness + key check |
-| `GET /v1/sessions/:session_id/cost` | One session's committed cost + savings, scoped to your key |
+| `GET /livez` &nbsp;·&nbsp; `GET /startupz` | process responsive check + completed initialization |
+| `GET /health` &nbsp;·&nbsp; `GET /readyz` &nbsp;·&nbsp; `GET /validate` | responsive-check alias + dependency diagnostics + key check |
+| `POST /v1/client-events`       | Harness CLI's `off`/`on`/`uninstall` report (`harness` = `claude_code`/`codex`/`opencode`/`pi`); logged + exported as `router.harness_lifecycle`, nothing stored |
+| `GET /v1/sessions/:session_id/cost` | One session's committed cost + savings, scoped to your key's installation; `rk_` or `ra_` key ([docs](docs/SESSION_COST.md)) |
 | `GET /v1/analytics/routing-decisions` | Raw routing decisions as cursor-paginated NDJSON ([docs](docs/ANALYTICS_EXPORT.md)) |
 | `GET /v1/analytics/schema` &nbsp;·&nbsp; `GET /v1/analytics/models` | Export field dictionary + price book |
 
-Keep liveness probes on `/health`. Point startup or readiness probes at
-`/readyz` when configured policy sidecars must be ready before traffic arrives.
+Use `/startupz` for Cloud Run startup and `/livez` for its process responsive
+check. The listener starts after artifact/client initialization and bounded
+connection preparation. `/startupz` also pings PostgreSQL with a two-second
+budget: failure returns 503, so Cloud Run withholds traffic and retries while
+the process stays running. Provider preparation failures only log warnings.
+`/livez` does not contact the database. Startup sends no prompts and performs no
+embedding or HMM inference; it cannot guarantee the latency of first inference.
+`/readyz` retains dependency diagnostics.
 
 Routed non-stream responses include `x-router-cost-usd`,
 `x-router-cost-input-usd`, `x-router-cost-output-usd`,
@@ -264,10 +283,28 @@ the final Anthropic `message_delta` usage event.
   decisions into your own warehouse with a read-only key.
 - [**Policy router harness**](docs/POLICY_ROUTER_HARNESS.md): contract and
   rollout checklist for adding an out-of-process policy model.
+- 📏 [**Codex benchmark harness**](bench/README.md): reproduce the published
+  SWE-Atlas QnA and Terminal-Bench 4.0 comparisons of
+  `/beta` routing vs. direct and OpenRouter controls.
 - 🛠️ [**Contributing**](CONTRIBUTING.md): layering rules, hot-reload dev,
   migrations, tests, the whole engineering loop.
 - 🏗️ [**Architecture**](AGENTS.md): package layout, import contracts,
   recipes for adding endpoints / providers / strategies.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). Copyright 2025-2026 Workweave, Inc.
+See [NOTICE](NOTICE) for attribution.
+
+The Apache-2.0 release line begins with `router-v0.2.24` (npm packages
+`@weave-os/router` and `@workweave/router` version `0.2.24`). Earlier tags and
+published packages retain the licenses shipped with them; this change does
+not rewrite historical releases.
+
+Apache-2.0 permits commercial use, hosted services, and proprietary derivatives,
+subject to its terms, and includes a patent grant. It does not grant general
+rights to Workweave's trademarks. Third-party code, dependencies, model weights,
+and datasets retain their own licenses; see [THIRD_PARTY.md](THIRD_PARTY.md).
 
 
 ---

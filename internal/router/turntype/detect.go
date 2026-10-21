@@ -5,7 +5,7 @@ package turntype
 import (
 	"strings"
 
-	"workweave/router/internal/translate"
+	"weave-os/router/internal/translate"
 )
 
 // TurnType classifies an inbound conversation turn.
@@ -21,9 +21,13 @@ const (
 	// Probe: quota/liveness check (max_tokens=1..4). Hard-pinned to cheap
 	// model AND skips session-pin creation.
 	Probe TurnType = "probe"
-	// TitleGen: Claude Code sidebar-title generation. Hard-pinned AND
-	// skips session-pin creation.
+	// TitleGen: harness sidebar-title generation. Hard-pinned AND skips
+	// session-pin creation.
 	TitleGen TurnType = "title_gen"
+	// Recap: Claude Code's away-summary turn, a fork of the conversation
+	// asking for a short "welcome back" recap. Scored AND skips session-pin
+	// reads/writes; renders without router surfaces.
+	Recap TurnType = "recap"
 	// Classifier: short-form classification call (security monitor, etc.).
 	// Hard-pinned AND skips session-pin creation.
 	Classifier TurnType = "classifier"
@@ -45,9 +49,32 @@ const compactionNoToolsPhrase = "do not call any tools"
 // (e.g. on a mid-thread model switch). Distinctive enough to match alone.
 const codexCompactionMarkerPhrase = "you are performing a context checkpoint compaction"
 
+// recapMarkerPhrase opens Claude Code's away-summary instruction, which it
+// appends as the trailing user message of a forked copy of the conversation.
+const recapMarkerPhrase = "the user stepped away and is coming back. recap in under"
+
+// openCodeTitlePromptPrefix opens the system prompt of OpenCode's built-in
+// title agent. OpenCode 2.x identifies this request from its native prompt,
+// gated on the detected client rather than a plugin-provided header.
+const openCodeTitlePromptPrefix = "you are a title generator. you output only a thread title."
+
+// openCodeTitleMaxMessages bounds OpenCode's title window: the system prompt
+// plus at most two user messages (1.x prepends a "Generate a title" turn).
+const openCodeTitleMaxMessages = 3
+
+const (
+	systemReminderOpen  = "<system-reminder>"
+	systemReminderClose = "</system-reminder>"
+)
+
 // compactionSniffLen bounds the trailing-user-message scan; both harnesses'
 // preambles place the phrase within ~200 bytes, so long pasted messages are excluded.
 const compactionSniffLen = 4096
+
+// subAgentSystemMarker is the flag Claude Code sets on the billing-header line
+// that opens a sub-agent's system prompt. Only that line is inspected, never
+// the prompt body, so quoted or injected prompt text cannot trigger it.
+const subAgentSystemMarker = "cc_is_subagent=true"
 
 // Bounds for short-form classifier calls (e.g. Claude Code's security monitor:
 // max_tokens=64, message_count=2). Headroom for similar calls without catching main-loop turns.
@@ -56,12 +83,29 @@ const (
 	classifierMaxMessageCount    = 3
 )
 
+// OpenCodeCaller is the caller's OpenCode identity; the zero value is any
+// other client.
+type OpenCodeCaller struct {
+	// IsClient gates body fallbacks keyed on OpenCode's harness prompts, which
+	// another client could send verbatim.
+	IsClient bool
+	// IsSubagent marks a request from an OpenCode child session. Its turns
+	// carry the full tool registry, so no body fingerprint identifies them.
+	IsSubagent bool
+}
+
 // DetectFromEnvelope classifies an inbound request. subAgentHint is the
 // optional x-weave-subagent-type header value.
 //
 // Conservative by design: false negatives (MainLoop) are safe, false
 // positives aren't, so each heuristic below is intentionally tight.
 func DetectFromEnvelope(env *translate.RequestEnvelope, feats translate.RoutingFeatures, subAgentHint string) TurnType {
+	return Detect(env, feats, subAgentHint, OpenCodeCaller{})
+}
+
+// Detect classifies an inbound request. OpenCode-specific body matching is
+// enabled only for an identified OpenCode caller.
+func Detect(env *translate.RequestEnvelope, feats translate.RoutingFeatures, subAgentHint string, openCode OpenCodeCaller) TurnType {
 	if env == nil {
 		return MainLoop
 	}
@@ -69,7 +113,9 @@ func DetectFromEnvelope(env *translate.RequestEnvelope, feats translate.RoutingF
 	if isProbe(feats) {
 		return Probe
 	}
-	if isTitleGen(env, feats.HasTools) {
+	if isTitleGen(env, feats.HasTools) ||
+		(feats.TitleGenHint && env.SourceFormat() == translate.FormatOpenAI) ||
+		(openCode.IsClient && isOpenCodeTitleGen(env, feats)) {
 		return TitleGen
 	}
 	systemText := env.SystemText()
@@ -84,7 +130,10 @@ func DetectFromEnvelope(env *translate.RequestEnvelope, feats translate.RoutingF
 	if isCodexCompaction(lastUserText) {
 		return Compaction
 	}
-	if isSubAgentDispatch(env.MetadataUserID(), env.FirstUserMessageText(), subAgentHint) {
+	if env.SourceFormat() == translate.FormatAnthropic && isRecap(lastUserText) {
+		return Recap
+	}
+	if IsSubAgent(env, subAgentHint, openCode) {
 		return SubAgentDispatch
 	}
 	if isClassifier(feats) {
@@ -94,6 +143,15 @@ func DetectFromEnvelope(env *translate.RequestEnvelope, feats translate.RoutingF
 		return ToolResult
 	}
 	return MainLoop
+}
+
+// IsSubAgent reports child identity independently of the turn's purpose, so
+// utility turns such as compaction retain their caller's routing scope.
+func IsSubAgent(env *translate.RequestEnvelope, subAgentHint string, openCode OpenCodeCaller) bool {
+	if openCode.IsSubagent || subAgentHint != "" {
+		return true
+	}
+	return env != nil && isSubAgentDispatch(env.MetadataUserID(), env.AnthropicBillingHeader(), env.FirstUserMessageText(), subAgentHint)
 }
 
 func isProbe(feats translate.RoutingFeatures) bool {
@@ -126,6 +184,34 @@ func isTitleGen(env *translate.RequestEnvelope, hasTools bool) bool {
 	return env.RequestsTitleSchema()
 }
 
+// isOpenCodeTitleGen reports whether a request is OpenCode's title call: no
+// tools, and a fresh window of the title-agent system prompt followed only by
+// user messages. OpenCode titles the session with the first non-empty line of
+// the reply, so any router prefix on a misclassified turn becomes the title.
+// The prompt may arrive as `instructions`, a system message, or a developer
+// message, so the leading message is read directly rather than via SystemText.
+func isOpenCodeTitleGen(env *translate.RequestEnvelope, feats translate.RoutingFeatures) bool {
+	if feats.HasTools || feats.MessageCount <= 0 || feats.MessageCount > openCodeTitleMaxMessages {
+		return false
+	}
+	msgs := env.ConversationMessages()
+	if len(msgs) < 2 || len(msgs) > openCodeTitleMaxMessages {
+		return false
+	}
+	if role := msgs[0].Role; role != "system" && role != "developer" {
+		return false
+	}
+	if !strings.HasPrefix(strings.ToLower(msgs[0].Text), openCodeTitlePromptPrefix) {
+		return false
+	}
+	for _, msg := range msgs[1:] {
+		if msg.Role != "user" || len(msg.ToolResults) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // isCompaction reports whether the request carries Claude Code's compaction instruction
 // (system prompt, or last user message: 2.x appends it to the trailing turn alongside tool_result).
 func isCompaction(systemText, lastUserText string) bool {
@@ -153,18 +239,42 @@ func isCodexCompaction(lastUserText string) bool {
 	return strings.Contains(strings.ToLower(lastUserText), codexCompactionMarkerPhrase)
 }
 
+// isRecap reports whether the trailing user message is Claude Code's
+// away-summary instruction. The instruction must open the message (after any
+// harness <system-reminder> blocks) so a user quoting it mid-message stays
+// MainLoop. Only the trailing turn is checked: once the recap renders, later
+// real turns carry it in history and must stay MainLoop.
+func isRecap(lastUserText string) bool {
+	if len(lastUserText) > compactionSniffLen {
+		lastUserText = lastUserText[:compactionSniffLen]
+	}
+	text := strings.TrimSpace(lastUserText)
+	for strings.HasPrefix(text, systemReminderOpen) {
+		end := strings.Index(text, systemReminderClose)
+		if end == -1 {
+			return false
+		}
+		text = strings.TrimSpace(text[end+len(systemReminderClose):])
+	}
+	return strings.HasPrefix(strings.ToLower(text), recapMarkerPhrase)
+}
+
 // isSubAgentDispatch reports whether the request originates from a sub-agent:
-// the x-weave-subagent-type header, a "subagent:" metadata.user_id prefix, or
-// a "<transcript>" tag (Claude Code's Agent tool convention) near the start
-// of the first user message. Matching in the user-message body rather than
-// the system prompt avoids false-positiving on the Agent tool's own
+// the x-weave-subagent-type header, a "subagent:" metadata.user_id prefix,
+// Claude Code's cc_is_subagent flag on the billing-header line, or a
+// "<transcript>" tag (Claude Code's Agent tool convention) near the start of
+// the first user message. Matching the transcript tag in the user-message body
+// rather than the system prompt avoids false-positiving on the Agent tool's own
 // description, which appears in every main-loop turn's system prompt. The
 // prefix is bounded so a stray "<transcript>" deep in a long turn can't trigger.
-func isSubAgentDispatch(metadataUserID, firstUserText, subAgentHint string) bool {
+func isSubAgentDispatch(metadataUserID, billingHeader, firstUserText, subAgentHint string) bool {
 	if subAgentHint != "" {
 		return true
 	}
 	if strings.HasPrefix(metadataUserID, "subagent:") {
+		return true
+	}
+	if strings.Contains(billingHeader, subAgentSystemMarker) {
 		return true
 	}
 	const sniffLen = 64

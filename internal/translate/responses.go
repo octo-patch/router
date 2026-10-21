@@ -14,8 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"workweave/router/internal/router"
-	"workweave/router/internal/sse"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/sse"
+	"weave-os/router/internal/usage"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -29,9 +30,19 @@ type ResponsesConversion struct {
 	OriginalBody []byte
 	Stream       bool
 	Model        string
-	Requirements router.TranslationRequirements
-	Report       []ResponseTransform
-	ToolMappings map[string]ResponsesToolMapping
+	// CodexFeedbackSkill reports a user-invoked $rf/$router-feedback skill
+	// whose emitted directive arrived in a later tool-result item.
+	CodexFeedbackSkill bool
+	// CodexModelSwitch reports that the user switched models with Codex's
+	// native /model picker during this session, as opposed to launching with
+	// a configured model.
+	CodexModelSwitch bool
+	Requirements     router.TranslationRequirements
+	Report           []ResponseTransform
+	ToolMappings     map[string]ResponsesToolMapping
+	// TitleGeneration reports a native Codex title-generation request. It is
+	// consumed only when the proxy has independently identified the Codex client.
+	TitleGeneration bool
 }
 
 // ResponseTransform reports an ingress conversion outcome with a stable code.
@@ -100,6 +111,7 @@ func ConvertResponsesToChatCompletions(body []byte) (ResponsesConversion, error)
 	result.Requirements.Audio, result.Requirements.Files = openAIMediaRequirements(body)
 	result.Requirements.CitationsOrSearch = len(nativeServerToolsFromBody(body, FormatOpenAI)) > 0
 	result.Requirements.StructuredOutput = root.Get("text.format").Exists() || root.Get("response_format").Exists()
+	result.TitleGeneration = requestRootRequestsCodexTitle(root)
 	out := map[string]any{}
 
 	model := root.Get("model").Str
@@ -298,76 +310,82 @@ func responsesInputItemToMessages(item gjson.Result) ([]map[string]any, error) {
 // the first assistant text delta. Stripped on ingress so it doesn't accumulate
 // in history (defeats prompt-cache reuse) or leak router-injected content
 // upstream.
-var responsesBadgePattern = regexp.MustCompile(`(?is)\A(?:\*\*WEAVE ROUTER\*\* — .*?\n\n|✦ \*\*WEAVE ROUTER\*\* → .*?\n\n)`)
+var responsesBadgePattern = regexp.MustCompile(`(?is)\A(?:` + regexp.QuoteMeta(routerNoticeSentinel) + `.*?\n\n|` + legacyNoticeExpression + `)`)
 
-// codexResponsesBadgeSentinel is an invisible router-owned prefix that
-// distinguishes injected badge text from user-authored assistant prose.
-const codexResponsesBadgeSentinel = "\u2063\u2060\u2063\u2060"
+const responsesTerminalBadgeSentinel = routerNoticeSentinel
 
-var codexResponsesBadgePattern = regexp.MustCompile(
-	`(?is)\A` + regexp.QuoteMeta(codexResponsesBadgeSentinel) +
-		`(?:\*\*WEAVE ROUTER\*\* — .*?\n\n|✦ \*\*WEAVE ROUTER\*\* → .*?\n\n)`,
-)
+var responsesTerminalBadgePattern = regexp.MustCompile(`(?is)\A` + regexp.QuoteMeta(routerNoticeSentinel) + `.*?\n\n`)
 
 // StripRoutingBadgeFromResponsesInput removes a provenance-marked router badge
-// from assistant items. Call only for clients opted into the Codex badge.
+// from assistant items. Call only for clients opted into terminal surfaces.
 func StripRoutingBadgeFromResponsesInput(body []byte) ([]byte, error) {
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
 		return body, nil
 	}
 
-	out := body
+	itemRaws := input.Array()
+	newItemRaws := make([]string, 0, len(itemRaws))
 	changed := false
-	var emptied []int
-	for itemIndex, item := range input.Array() {
+	for _, item := range itemRaws {
 		itemType := item.Get("type").Str
 		if itemType != "message" && !(itemType == "" && item.Get("role").Str != "") {
+			newItemRaws = append(newItemRaws, item.Raw)
 			continue
 		}
 		if item.Get("role").Str != "assistant" {
+			newItemRaws = append(newItemRaws, item.Raw)
 			continue
 		}
 
 		content := item.Get("content")
 		if content.Type == gjson.String {
-			stripped := codexResponsesBadgePattern.ReplaceAllString(content.Str, "")
+			stripped := responsesTerminalBadgePattern.ReplaceAllString(content.Str, "")
 			if stripped == content.Str {
+				newItemRaws = append(newItemRaws, item.Raw)
 				continue
 			}
 			if stripped == "" {
-				emptied = append(emptied, itemIndex)
 				changed = true
 				continue
 			}
-			var err error
-			out, err = sjson.SetBytes(out, "input."+strconv.Itoa(itemIndex)+".content", stripped)
+			newItem, err := replaceResponsesField(item.Raw, "content", stripped)
 			if err != nil {
 				return nil, fmt.Errorf("strip Responses routing badge from string content: %w", err)
 			}
+			newItemRaws = append(newItemRaws, newItem)
 			changed = true
 			continue
 		}
 		if !content.IsArray() {
+			newItemRaws = append(newItemRaws, item.Raw)
 			continue
 		}
+
+		parts := content.Array()
+		newPartRaws := make([]string, len(parts))
+		for i, part := range parts {
+			newPartRaws[i] = part.Raw
+		}
+		itemChanged := false
+		dropItem := false
 	contentParts:
-		for partIndex, part := range content.Array() {
+		for partIndex, part := range parts {
 			switch part.Get("type").Str {
 			case "input_text", "output_text", "text":
 				text := part.Get("text").Str
-				stripped := codexResponsesBadgePattern.ReplaceAllString(text, "")
+				stripped := responsesTerminalBadgePattern.ReplaceAllString(text, "")
 				if stripped != text {
-					var err error
-					path := "input." + strconv.Itoa(itemIndex) + ".content." + strconv.Itoa(partIndex) + ".text"
-					out, err = sjson.SetBytes(out, path, stripped)
+					newPart, err := replaceResponsesField(part.Raw, "text", stripped)
 					if err != nil {
 						return nil, fmt.Errorf("strip Responses routing badge from content part: %w", err)
 					}
+					newPartRaws[partIndex] = newPart
+					itemChanged = true
 					changed = true
 				}
-				if stripped == "" && !responsesContentHasBody(content, partIndex) {
-					emptied = append(emptied, itemIndex)
+				if stripped == "" && !responsesContentHasBody(parts, partIndex) {
+					dropItem = true
 					changed = true
 				}
 				// The egress marker is only ever prepended to the first text part.
@@ -375,57 +393,73 @@ func StripRoutingBadgeFromResponsesInput(body []byte) ([]byte, error) {
 				break contentParts
 			}
 		}
+		if dropItem {
+			continue
+		}
+		if !itemChanged {
+			newItemRaws = append(newItemRaws, item.Raw)
+			continue
+		}
+		newContent := "[" + strings.Join(newPartRaws, ",") + "]"
+		newItem, err := replaceResponsesRawField([]byte(item.Raw), "content", []byte(newContent))
+		if err != nil {
+			return nil, fmt.Errorf("replace Responses content after routing badge strip: %w", err)
+		}
+		newItemRaws = append(newItemRaws, string(newItem))
 	}
 	if !changed {
 		return body, nil
 	}
-	// Descending: an earlier delete would shift the indices still pending.
-	for i := len(emptied) - 1; i >= 0; i-- {
-		var err error
-		out, err = sjson.DeleteBytes(out, "input."+strconv.Itoa(emptied[i]))
-		if err != nil {
-			return nil, fmt.Errorf("drop badge-only Responses input item: %w", err)
-		}
-	}
-	return out, nil
+	return replaceResponsesRawField(body, "input", []byte("["+strings.Join(newItemRaws, ",")+"]"))
 }
 
 // StripFeedbackFooterFromResponsesInput removes the rating hint from assistant
-// text items so a subsequent native Codex turn does not echo it upstream.
+// text items so a subsequent terminal Responses turn does not echo it upstream.
 func StripFeedbackFooterFromResponsesInput(body []byte) ([]byte, error) {
 	input := gjson.GetBytes(body, "input")
 	if !input.IsArray() {
 		return body, nil
 	}
-	out := body
+	itemRaws := input.Array()
+	newItemRaws := make([]string, 0, len(itemRaws))
 	changed := false
-	for itemIndex, item := range input.Array() {
+	for _, item := range itemRaws {
 		itemType := item.Get("type").Str
 		if itemType != "message" && !(itemType == "" && item.Get("role").Str != "") {
+			newItemRaws = append(newItemRaws, item.Raw)
 			continue
 		}
 		if item.Get("role").Str != "assistant" {
+			newItemRaws = append(newItemRaws, item.Raw)
 			continue
 		}
 		content := item.Get("content")
 		if content.Type == gjson.String {
 			stripped := feedbackFooterPattern.ReplaceAllString(content.Str, "")
 			if stripped == content.Str {
+				newItemRaws = append(newItemRaws, item.Raw)
 				continue
 			}
-			var err error
-			out, err = sjson.SetBytes(out, "input."+strconv.Itoa(itemIndex)+".content", stripped)
+			newItem, err := replaceResponsesField(item.Raw, "content", stripped)
 			if err != nil {
 				return nil, fmt.Errorf("strip Responses feedback footer from string content: %w", err)
 			}
+			newItemRaws = append(newItemRaws, newItem)
 			changed = true
 			continue
 		}
 		if !content.IsArray() {
+			newItemRaws = append(newItemRaws, item.Raw)
 			continue
 		}
-		for partIndex := len(content.Array()) - 1; partIndex >= 0; partIndex-- {
-			part := content.Array()[partIndex]
+
+		parts := content.Array()
+		newPartRaws := make([]string, len(parts))
+		for i, part := range parts {
+			newPartRaws[i] = part.Raw
+		}
+		itemChanged := false
+		for partIndex, part := range parts {
 			switch part.Get("type").Str {
 			case "input_text", "output_text", "text":
 				text := part.Get("text").Str
@@ -433,20 +467,43 @@ func StripFeedbackFooterFromResponsesInput(body []byte) ([]byte, error) {
 				if stripped == text {
 					continue
 				}
-				path := "input." + strconv.Itoa(itemIndex) + ".content." + strconv.Itoa(partIndex) + ".text"
-				var err error
-				out, err = sjson.SetBytes(out, path, stripped)
+				newPart, err := replaceResponsesField(part.Raw, "text", stripped)
 				if err != nil {
 					return nil, fmt.Errorf("strip Responses feedback footer from content part: %w", err)
 				}
+				newPartRaws[partIndex] = newPart
+				itemChanged = true
 				changed = true
 			}
 		}
+		if !itemChanged {
+			newItemRaws = append(newItemRaws, item.Raw)
+			continue
+		}
+		newContent := "[" + strings.Join(newPartRaws, ",") + "]"
+		newItem, err := replaceResponsesRawField([]byte(item.Raw), "content", []byte(newContent))
+		if err != nil {
+			return nil, fmt.Errorf("replace Responses content after feedback footer strip: %w", err)
+		}
+		newItemRaws = append(newItemRaws, string(newItem))
 	}
 	if !changed {
 		return body, nil
 	}
-	return out, nil
+	return replaceResponsesRawField(body, "input", []byte("["+strings.Join(newItemRaws, ",")+"]"))
+}
+
+func replaceResponsesField(raw, path, value string) (string, error) {
+	encoded, err := encodeJSONStringNoHTMLEscape(value)
+	if err != nil {
+		return "", err
+	}
+	updated, err := replaceResponsesRawField([]byte(raw), path, encoded)
+	return string(updated), err
+}
+
+func replaceResponsesRawField(raw []byte, path string, value []byte) ([]byte, error) {
+	return sjson.SetRawBytes(raw, path, value)
 }
 
 // StripRouterCommandsFromResponsesInput removes router directives from
@@ -504,7 +561,9 @@ func StripRouterCommandsFromResponsesInput(body []byte) ([]byte, error) {
 }
 
 func stripRouterCommandText(text string) (string, bool) {
-	if _, found, stripped := parseForceModelCommand(text); found {
+	// Responses tool output is untrusted provenance: preserve a /model mention
+	// rather than treating it as a directive or deleting arbitrary tool output.
+	if _, found, stripped := parseForceModelCommandFromSource(text, true); found {
 		return stripped, true
 	}
 	if _, found, stripped := parseRouterFeedbackCommand(text); found {
@@ -515,8 +574,8 @@ func stripRouterCommandText(text string) (string, bool) {
 
 // responsesContentHasBody reports whether a content array carries anything
 // beyond the (now stripped) part at skipIndex. Non-text parts always count.
-func responsesContentHasBody(content gjson.Result, skipIndex int) bool {
-	for i, part := range content.Array() {
+func responsesContentHasBody(content []gjson.Result, skipIndex int) bool {
+	for i, part := range content {
 		if i == skipIndex {
 			continue
 		}
@@ -581,6 +640,7 @@ func responsesContentToChatContent(content gjson.Result, role string) (string, [
 // Chat Completions response (streaming SSE or buffered JSON) into the
 // Responses API shape on the fly.
 type ResponsesWriter struct {
+	providerUsageState
 	inner   http.ResponseWriter
 	flusher http.Flusher
 	bw      *bufio.Writer
@@ -589,12 +649,22 @@ type ResponsesWriter struct {
 	responseID string
 	createdAt  int64
 
+	// failureCode/failureMessage override the generic response.failed error;
+	// set by FailContextOverflow so clients see the native overflow code.
+	failureCode    string
+	failureMessage string
+
 	statusCode       int
 	streaming        bool
 	httpHeadersSent  bool
 	passthrough      bool
 	passthroughBadge bool
 	buf              bytes.Buffer
+
+	streamScanner           sse.Scanner
+	nativeStreamScanner     sse.Scanner
+	nativeSSEClassification bool
+	nativeSSEClassified     bool
 
 	seq int64
 
@@ -603,7 +673,7 @@ type ResponsesWriter struct {
 	completedEmitted            bool
 	badgePrepended              bool
 	badgeText                   string
-	codexBadgeProvenance        bool
+	terminalBadgeProvenance     bool
 	nativeBadgeTargetSelected   bool
 	nativeBadgeDeltaPrepended   bool
 	nativeBadgeItemID           string
@@ -612,17 +682,26 @@ type ResponsesWriter struct {
 	nativeBadgeContentIndex     int64
 	nativeBadgeHasContentIndex  bool
 	nativeSyntheticBadgeEmitted bool
+	nativeNoticeItems           []json.RawMessage
+	nativePreludeCreated        bool
+	nativeStreamStarted         bool
+	nativeResponseID            string
+	nativeLastSequence          int64
+	nativeLastSequenceSet       bool
 	nativeOutputIndexShift      int64
 	nativeSequenceShift         int64
+	outputIndexOffset           int
 	footerText                  string
 	footerEmitted               bool
 	sawToolCall                 bool
+	hasUpstreamOutput           bool
 	nativeHeldEvents            [][]byte
 	nativeFooterCommit          bool
+	finalized                   bool
+	nativeEmptyRejected         bool
 	textItem                    *responsesTextItem
 	toolItems                   map[int]*responsesToolItem
 	finishReason                string
-	usage                       *responsesUsage
 	lifecycle                   *StreamLifecycle
 	toolLedger                  *ToolCallLedger
 	toolMappings                map[string]ResponsesToolMapping
@@ -642,15 +721,9 @@ type responsesToolItem struct {
 	name        string
 	mapping     ResponsesToolMapping
 	outputIndex int
-	arguments   strings.Builder
+	call        AcceptedToolCall
 	opened      bool
 	closed      bool
-}
-
-type responsesUsage struct {
-	prompt     int64
-	completion int64
-	total      int64
 }
 
 var responsesIDCounter atomic.Uint64
@@ -718,10 +791,43 @@ func (t *ResponsesWriter) SetBadgeText(text string) {
 	t.badgeText = text + "\n\n"
 }
 
-// EnableCodexBadgeProvenance prefixes in-band badges with the invisible
+// SetRoutedModel updates the model reported by terminal response envelopes.
+func (t *ResponsesWriter) SetRoutedModel(model string) {
+	t.model = model
+}
+
+// EmitRoutingBadge appends a corrected routing badge to an open stream.
+func (t *ResponsesWriter) EmitRoutingBadge(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" || text == strings.TrimSpace(t.badgeText) {
+		return nil
+	}
+	t.badgeText = text + "\n\n"
+	if t.passthrough {
+		if !t.nativePreludeCreated {
+			return nil
+		}
+		return t.emitNativeSyntheticBadge(1+t.nativeSequenceShift, t.nativeOutputIndexShift)
+	}
+	if !t.streaming || !t.headersEmitted {
+		return nil
+	}
+	if t.textItem == nil || t.textItem.closed {
+		if err := t.openTextItem(); err != nil {
+			return err
+		}
+		if err := t.lifecycle.Output(t.textItem.outputIndex); err != nil {
+			return err
+		}
+	}
+	t.textItem.text.WriteString(t.computeBadgeText())
+	return t.emitTextDelta(t.textItem, t.computeBadgeText())
+}
+
+// EnableTerminalBadgeProvenance prefixes in-band badges with the invisible
 // sentinel so ingress stripping only removes router-injected text.
-func (t *ResponsesWriter) EnableCodexBadgeProvenance() {
-	t.codexBadgeProvenance = true
+func (t *ResponsesWriter) EnableTerminalBadgeProvenance() {
+	t.terminalBadgeProvenance = true
 }
 
 // SetFooterText appends the rating hint to the last assistant text of a
@@ -732,29 +838,78 @@ func (t *ResponsesWriter) SetFooterText(text string) {
 
 func (t *ResponsesWriter) Header() http.Header { return t.inner.Header() }
 
-// SetPassthrough switches to verbatim mode: bytes forwarded unchanged, no
-// chat->Responses translation, no response.created prelude. Use when upstream
-// already speaks Responses natively (Codex backend) — re-translating would
-// corrupt the stream. Must be called before the first write (right after
-// routing, before Prelude).
-func (t *ResponsesWriter) SetPassthrough() { t.passthrough = true }
+// resetSSEScanState discards search state whenever the writer changes mode or
+// replaces its buffered stream. The scanners never own the buffer itself.
+func (t *ResponsesWriter) resetSSEScanState() {
+	t.streamScanner.Reset()
+	t.nativeStreamScanner.Reset()
+	t.nativeSSEClassification = false
+	t.nativeSSEClassified = false
+}
+
+// ResetAttempt discards buffered provider bytes from a failed retryable attempt
+// so the next dispatch does not inherit a partial or empty terminal.
+func (t *ResponsesWriter) ResetAttempt() {
+	if t.finalized {
+		return
+	}
+	t.buf.Reset()
+	t.resetSSEScanState()
+	t.nativeStreamStarted = false
+	t.nativeResponseID = ""
+	t.nativeLastSequence = t.nativeSequenceShift
+	t.nativeLastSequenceSet = t.nativePreludeCreated
+	t.hasUpstreamOutput = false
+	t.nativeHeldEvents = nil
+	t.sawToolCall = false
+	t.completedEmitted = false
+	t.nativeEmptyRejected = false
+	t.finishReason = ""
+	t.toolItems = map[int]*responsesToolItem{}
+	t.providerUsageState = providerUsageState{}
+	t.toolLedger = NewToolCallLedger()
+	// Keep headersEmitted, textItem, and prelude lifecycle so a retried
+	// translated stream does not emit a second response.created.
+}
+
+// SetPassthrough switches to native Responses mode. Upstream bytes remain in
+// Responses format, while Prelude may synthesize lifecycle and badge events.
+// Must be called before the first write.
+func (t *ResponsesWriter) SetPassthrough() {
+	t.resetSSEScanState()
+	t.passthrough = true
+}
 
 // ClearPassthrough returns the writer to translation mode, reporting false
-// when bytes already committed it. Used for pre-commit fallback to chat/completions.
+// after provider output prevents a clean continuation. A visible synthetic
+// prelude remains valid and seeds the translated sequence and output indexes.
 func (t *ResponsesWriter) ClearPassthrough() bool {
+	if t.nativePreludeCreated && !t.completedEmitted {
+		if err := t.lifecycle.Start(); err != nil {
+			return false
+		}
+		t.resetSSEScanState()
+		t.passthrough = false
+		t.passthroughBadge = false
+		t.headersEmitted = true
+		t.seq = 1 + t.nativeSequenceShift
+		t.outputIndexOffset = int(t.nativeOutputIndexShift)
+		return true
+	}
 	if t.httpHeadersSent || t.headersEmitted || t.buf.Len() > 0 {
 		return false
 	}
+	t.resetSSEScanState()
 	t.passthrough = false
 	t.passthroughBadge = false
 	return true
 }
 
-// SetPassthroughBadge switches to native Responses passthrough while opting
-// into a Codex-visible badge; text-free turns get a synthetic assistant item
-// so Codex has a visible surface for the badge.
+// SetPassthroughBadge switches to native Responses passthrough with a visible
+// badge. Text-free turns get a synthetic assistant item to carry it.
 func (t *ResponsesWriter) SetPassthroughBadge() {
-	t.EnableCodexBadgeProvenance()
+	t.EnableTerminalBadgeProvenance()
+	t.resetSSEScanState()
 	t.passthrough = true
 	t.passthroughBadge = true
 }
@@ -774,8 +929,10 @@ func (t *ResponsesWriter) WriteHeader(code int) {
 		// Codex backend already sets text/event-stream; only drop length/encoding.
 		t.inner.Header().Del("Content-Length")
 		t.inner.Header().Del("Content-Encoding")
-		t.inner.WriteHeader(code)
-		t.httpHeadersSent = true
+		if t.streaming {
+			t.inner.WriteHeader(code)
+			t.httpHeadersSent = true
+		}
 		return
 	}
 	if t.httpHeadersSent {
@@ -799,13 +956,20 @@ func (t *ResponsesWriter) Write(data []byte) (int, error) {
 	n := len(data)
 	if t.passthrough {
 		if !t.httpHeadersSent {
-			t.streaming = strings.Contains(t.inner.Header().Get("Content-Type"), "text/event-stream")
-			t.statusCode = http.StatusOK
-			t.inner.WriteHeader(http.StatusOK)
-			t.httpHeadersSent = true
+			ct := t.inner.Header().Get("Content-Type")
+			if t.statusCode >= 400 {
+				t.streaming = false
+			} else {
+				t.streaming = strings.Contains(ct, "text/event-stream")
+				if t.statusCode == 0 {
+					t.statusCode = http.StatusOK
+				}
+			}
+			if t.streaming {
+				t.inner.WriteHeader(t.statusCode)
+				t.httpHeadersSent = true
+			}
 		}
-		// Generic native Responses callers remain byte-for-byte passthrough. Only
-		// the explicitly enabled Codex display path parses native SSE.
 		if t.passthroughBadge && t.streaming {
 			t.buf.Write(data)
 			err := t.processPassthroughSSEBuffer()
@@ -817,11 +981,18 @@ func (t *ResponsesWriter) Write(data []byte) (int, error) {
 			}
 			return n, err
 		}
-		if t.passthroughBadge {
+		if !t.streaming {
 			t.buf.Write(data)
-			// Some upstreams omit Content-Type; detect SSE from the first buffered event.
-			if nativeResponsesSSEBuffer(t.buf.Bytes()) {
+			// The Codex subscription backend omits Content-Type on SSE. Inspect the
+			// first event without consuming it, then drain it exactly once.
+			if t.detectNativeResponsesSSE() {
+				t.nativeStreamScanner.Reset()
+				t.nativeSSEClassification = false
+				t.nativeSSEClassified = false
 				t.streaming = true
+				t.inner.Header().Set("Content-Type", "text/event-stream")
+				t.inner.WriteHeader(t.statusCode)
+				t.httpHeadersSent = true
 				if err := t.processPassthroughSSEBuffer(); err != nil {
 					return n, err
 				}
@@ -834,16 +1005,17 @@ func (t *ResponsesWriter) Write(data []byte) (int, error) {
 			}
 			return n, nil
 		}
-		// Forward verbatim. The upstream emits Responses natively, so there is
-		// nothing to translate for clients that did not opt into the display badge.
-		written, err := t.bw.Write(data)
-		if err == nil {
-			err = t.bw.Flush()
-			if t.flusher != nil {
-				t.flusher.Flush()
-			}
+		t.buf.Write(data)
+		if err := t.processPassthroughSSEBuffer(); err != nil {
+			return n, err
 		}
-		return written, err
+		if err := t.bw.Flush(); err != nil {
+			return n, err
+		}
+		if t.flusher != nil {
+			t.flusher.Flush()
+		}
+		return n, nil
 	}
 	t.buf.Write(data)
 	if !t.streaming {
@@ -861,13 +1033,18 @@ func (t *ResponsesWriter) Write(data []byte) (int, error) {
 	return n, t.processSSEBuffer()
 }
 
-func nativeResponsesSSEBuffer(data []byte) bool {
-	event, n := sse.SplitNext(data)
+func (t *ResponsesWriter) detectNativeResponsesSSE() bool {
+	if t.nativeSSEClassified {
+		return t.nativeSSEClassification
+	}
+	event, n := t.nativeStreamScanner.Next(t.buf.Bytes())
 	if n == 0 {
 		return false
 	}
 	_, payload := sse.ParseEvent(event)
-	return gjson.ValidBytes(payload) && gjson.GetBytes(payload, "type").Str != ""
+	t.nativeSSEClassification = gjson.ValidBytes(payload) && gjson.GetBytes(payload, "type").Str != ""
+	t.nativeSSEClassified = true
+	return t.nativeSSEClassification
 }
 
 // Prelude commits headers and emits response.created immediately so Codex
@@ -875,9 +1052,27 @@ func nativeResponsesSSEBuffer(data []byte) bool {
 // was requested; the headersEmitted guard makes it safe to call once, with
 // upstream Write emitting created later if this hasn't run yet.
 func (t *ResponsesWriter) Prelude(streaming bool) error {
-	// Upstream emits its own response.created in passthrough mode.
 	if t.passthrough {
-		return nil
+		if !streaming || !t.passthroughBadge || t.nativePreludeCreated {
+			return nil
+		}
+		t.inner.Header().Set("Content-Type", "text/event-stream")
+		t.inner.Header().Del("Content-Length")
+		t.inner.Header().Del("Content-Encoding")
+		t.streaming = true
+		t.statusCode = http.StatusOK
+		if !t.httpHeadersSent {
+			t.inner.WriteHeader(http.StatusOK)
+			t.httpHeadersSent = true
+		}
+		if err := t.writeNativeEvent("response.created", 0, map[string]any{"response": t.responseEnvelope("in_progress")}); err != nil {
+			return err
+		}
+		t.nativePreludeCreated = true
+		if t.computeBadgeText() == "" {
+			return nil
+		}
+		return t.emitNativeSyntheticBadge(1, 0)
 	}
 	if !streaming || t.headersEmitted {
 		return nil
@@ -893,7 +1088,10 @@ func (t *ResponsesWriter) Prelude(streaming bool) error {
 	if err := t.lifecycle.Start(); err != nil {
 		return err
 	}
-	return t.emitCreated()
+	if err := t.emitCreated(); err != nil {
+		return err
+	}
+	return t.ensureBadgeItem()
 }
 
 func (t *ResponsesWriter) Flush() {
@@ -909,23 +1107,16 @@ func (t *ResponsesWriter) Flush() {
 // Finalize handles non-streaming bodies and end-of-stream completion events.
 func (t *ResponsesWriter) Finalize() error {
 	if t.passthrough {
-		if t.passthroughBadge && t.streaming {
+		if t.nativeEmptyRejected {
+			return emptyCompletionOpenAIError()
+		}
+		if t.streaming {
 			if err := t.processFinalPassthroughSSETail(); err != nil {
 				return err
 			}
 		}
-		if t.passthroughBadge && !t.streaming {
-			body := t.buf.Bytes()
-			if rewritten, changed := t.rewriteNativeNonStreamingBody(body); changed {
-				body = rewritten
-			}
-			if !t.httpHeadersSent {
-				t.inner.Header().Set("Content-Type", "application/json")
-				t.inner.WriteHeader(t.statusCode)
-				t.httpHeadersSent = true
-			}
-			_, err := t.inner.Write(body)
-			return err
+		if !t.streaming {
+			return t.flushBufferedNativeBody(nil)
 		}
 		// Nothing is synthesized; the upstream remains the event authority.
 		return t.bw.Flush()
@@ -933,6 +1124,21 @@ func (t *ResponsesWriter) Finalize() error {
 	if t.streaming {
 		if err := t.processFinalSSETail(); err != nil {
 			return err
+		}
+		if !t.completedEmitted && t.finishReason != "" {
+			if err := t.closeOpenItems(); err != nil {
+				return err
+			}
+			if !t.hasUpstreamOutput {
+				return emptyCompletionOpenAIError()
+			}
+			if err := t.lifecycle.Terminal(); err != nil {
+				return err
+			}
+			t.completedEmitted = true
+			if err := t.emitCompleted(); err != nil {
+				return err
+			}
 		}
 		if err := t.lifecycle.EOF(); err != nil {
 			if t.lifecycle.State() == StreamStarted {
@@ -953,12 +1159,16 @@ func (t *ResponsesWriter) Finalize() error {
 		return err
 	}
 
-	translated, err := chatCompletionToResponse(body, t.responseID, t.model, t.createdAt, t.toolMappings, t.computeBadgeText(), t.footerText)
+	t.observeUsage(gjson.GetBytes(body, "usage"), usage.ParseOpenAI, nil)
+	translated, err := chatCompletionToResponse(body, t.responseID, t.model, t.createdAt, t.toolMappings, t.computeBadgeText(), t.footerText, t.UsageFacts())
 	if err != nil {
 		t.inner.Header().Set("Content-Type", "application/json")
 		t.inner.WriteHeader(http.StatusBadGateway)
 		_, _ = t.inner.Write([]byte(`{"error":{"message":"translation failed","type":"api_error"}}`))
 		return err
+	}
+	if !chatCompletionHasUsableOutput(body) {
+		return emptyCompletionOpenAIError()
 	}
 	t.inner.Header().Set("Content-Type", "application/json")
 	t.inner.WriteHeader(t.statusCode)
@@ -1087,7 +1297,7 @@ func (t *ResponsesWriter) observeNativeBadgeTarget(ref nativeResponsesBadgeRef) 
 
 func (t *ResponsesWriter) prefixNativeBadge(data []byte, path string) ([]byte, bool) {
 	text := gjson.GetBytes(data, path)
-	if text.Type != gjson.String || text.Str == "" || codexResponsesBadgePattern.MatchString(text.Str) {
+	if text.Type != gjson.String || text.Str == "" || responsesTerminalBadgePattern.MatchString(text.Str) {
 		return data, false
 	}
 	badge := t.computeBadgeText()
@@ -1294,27 +1504,31 @@ func (t *ResponsesWriter) rewriteNativePassthroughFields(data []byte) ([]byte, b
 			changed = true
 		}
 	}
-	if !t.nativeSyntheticBadgeEmitted || (root.Get("type").Str != "response.completed" && root.Get("type").Str != "response.incomplete") {
+	if t.nativePreludeCreated && root.Get("response.id").Exists() {
+		if rewritten, err := sjson.SetBytes(data, "response.id", t.responseID); err == nil {
+			data = rewritten
+			root = gjson.ParseBytes(data)
+			changed = true
+		}
+	}
+	if t.nativePreludeCreated && root.Get("response.model").Exists() {
+		if rewritten, err := sjson.SetBytes(data, "response.model", t.model); err == nil {
+			data = rewritten
+			root = gjson.ParseBytes(data)
+			changed = true
+		}
+	}
+	if !t.nativeSyntheticBadgeEmitted || (root.Get("type").Str != "response.completed" && root.Get("type").Str != "response.incomplete" && root.Get("type").Str != "response.failed") {
 		return data, changed
 	}
 	output := root.Get("response.output")
 	if !output.IsArray() {
 		return data, changed
 	}
-	for _, item := range output.Array() {
-		if item.Get("id").Str == t.nativeBadgeItemID {
-			return data, changed
-		}
+	items := make([]string, 0, len(t.nativeNoticeItems))
+	for _, noticeItem := range t.nativeNoticeItems {
+		items = append(items, string(noticeItem))
 	}
-	badgeItem, err := json.Marshal(map[string]any{
-		"id": t.nativeBadgeItemID, "type": "message", "status": "completed", "role": "assistant",
-		"content": []any{map[string]any{"type": "output_text", "text": t.computeBadgeText(), "annotations": []any{}}},
-	})
-	if err != nil {
-		return data, changed
-	}
-	items := make([]string, 0, len(output.Array())+1)
-	items = append(items, string(badgeItem))
 	for _, item := range output.Array() {
 		items = append(items, item.Raw)
 	}
@@ -1345,7 +1559,7 @@ func (t *ResponsesWriter) rewriteNativeNonStreamingBody(data []byte) ([]byte, bo
 		return t.prefixNativeBadge(data, path)
 	}
 	for _, item := range output.Array() {
-		if item.Get("id").Str != "" && codexResponsesBadgePattern.MatchString(item.Get("content.0.text").Str) {
+		if item.Get("id").Str != "" && responsesTerminalBadgePattern.MatchString(item.Get("content.0.text").Str) {
 			return data, false
 		}
 	}
@@ -1412,14 +1626,66 @@ func (t *ResponsesWriter) writeNativeEvent(eventType string, sequence int64, pay
 	if err != nil {
 		return err
 	}
-	if _, err := t.bw.WriteString("event: " + eventType + "\ndata: "); err != nil {
+	return t.writeNativeResponsesFrame(append([]byte("event: "+eventType+"\ndata: "), body...), []byte("\n\n"))
+}
+
+func (t *ResponsesWriter) emitNativeSyntheticBadge(base, outputIndex int64) error {
+	itemID := newResponsesID("msg")
+	text := t.computeBadgeText()
+	item := map[string]any{
+		"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{},
+	}
+	if err := t.writeNativeEvent("response.output_item.added", base, map[string]any{"output_index": outputIndex, "item": item}); err != nil {
 		return err
 	}
-	if _, err := t.bw.Write(body); err != nil {
+	if err := t.writeNativeEvent("response.content_part.added", base+1, map[string]any{
+		"item_id": itemID, "output_index": outputIndex, "content_index": 0,
+		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	}); err != nil {
 		return err
 	}
-	_, err = t.bw.WriteString("\n\n")
-	return err
+	if err := t.writeNativeEvent("response.output_text.delta", base+2, map[string]any{
+		"item_id": itemID, "output_index": outputIndex, "content_index": 0, "delta": text,
+	}); err != nil {
+		return err
+	}
+	if err := t.writeNativeEvent("response.output_text.done", base+3, map[string]any{
+		"item_id": itemID, "output_index": outputIndex, "content_index": 0, "text": text,
+	}); err != nil {
+		return err
+	}
+	if err := t.writeNativeEvent("response.content_part.done", base+4, map[string]any{
+		"item_id": itemID, "output_index": outputIndex, "content_index": 0,
+		"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+	}); err != nil {
+		return err
+	}
+	if err := t.writeNativeEvent("response.output_item.done", base+5, map[string]any{
+		"output_index": outputIndex,
+		"item": map[string]any{"id": itemID, "type": "message", "status": "completed", "role": "assistant", "content": []any{
+			map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+		}},
+	}); err != nil {
+		return err
+	}
+	completedNotice, err := json.Marshal(map[string]any{
+		"id": itemID, "type": "message", "status": "completed", "role": "assistant",
+		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+	})
+	if err != nil {
+		return err
+	}
+	t.nativeNoticeItems = append(t.nativeNoticeItems, completedNotice)
+	t.nativeSyntheticBadgeEmitted = true
+	t.nativeBadgeTargetSelected = true
+	t.nativeBadgeItemID = itemID
+	t.nativeBadgeOutputIndex = outputIndex
+	t.nativeBadgeHasOutputIndex = true
+	t.nativeBadgeContentIndex = 0
+	t.nativeBadgeHasContentIndex = true
+	t.nativeOutputIndexShift++
+	t.nativeSequenceShift += 6
+	return nil
 }
 
 // emitNativeBadgeBeforeOutput prepends a synthetic badge message item, emitting
@@ -1435,66 +1701,29 @@ func (t *ResponsesWriter) emitNativeBadgeBeforeOutput(event []byte) error {
 	if sequence.Type == gjson.Number {
 		base = sequence.Int() + t.nativeSequenceShift
 	}
-	itemID := newResponsesID("msg")
-	text := t.computeBadgeText()
-	item := map[string]any{
-		"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{},
-	}
-	if err := t.writeNativeEvent("response.output_item.added", base, map[string]any{"output_index": 0, "item": item}); err != nil {
-		return err
-	}
-	if err := t.writeNativeEvent("response.content_part.added", base+1, map[string]any{
-		"item_id": itemID, "output_index": 0, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-	}); err != nil {
-		return err
-	}
-	if err := t.writeNativeEvent("response.output_text.delta", base+2, map[string]any{
-		"item_id": itemID, "output_index": 0, "content_index": 0, "delta": text,
-	}); err != nil {
-		return err
-	}
-	if err := t.writeNativeEvent("response.output_text.done", base+3, map[string]any{
-		"item_id": itemID, "output_index": 0, "content_index": 0, "text": text,
-	}); err != nil {
-		return err
-	}
-	if err := t.writeNativeEvent("response.content_part.done", base+4, map[string]any{
-		"item_id": itemID, "output_index": 0, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
-	}); err != nil {
-		return err
-	}
-	if err := t.writeNativeEvent("response.output_item.done", base+5, map[string]any{
-		"output_index": 0,
-		"item": map[string]any{"id": itemID, "type": "message", "status": "completed", "role": "assistant", "content": []any{
-			map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
-		}},
-	}); err != nil {
-		return err
-	}
-	t.nativeSyntheticBadgeEmitted = true
-	t.nativeBadgeTargetSelected = true
-	t.nativeBadgeItemID = itemID
-	t.nativeBadgeOutputIndex = 0
-	t.nativeBadgeHasOutputIndex = true
-	t.nativeBadgeContentIndex = 0
-	t.nativeBadgeHasContentIndex = true
-	t.nativeOutputIndexShift++
-	t.nativeSequenceShift += 6
-	return nil
+	return t.emitNativeSyntheticBadge(base, t.nativeOutputIndexShift)
 }
 
 func (t *ResponsesWriter) writeNativeResponsesEvent(event, delimiter []byte) error {
 	_, data := sse.ParseEvent(event)
-	eventType := ""
-	itemType := ""
+	var eventType responsesEventType
+	var itemType responsesItemType
 	if gjson.ValidBytes(data) {
-		eventType = gjson.GetBytes(data, "type").Str
-		itemType = gjson.GetBytes(data, "item.type").Str
+		root := gjson.ParseBytes(data)
+		if err := t.validateNativeResponsesEvent(root); err != nil {
+			return err
+		}
+		eventType = responsesEventType(root.Get("type").Str)
+		itemType = responsesItemType(root.Get("item.type").Str)
 	}
-	toolCall := eventType == "response.function_call_arguments.delta" || eventType == "response.custom_tool_call_input.delta" || (eventType == "response.output_item.added" && (itemType == "function_call" || itemType == "custom_tool_call")) || (eventType == "response.output_item.done" && (itemType == "function_call" || itemType == "custom_tool_call"))
-	reasoningItem := eventType == "response.output_item.added" && itemType == "reasoning"
+	if !t.passthroughBadge {
+		return t.writeNativeResponsesFrame(event, delimiter)
+	}
+	if t.nativePreludeCreated && eventType == responsesCreated {
+		return nil
+	}
+	toolCall := eventType == responsesFunctionCallArgumentsDelta || eventType == responsesCustomToolCallInputDelta || (eventType == responsesOutputItemAdded && (itemType == responsesFunctionCallItem || itemType == responsesCustomToolCallItem)) || (eventType == responsesOutputItemDone && (itemType == responsesFunctionCallItem || itemType == responsesCustomToolCallItem))
+	reasoningItem := eventType == responsesOutputItemAdded && itemType == responsesReasoningItem
 	if toolCall || reasoningItem {
 		if toolCall {
 			t.sawToolCall = true
@@ -1508,9 +1737,11 @@ func (t *ResponsesWriter) writeNativeResponsesEvent(event, delimiter []byte) err
 			}
 		}
 	}
-	if (eventType == "response.completed" || eventType == "response.incomplete") && !t.nativeBadgeTargetSelected && !t.nativeSyntheticBadgeEmitted {
-		if err := t.emitNativeBadgeBeforeOutput(event); err != nil {
-			return err
+	if eventType == responsesCompleted || eventType == responsesIncomplete {
+		if !t.nativeBadgeTargetSelected && !t.nativeSyntheticBadgeEmitted {
+			if err := t.emitNativeBadgeBeforeOutput(event); err != nil {
+				return err
+			}
 		}
 	}
 	rewritten := t.rewriteNativeResponsesEvent(event)
@@ -1522,30 +1753,23 @@ func (t *ResponsesWriter) writeNativeResponsesEvent(event, delimiter []byte) err
 		t.nativeHeldEvents = append(t.nativeHeldEvents, held)
 		return nil
 	}
-	if eventType == "response.completed" || eventType == "response.incomplete" {
+	if eventType == responsesCompleted || eventType == responsesIncomplete {
 		if err := t.flushNativeHeldEvents(true); err != nil {
 			return err
 		}
 	}
-	if _, err := t.bw.Write(rewritten); err != nil {
-		return err
-	}
-	if len(delimiter) > 0 {
-		_, err := t.bw.Write(delimiter)
-		return err
-	}
-	return nil
+	return t.writeNativeResponsesFrame(rewritten, delimiter)
 }
 
-func (t *ResponsesWriter) shouldHoldNativeEvent(eventType, itemType string) bool {
+func (t *ResponsesWriter) shouldHoldNativeEvent(eventType responsesEventType, itemType responsesItemType) bool {
 	if t.footerText == "" || t.sawToolCall {
 		return false
 	}
 	switch eventType {
-	case "response.output_text.done", "response.content_part.done":
+	case responsesOutputTextDone, responsesContentPartDone:
 		return true
-	case "response.output_item.done":
-		return itemType == "message" || itemType == ""
+	case responsesOutputItemDone:
+		return itemType == responsesMessageItem || itemType == ""
 	}
 	return false
 }
@@ -1561,7 +1785,7 @@ func (t *ResponsesWriter) flushNativeHeldEvents(commitFooter bool) error {
 	t.nativeHeldEvents = nil
 	for _, event := range held {
 		rewritten := t.rewriteNativeHeldEvent(event)
-		if _, err := t.bw.Write(rewritten); err != nil {
+		if err := t.writeNativeResponsesFrame(rewritten, nil); err != nil {
 			return err
 		}
 	}
@@ -1571,7 +1795,7 @@ func (t *ResponsesWriter) flushNativeHeldEvents(commitFooter bool) error {
 func (t *ResponsesWriter) processPassthroughSSEBuffer() error {
 	for {
 		buffered := t.buf.Bytes()
-		event, n := sse.SplitNext(buffered)
+		event, n := t.nativeStreamScanner.Next(buffered)
 		if n == 0 {
 			return nil
 		}
@@ -1583,25 +1807,104 @@ func (t *ResponsesWriter) processPassthroughSSEBuffer() error {
 	}
 }
 
+func (t *ResponsesWriter) flushBufferedNativeBody(upstreamErr error) error {
+	if t.finalized {
+		return nil
+	}
+	body := t.buf.Bytes()
+	if root := gjson.ParseBytes(body); nativeResponsesIsEmptyTerminal(root) {
+		return emptyCompletionOpenAIError()
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	t.resetSSEScanState()
+	if rewritten, changed := t.rewriteNativeNonStreamingBody(body); changed {
+		body = rewritten
+	}
+	status := t.statusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if status < 400 {
+		if resp, ok := upstreamErrorHTTPStatus(upstreamErr); ok && resp >= 400 {
+			status = resp
+		}
+	}
+	if !t.httpHeadersSent {
+		if t.inner.Header().Get("Content-Type") == "" {
+			t.inner.Header().Set("Content-Type", "application/json")
+		}
+		t.inner.WriteHeader(status)
+		t.httpHeadersSent = true
+	}
+	_, err := t.inner.Write(body)
+	if err == nil {
+		t.finalized = true
+	}
+	return err
+}
+
 func (t *ResponsesWriter) processFinalPassthroughSSETail() error {
 	if t.buf.Len() > 0 {
 		event := append([]byte(nil), t.buf.Bytes()...)
 		t.buf.Reset()
+		t.nativeStreamScanner.Reset()
 		if err := t.writeNativeResponsesEvent(event, nil); err != nil {
 			return err
 		}
+	} else {
+		t.nativeStreamScanner.Reset()
 	}
 	return t.flushNativeHeldEvents(t.footerText != "" && !t.sawToolCall)
+}
+
+func (t *ResponsesWriter) sealInner() {
+	type sealer interface{ Seal() }
+	if s, ok := t.inner.(sealer); ok {
+		s.Seal()
+	}
 }
 
 // FinalizeError emits a response.failed terminal event when upstream fails
 // mid-stream (after response.created), so Codex sees a clean failure instead
 // of a truncated stream. No-op if nothing streamed yet (caller writes a JSON
-// error instead), in passthrough mode, or after a terminal event already fired.
-func (t *ResponsesWriter) FinalizeError(_ error) error {
-	if t.passthrough || !t.streaming || !t.headersEmitted || t.completedEmitted {
+// error instead) or after a terminal event already fired.
+func (t *ResponsesWriter) FinalizeError(err error) error {
+	if t.passthrough {
+		if !t.streaming {
+			return t.flushBufferedNativeBody(err)
+		}
+		if t.completedEmitted {
+			return nil
+		}
+		if !t.nativeStreamStarted && !t.nativePreludeCreated {
+			return nil
+		}
+		t.sealInner()
+		env := t.responseEnvelope("failed")
+		if t.nativeResponseID != "" {
+			env["id"] = t.nativeResponseID
+		}
+		env["output"] = t.nativeNoticeItems
+		if len(t.nativeNoticeItems) == 0 {
+			env["output"] = []any{}
+		}
+		env["error"] = t.failureError()
+		sequence := int64(1) + t.nativeSequenceShift
+		if t.nativeLastSequenceSet {
+			sequence = t.nativeLastSequence + 1
+		}
+		if err := t.writeNativeEvent("response.failed", sequence, map[string]any{"response": env}); err != nil {
+			return err
+		}
+		t.completedEmitted = true
+		return t.bw.Flush()
+	}
+	if !t.streaming || !t.headersEmitted || t.completedEmitted {
 		return nil
 	}
+	t.sealInner()
 	if t.lifecycle.State() == StreamStarted {
 		if err := t.lifecycle.Fail(); err != nil {
 			return err
@@ -1618,10 +1921,68 @@ func (t *ResponsesWriter) FinalizeError(_ error) error {
 	return closeErr
 }
 
+// failureError is the response.failed error object: the generic upstream
+// failure (no upstream internals leak) unless a native code was set.
+func (t *ResponsesWriter) failureError() map[string]any {
+	if t.failureCode != "" {
+		return map[string]any{"code": t.failureCode, "message": t.failureMessage}
+	}
+	return map[string]any{"code": "upstream_error", "message": "Upstream call failed."}
+}
+
+// FailContextOverflow ends the response with the Responses-native overflow
+// failure. Codex compacts only on an in-stream response.failed carrying this
+// code, so a streaming request whose stream has not started gets it opened
+// first; a non-streaming request gets the JSON error envelope.
+func (t *ResponsesWriter) FailContextOverflow(streaming bool, code, message string) error {
+	t.failureCode, t.failureMessage = code, message
+	if !streaming {
+		if t.httpHeadersSent {
+			return nil
+		}
+		body, err := json.Marshal(map[string]any{"error": map[string]any{
+			"message": message, "type": "invalid_request_error", "param": nil, "code": code,
+		}})
+		if err != nil {
+			return err
+		}
+		t.sealInner()
+		t.inner.Header().Set("Content-Type", "application/json")
+		t.inner.Header().Del("Content-Length")
+		t.inner.Header().Del("Content-Encoding")
+		t.inner.WriteHeader(http.StatusBadRequest)
+		t.httpHeadersSent = true
+		_, err = t.inner.Write(body)
+		return err
+	}
+	if t.passthrough {
+		if !t.nativeStreamStarted && !t.nativePreludeCreated {
+			t.inner.Header().Set("Content-Type", "text/event-stream")
+			t.inner.Header().Del("Content-Length")
+			t.inner.Header().Del("Content-Encoding")
+			t.streaming = true
+			t.statusCode = http.StatusOK
+			if !t.httpHeadersSent {
+				t.inner.WriteHeader(http.StatusOK)
+				t.httpHeadersSent = true
+			}
+			if err := t.writeNativeEvent("response.created", 0, map[string]any{"response": t.responseEnvelope("in_progress")}); err != nil {
+				return err
+			}
+			t.nativePreludeCreated = true
+		}
+	} else if !t.headersEmitted {
+		if err := t.Prelude(true); err != nil {
+			return err
+		}
+	}
+	return t.FinalizeError(nil)
+}
+
 // processSSEBuffer drains complete chat.completion.chunk events.
 func (t *ResponsesWriter) processSSEBuffer() error {
 	for {
-		event, n := sse.SplitNext(t.buf.Bytes())
+		event, n := t.streamScanner.Next(t.buf.Bytes())
 		if n == 0 {
 			return nil
 		}
@@ -1635,10 +1996,12 @@ func (t *ResponsesWriter) processSSEBuffer() error {
 
 func (t *ResponsesWriter) processFinalSSETail() error {
 	if t.buf.Len() == 0 {
+		t.streamScanner.Reset()
 		return nil
 	}
 	event := append([]byte(nil), t.buf.Bytes()...)
 	t.buf.Reset()
+	t.streamScanner.Reset()
 	return t.translateChunk(event)
 }
 
@@ -1648,11 +2011,11 @@ func (t *ResponsesWriter) translateChunk(raw []byte) error {
 		return nil
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
-		if !t.lifecycle.OutputStarted() {
-			return nil
-		}
 		if err := t.closeOpenItems(); err != nil {
 			return err
+		}
+		if !t.lifecycle.OutputStarted() {
+			return nil
 		}
 		if t.completedEmitted {
 			return nil
@@ -1671,13 +2034,7 @@ func (t *ResponsesWriter) translateChunk(raw []byte) error {
 	if m := root.Get("model").Str; m != "" && t.model == "" {
 		t.model = strings.Clone(m)
 	}
-	if usage := root.Get("usage"); usage.Exists() {
-		t.usage = &responsesUsage{
-			prompt:     usage.Get("prompt_tokens").Int(),
-			completion: usage.Get("completion_tokens").Int(),
-			total:      usage.Get("total_tokens").Int(),
-		}
-	}
+	t.observeUsage(root.Get("usage"), usage.ParseOpenAI, nil)
 
 	choice := root.Get("choices.0")
 	if !choice.Exists() {
@@ -1686,15 +2043,23 @@ func (t *ResponsesWriter) translateChunk(raw []byte) error {
 	delta := choice.Get("delta")
 
 	if content := delta.Get("content"); content.Type == gjson.String && content.Str != "" {
+		t.hasUpstreamOutput = true
 		if err := t.appendText(content.Str); err != nil {
 			return err
+		}
+	} else if content := delta.Get("content"); content.IsArray() {
+		for _, part := range content.Array() {
+			if part.Get("text").Type != gjson.String || part.Get("text").Str == "" {
+				continue
+			}
+			t.hasUpstreamOutput = true
+			if err := t.appendText(part.Get("text").Str); err != nil {
+				return err
+			}
 		}
 	}
 
 	if tcs := delta.Get("tool_calls"); tcs.IsArray() {
-		if tcs.Get("#").Int() > 0 {
-			t.sawToolCall = true
-		}
 		for _, tc := range tcs.Array() {
 			idx := int(tc.Get("index").Int())
 			if err := t.appendToolCall(idx, tc); err != nil {
@@ -1707,19 +2072,29 @@ func (t *ResponsesWriter) translateChunk(raw []byte) error {
 		t.finishReason = fr.Str
 		// Reasoning-only turns emit no delta this writer translates, so the
 		// badge would never be reached through appendText/appendToolCall.
+		if !t.hasUpstreamOutput {
+			if len(t.toolMappings) > 0 && len(t.toolItems) > 0 {
+				if err := t.closeOpenItems(); err != nil {
+					return err
+				}
+			}
+			return emptyCompletionOpenAIError()
+		}
 		if err := t.ensureBadgeItem(); err != nil {
 			return err
 		}
 		if err := t.closeOpenItems(); err != nil {
 			return err
 		}
-		if !t.completedEmitted {
-			if err := t.lifecycle.Terminal(); err != nil {
-				return err
-			}
-			t.completedEmitted = true
-			return t.emitCompleted()
+		// OpenAI-compatible streams may put usage in a trailing choices:[] frame.
+		if !t.UsageFacts().Present || t.completedEmitted {
+			return nil
 		}
+		if err := t.lifecycle.Terminal(); err != nil {
+			return err
+		}
+		t.completedEmitted = true
+		return t.emitCompleted()
 	}
 	return nil
 }
@@ -1784,73 +2159,31 @@ func (t *ResponsesWriter) ensureBadgeItem() error {
 }
 
 func (t *ResponsesWriter) appendToolCall(idx int, tc gjson.Result) error {
+	entry := t.toolLedger.AppendArguments(idx, tc.Get("id").String(), tc.Get("function.name").String(), tc.Get("function.arguments").String())
+	if entry.Name == "" {
+		return nil
+	}
+	if _, opened := t.toolItems[idx]; opened {
+		return nil
+	}
 	if err := t.ensureBadgeItem(); err != nil {
 		return err
 	}
-	entry := t.toolLedger.Upsert(idx, tc.Get("id").Str, tc.Get("function.name").Str)
-	item, ok := t.toolItems[idx]
-	justOpened := false
-	if !ok {
-		mapping := ResponsesToolMapping{Name: entry.Name}
-		if mapped, found := t.toolMappings[entry.Name]; found {
-			mapping = mapped
-		}
-		item = &responsesToolItem{
-			mapping: mapping,
-		}
-		t.toolItems[idx] = item
-		item.outputIndex = t.nextOutputIndex()
-		item.callID = entry.ExternalID
-		item.name = mapping.Name
-		if item.name == "" {
-			item.name = entry.Name
-		}
-		// Buffer nameless chunks; the mapping decides function_call vs
-		// custom_tool_call only once the name arrives from a later delta.
-		if len(t.toolMappings) == 0 || item.name != "" {
-			item.itemID = newResponsesID(toolCallItemIDPrefix(item.mapping.Custom))
-			if err := t.emitFunctionCallItemAdded(item); err != nil {
-				return err
-			}
-			item.opened = true
-			justOpened = true
-		}
+	mapping, mapped := t.toolMappings[entry.Name]
+	if !mapped {
+		mapping = ResponsesToolMapping{Name: entry.Name}
 	}
-	// Later chunks may carry name/id only on first delta; pick up any later
-	// arrivals defensively.
-	if item.name == "" && entry.Name != "" {
-		if mapped, found := t.toolMappings[entry.Name]; found {
-			item.mapping = mapped
-			item.name = mapped.Name
-		} else {
-			item.name = entry.Name
-		}
-	}
-	if !item.opened && item.name != "" {
-		item.itemID = newResponsesID(toolCallItemIDPrefix(item.mapping.Custom))
-		if err := t.emitFunctionCallItemAdded(item); err != nil {
-			return err
-		}
-		item.opened = true
-		justOpened = true
-	}
+	item := &responsesToolItem{mapping: mapping, name: mapping.Name, callID: t.toolLedger.ProjectID(idx, clampOpenAIToolCallID), itemID: newResponsesID(toolCallItemIDPrefix(mapping.Custom))}
+	t.toolItems[idx] = item
+	item.outputIndex = t.nextOutputIndex()
 	if err := t.lifecycle.Output(item.outputIndex); err != nil {
 		return err
 	}
-	args := tc.Get("function.arguments").Str
-	if args != "" {
-		t.toolLedger.AppendArguments(idx, tc.Get("id").Str, tc.Get("function.name").Str, args)
-		item.arguments.WriteString(args)
+	if err := t.emitFunctionCallItemAdded(item); err != nil {
+		return err
 	}
-	if !item.opened {
-		return nil
-	}
-	if justOpened && item.arguments.Len() > 0 {
-		return t.emitFunctionArgsDelta(item, item.arguments.String())
-	}
-	if args != "" {
-		return t.emitFunctionArgsDelta(item, args)
-	}
+	item.opened = true
+	t.hasUpstreamOutput = true
 	return nil
 }
 
@@ -1860,24 +2193,32 @@ func (t *ResponsesWriter) nextOutputIndex() int {
 		count++
 	}
 	count += len(t.toolItems)
-	return count - 1
+	return t.outputIndexOffset + count - 1
 }
 
 // computeBadgeText returns the routing badge to surface for this turn, with the
-// Codex provenance sentinel applied when enabled. Empty when the proxy supplied
+// terminal-client provenance sentinel when enabled. Empty when the proxy supplied
 // no marker — suppression is decided there, not here.
 func (t *ResponsesWriter) computeBadgeText() string {
 	if t.badgeText == "" {
 		return ""
 	}
 	badge := t.badgeText
-	if t.codexBadgeProvenance && !strings.HasPrefix(badge, codexResponsesBadgeSentinel) {
-		badge = codexResponsesBadgeSentinel + badge
+	if t.terminalBadgeProvenance && !strings.HasPrefix(badge, responsesTerminalBadgeSentinel) {
+		badge = responsesTerminalBadgeSentinel + badge
 	}
 	return badge
 }
 
 func (t *ResponsesWriter) closeOpenItems() error {
+	for _, entry := range t.toolLedger.Entries() {
+		call := entry.Accept(nil)
+		if item, exists := t.toolItems[entry.SourceIndex]; exists {
+			item.call = call
+			t.sawToolCall = true
+		}
+	}
+
 	if t.textItem != nil && !t.textItem.closed {
 		if t.footerText != "" && !t.sawToolCall && t.finishReason == "stop" && !feedbackFooterPattern.MatchString(t.textItem.text.String()) {
 			t.textItem.text.WriteString(t.footerText)
@@ -1896,17 +2237,21 @@ func (t *ResponsesWriter) closeOpenItems() error {
 		}
 		t.textItem.closed = true
 	}
-	for _, item := range t.toolItems {
-		if item.closed {
+	for _, entry := range t.toolLedger.Entries() {
+		item, exists := t.toolItems[entry.SourceIndex]
+		if !exists {
 			continue
 		}
-		if len(t.toolMappings) > 0 && !item.opened {
-			return fmt.Errorf("portable Codex tool call is missing a function name")
+		if item.closed || !item.opened {
+			continue
 		}
-		if err := t.emitFunctionArgsDone(item); err != nil && len(t.toolMappings) > 0 {
+		if err := t.emitFunctionArgsDelta(item, item.call.Arguments); err != nil {
 			return err
 		}
-		if err := t.emitFunctionCallItemDone(item); err != nil && len(t.toolMappings) > 0 {
+		if err := t.emitFunctionArgsDone(item); err != nil {
+			return err
+		}
+		if err := t.emitFunctionCallItemDone(item); err != nil {
 			return err
 		}
 		item.closed = true
@@ -2113,7 +2458,7 @@ func (t *ResponsesWriter) emitFunctionArgsDelta(item *responsesToolItem, delta s
 
 func (t *ResponsesWriter) emitFunctionArgsDone(item *responsesToolItem) error {
 	if item.mapping.Custom {
-		input, err := customToolInput(item.arguments.String())
+		input, err := customToolInput(item.call.Arguments)
 		if err != nil {
 			return err
 		}
@@ -2132,13 +2477,13 @@ func (t *ResponsesWriter) emitFunctionArgsDone(item *responsesToolItem) error {
 	return t.writeEvent("response.function_call_arguments.done", map[string]any{
 		"item_id":      item.itemID,
 		"output_index": item.outputIndex,
-		"arguments":    item.arguments.String(),
+		"arguments":    item.call.Arguments,
 	})
 }
 
 func (t *ResponsesWriter) emitFunctionCallItemDone(item *responsesToolItem) error {
 	if item.mapping.Custom {
-		input, err := customToolInput(item.arguments.String())
+		input, err := customToolInput(item.call.Arguments)
 		if err != nil {
 			return err
 		}
@@ -2153,7 +2498,7 @@ func (t *ResponsesWriter) emitFunctionCallItemDone(item *responsesToolItem) erro
 	}
 	call := map[string]any{
 		"id": item.itemID, "type": "function_call", "status": "completed",
-		"call_id": item.callID, "name": item.name, "arguments": item.arguments.String(),
+		"call_id": item.callID, "name": item.name, "arguments": item.call.Arguments,
 	}
 	if item.mapping.Namespace != "" {
 		call["namespace"] = item.mapping.Namespace
@@ -2164,13 +2509,10 @@ func (t *ResponsesWriter) emitFunctionCallItemDone(item *responsesToolItem) erro
 func (t *ResponsesWriter) emitCompleted() error {
 	env := t.responseEnvelope("completed")
 	env["output"] = t.assembleOutput()
-	if t.usage != nil {
-		env["usage"] = map[string]any{
-			"input_tokens":  t.usage.prompt,
-			"output_tokens": t.usage.completion,
-			"total_tokens":  t.usage.total,
-		}
-	}
+	jw := newJSONWriter()
+	writeResponsesUsage(jw, t.UsageFacts())
+	env["usage"] = json.RawMessage(jw.Bytes())
+
 	return t.writeEvent("response.completed", map[string]any{
 		"response": env,
 	})
@@ -2182,10 +2524,7 @@ func (t *ResponsesWriter) emitCompleted() error {
 func (t *ResponsesWriter) emitFailed() error {
 	env := t.responseEnvelope("failed")
 	env["output"] = t.assembleOutput()
-	env["error"] = map[string]any{
-		"code":    "upstream_error",
-		"message": "Upstream call failed.",
-	}
+	env["error"] = t.failureError()
 	return t.writeEvent("response.failed", map[string]any{
 		"response": env,
 	})
@@ -2220,7 +2559,7 @@ func (t *ResponsesWriter) assembleOutput() []any {
 			continue
 		}
 		if item.mapping.Custom {
-			input, err := customToolInput(item.arguments.String())
+			input, err := customToolInput(item.call.Arguments)
 			if err != nil {
 				continue
 			}
@@ -2244,7 +2583,7 @@ func (t *ResponsesWriter) assembleOutput() []any {
 			"status":    "completed",
 			"call_id":   item.callID,
 			"name":      item.name,
-			"arguments": item.arguments.String(),
+			"arguments": item.call.Arguments,
 		}
 		if item.mapping.Namespace != "" {
 			call["namespace"] = item.mapping.Namespace
@@ -2259,7 +2598,7 @@ func (t *ResponsesWriter) assembleOutput() []any {
 // stream:false; Codex always streams, but other clients may not. A non-empty
 // badge leads the assistant text, synthesizing the message item when the turn
 // produced only tool calls.
-func chatCompletionToResponse(body []byte, responseID, model string, createdAt int64, mappings map[string]ResponsesToolMapping, badge, footer string) ([]byte, error) {
+func chatCompletionToResponse(body []byte, responseID, model string, createdAt int64, mappings map[string]ResponsesToolMapping, badge, footer string, facts usage.Facts) ([]byte, error) {
 	if !gjson.ValidBytes(body) {
 		return nil, fmt.Errorf("invalid JSON")
 	}
@@ -2279,10 +2618,9 @@ func chatCompletionToResponse(body []byte, responseID, model string, createdAt i
 	choice := root.Get("choices.0.message")
 	output := make([]any, 0, 2)
 	text := badge
-	if content := choice.Get("content"); content.Type == gjson.String {
-		text += content.Str
-	}
-	if footer != "" && choice.Get("tool_calls.#").Int() == 0 && !feedbackFooterPattern.MatchString(text) {
+	text += chatContentText(choice.Get("content"))
+	calls, _ := acceptedChatToolCalls(choice.Get("tool_calls"), nil, false)
+	if footer != "" && len(calls) == 0 && !feedbackFooterPattern.MatchString(text) {
 		text += footer
 	}
 	if text != "" {
@@ -2298,45 +2636,41 @@ func chatCompletionToResponse(body []byte, responseID, model string, createdAt i
 			}},
 		})
 	}
-	if tcs := choice.Get("tool_calls"); tcs.IsArray() {
-		for _, tc := range tcs.Array() {
-			alias := tc.Get("function.name").Str
-			mapping, mapped := mappings[alias]
-			if !mapped {
-				mapping = ResponsesToolMapping{Name: alias}
-			}
-			item := map[string]any{
-				"id":      newResponsesID(toolCallItemIDPrefix(mapping.Custom)),
-				"status":  "completed",
-				"call_id": tc.Get("id").Str,
-				"name":    mapping.Name,
-			}
-			if mapping.Namespace != "" {
-				item["namespace"] = mapping.Namespace
-			}
-			if mapping.Custom {
-				input, err := customToolInput(tc.Get("function.arguments").Str)
-				if err != nil {
-					return nil, err
-				}
-				item["type"] = "custom_tool_call"
-				item["input"] = input
-			} else {
-				item["type"] = "function_call"
-				item["arguments"] = tc.Get("function.arguments").Str
-			}
-			output = append(output, item)
+	wireIDs := NewToolCallLedger()
+	for index, call := range calls {
+		wireIDs.Upsert(index, call.ID, call.Name)
+		alias := call.Name
+		mapping, mapped := mappings[alias]
+		if !mapped {
+			mapping = ResponsesToolMapping{Name: alias}
 		}
+		item := map[string]any{
+			"id":      newResponsesID(toolCallItemIDPrefix(mapping.Custom)),
+			"status":  "completed",
+			"call_id": wireIDs.ProjectID(index, clampOpenAIToolCallID),
+			"name":    mapping.Name,
+		}
+		if mapping.Namespace != "" {
+			item["namespace"] = mapping.Namespace
+		}
+		if mapping.Custom {
+			input, err := customToolInput(call.Arguments)
+			if err != nil {
+				return nil, err
+			}
+			item["type"] = "custom_tool_call"
+			item["input"] = input
+		} else {
+			item["type"] = "function_call"
+			item["arguments"] = call.Arguments
+		}
+		output = append(output, item)
 	}
 	out["output"] = output
 
-	if usage := root.Get("usage"); usage.Exists() {
-		out["usage"] = map[string]any{
-			"input_tokens":  usage.Get("prompt_tokens").Int(),
-			"output_tokens": usage.Get("completion_tokens").Int(),
-			"total_tokens":  usage.Get("total_tokens").Int(),
-		}
-	}
+	jw := newJSONWriter()
+	writeResponsesUsage(jw, facts)
+	out["usage"] = json.RawMessage(jw.Bytes())
 
 	return json.Marshal(out)
 }

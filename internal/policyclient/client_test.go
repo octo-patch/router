@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"workweave/router/internal/providers"
-	"workweave/router/internal/router"
-	"workweave/router/internal/router/policy"
+	"weave-os/router/internal/providers"
+	"weave-os/router/internal/router"
+	"weave-os/router/internal/router/policy"
 )
 
 func TestClientPostsVersionedRouteAndParsesPolicyMetadata(t *testing.T) {
@@ -167,6 +167,133 @@ func TestClientPostsVersionedRouteAndParsesPolicyMetadata(t *testing.T) {
 	assert.Equal(t, "debug-1", result.DebugRef)
 	assert.Equal(t, 0.91, result.Score)
 	assert.Equal(t, map[string]float32{"moonshotai/kimi-k2.7-code": 0.91}, result.CandidateScores)
+}
+
+func validClassifierResponseV4() classifierResponseV4 {
+	return classifierResponseV4{
+		SchemaVersion:         policy.SchemaVersionV4,
+		RouteID:               "route-v4",
+		ClassifierArtifactID:  "classifier-20260910",
+		ClassifierSHA256:      strings.Repeat("a", 64),
+		PredictedLabel:        "high",
+		ClassOrder:            []string{"low", "medium", "high"},
+		ClassProbabilities:    map[string]float64{"low": 0.1, "medium": 0.2, "high": 0.7},
+		ClassifierConfidence:  floatPtr(0.7),
+		ClassifierMargin:      floatPtr(0.5),
+		HMMStateID:            2,
+		HMMStatePath:          []int{0, 1, 2},
+		HMMStateProbabilities: []float64{0.1, 0.2, 0.7},
+	}
+}
+
+func TestClientPostsClassifierOnlyV4RequestAndParsesFacts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var requestPayload map[string]json.RawMessage
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&requestPayload))
+		for _, field := range []string{
+			"candidate_models",
+			"candidate_providers",
+			"candidates",
+			"preferred_models",
+			"quality_bias",
+			"requested_model",
+			"routing_intent",
+			"routing_knobs",
+		} {
+			assert.NotContains(t, requestPayload, field)
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(validClassifierResponseV4()))
+	}))
+	defer server.Close()
+
+	qualityBias := 0.9
+	result, err := New(server.URL, server.Client(), 0).Decide(context.Background(), policy.Query{
+		SchemaVersion:   policy.SchemaVersionV4,
+		Strategy:        router.StrategyHMM,
+		ExecutionMode:   policy.ExecutionModeServing,
+		RouteID:         "route-v4",
+		RequestedModel:  "openai/gpt-5.6-sol",
+		PromptText:      "implement the router policy",
+		RoutingIntent:   "high",
+		PreferredModels: []string{"openai/gpt-5.6-sol"},
+		RoutingKnobs:    &router.Overrides{QualityBias: &qualityBias},
+		Candidates: []policy.Candidate{{
+			RosterID:  "openai/gpt-5.6-sol",
+			CatalogID: "openai/gpt-5.6-sol",
+			Provider:  providers.ProviderOpenAI,
+		}},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, policy.SchemaVersionV4, result.SchemaVersion)
+	assert.Equal(t, "high", result.PredictedLabel)
+	assert.Equal(t, []string{"low", "medium", "high"}, result.ClassOrder)
+	assert.Equal(t, map[string]float64{"low": 0.1, "medium": 0.2, "high": 0.7}, result.ClassProbabilities)
+	assert.Empty(t, result.Model)
+	assert.Empty(t, result.Provider)
+	assert.Empty(t, result.RankedFallback)
+}
+
+func TestClientRejectsSelectionAuthorityInV4Response(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		response := validClassifierResponseV4()
+		payload, err := json.Marshal(response)
+		require.NoError(t, err)
+		var responsePayload map[string]interface{}
+		require.NoError(t, json.Unmarshal(payload, &responsePayload))
+		responsePayload["model"] = "openai/gpt-5.6-luna"
+		require.NoError(t, json.NewEncoder(w).Encode(responsePayload))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, server.Client(), 0).Decide(context.Background(), policy.Query{
+		SchemaVersion: policy.SchemaVersionV4,
+		Strategy:      router.StrategyHMM,
+		PromptText:    "classify only",
+	})
+
+	require.ErrorContains(t, err, "unknown field \"model\"")
+}
+
+func TestClientIgnoresUnknownTimingStagesInV4Response(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		payload, err := json.Marshal(validClassifierResponseV4())
+		require.NoError(t, err)
+		var responsePayload map[string]interface{}
+		require.NoError(t, json.Unmarshal(payload, &responsePayload))
+		responsePayload["timings"] = map[string]interface{}{
+			"route_ms":             20.0,
+			"infer_ms":             14.0,
+			"features_ms":          1.5,
+			"select_ms":            3.5,
+			"turns":                2,
+			"infer_degraded":       true,
+			"documents_ms":         0.5,
+			"embed_ms":             12.5,
+			"posterior_ms":         1.0,
+			"documents":            3,
+			"embed_cache_hits":     2,
+			"embed_cache_misses":   1,
+			"embed_inflight_joins": 0,
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(responsePayload))
+	}))
+	defer server.Close()
+
+	result, err := New(server.URL, server.Client(), 0).Decide(context.Background(), policy.Query{
+		SchemaVersion: policy.SchemaVersionV4,
+		Strategy:      router.StrategyHMM,
+		PromptText:    "classify only",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "high", result.PredictedLabel)
+	require.NotNil(t, result.Timings)
+	assert.Equal(t, 12.5, *result.Timings.EmbedMs)
+	assert.Equal(t, 3.5, *result.Timings.SelectMs)
+	assert.Equal(t, 4.0, *result.Timings.OtherMs)
+	require.NotNil(t, result.ServingStats)
+	assert.Equal(t, int64(2), *result.ServingStats.EmbedCacheHits)
 }
 
 func decideWithTimings(t *testing.T, timings *routeTimings) policy.Result {
@@ -514,6 +641,26 @@ func TestClientRejectsUnknownRouteSchema(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsupported policy route schema")
 }
 
+func TestClientDecideMapsSidecar413ToContextWindowExceeded(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte("<html><body>Request Entity Too Large</body></html>"))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, server.Client(), time.Second).Decide(
+		context.Background(),
+		policy.Query{Candidates: []policy.Candidate{{RosterID: "model-a"}}},
+	)
+
+	require.ErrorIs(t, err, policy.ErrContextWindowExceeded)
+	assert.NotContains(t, err.Error(), "decode policy route response")
+	assert.Equal(t, 1, attempts)
+}
+
 func TestClientRetriesTransientRouteFailureWithoutFallback(t *testing.T) {
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -777,66 +924,6 @@ func TestClientCapabilities(t *testing.T) {
 	}
 }
 
-func TestClientRoster(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		require.Equal(t, "/roster", request.URL.Path)
-		_ = json.NewEncoder(w).Encode(rosterResponse{
-			SchemaVersion: policy.SchemaVersionV2,
-			RosterVersion: "abc123",
-			RosterIDs:     []string{"openai/gpt-5.6-sol", "anthropic/claude-opus-4.8"},
-		})
-	}))
-	defer server.Close()
-
-	rosterIDs, err := New(server.URL, server.Client(), 0).Roster(context.Background())
-
-	require.NoError(t, err)
-	assert.Equal(t, []string{"openai/gpt-5.6-sol", "anthropic/claude-opus-4.8"}, rosterIDs)
-}
-
-func TestClientClusterRoster(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		require.Equal(t, "/roster", request.URL.Path)
-		_ = json.NewEncoder(w).Encode(rosterResponse{
-			SchemaVersion: policy.SchemaVersionV2,
-			RosterVersion: "abc123",
-			RosterIDs:     []string{"openai/gpt-5.6-sol", "anthropic/claude-opus-4.8"},
-			Clusters: map[string][]string{
-				"maximum": {"anthropic/claude-opus-4.8", "openai/gpt-5.6-sol"},
-			},
-		})
-	}))
-	defer server.Close()
-
-	snapshot, err := New(server.URL, server.Client(), 0).ClusterRoster(context.Background())
-
-	require.NoError(t, err)
-	assert.Equal(t, "abc123", snapshot.RosterSHA256)
-	assert.Equal(t, []string{"anthropic/claude-opus-4.8", "openai/gpt-5.6-sol"}, snapshot.Clusters["maximum"])
-}
-
-func TestClientRosterRejectsUnknownSchema(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(rosterResponse{SchemaVersion: "v99", RosterIDs: []string{"x"}})
-	}))
-	defer server.Close()
-
-	_, err := New(server.URL, server.Client(), 0).Roster(context.Background())
-
-	require.Error(t, err)
-}
-
-func TestClientRosterPropagatesStatusError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
-	_, err := New(server.URL, server.Client(), 0).Roster(context.Background())
-
-	require.Error(t, err)
-}
-
 func TestClientCheckHealth(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		assert.Equal(t, http.MethodGet, request.Method)
@@ -901,8 +988,51 @@ func TestRouteMessagesPreservesLatestUserWhenPayloadIsCapped(t *testing.T) {
 	}
 }
 
+func TestRouteMessagesKeepsUserBoundaryOutsideTheMessageCap(t *testing.T) {
+	source := []router.ConversationMessage{{Role: "user", Text: "fix the failing test"}}
+	for len(source) < maxRouteMessages+40 {
+		source = append(source,
+			router.ConversationMessage{Role: "assistant", ToolCalls: []router.ConversationToolCall{{Name: "exec"}}},
+			router.ConversationMessage{Role: "user", ToolResults: []router.ConversationToolResult{{ToolUseID: "call-1", ResultPresent: true}}},
+		)
+	}
+
+	messages := routeMessages(source)
+
+	assert.Len(t, messages, maxRouteMessages)
+	assert.Equal(t, "fix the failing test", latestUserText(messages))
+}
+
+func TestRouteMessagesKeepsUserBoundaryTextWhenNewerMessagesFillTheTextBudget(t *testing.T) {
+	source := []router.ConversationMessage{{Role: "user", Text: "fix the failing test"}}
+	for len(source) < maxRouteMessages+40 {
+		source = append(source,
+			router.ConversationMessage{Role: "assistant", Text: strings.Repeat("a", maxRouteMessageTextChars)},
+			router.ConversationMessage{Role: "user", ToolResults: []router.ConversationToolResult{{ToolUseID: "call-1", ResultPresent: true}}},
+		)
+	}
+
+	messages := routeMessages(source)
+
+	assert.Equal(t, "fix the failing test", latestUserText(messages))
+}
+
 func floatPtr(value float64) *float64 { return &value }
 
 func intPointer(value int) *int { return &value }
 
 func int64Ptr(value int64) *int64 { return &value }
+
+func TestQwenWarmingStopsClassificationRetries(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"qwen_warming","preparation":{"state":"warming","operation_id":"fc-warmup"}}`))
+	}))
+	defer server.Close()
+	client := New(server.URL, server.Client(), time.Second)
+	_, err := client.Decide(context.Background(), policy.Query{Strategy: router.StrategyHMMQwen, RouteID: "cold", SchemaVersion: policy.SchemaVersionV4})
+	require.ErrorContains(t, err, "Qwen classifier is warming")
+	require.Equal(t, 1, calls, "cold GPU startup should be prepared explicitly, not retried inside classification")
+}

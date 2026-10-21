@@ -1,12 +1,12 @@
 # internal/api — CLAUDE
 
-> **Mirror notice.** Verbatim sync with [AGENTS.md](AGENTS.md). **Update both together** — divergence = bug.
+> **Mirror notice.** Source for generated [AGENTS.md](AGENTS.md). Edit this file, then run `make generate-agent-guides`; CI rejects drift.
 
 Presentation layer. Handlers adapt HTTP ↔ Service. Read [root CLAUDE.md](../../CLAUDE.md) first.
 
 ## Subpackages
 
-- `admin/` — operational endpoints: `/health`, `/validate`, `/admin/v1/*`
+- `admin/` — operational endpoints: `/health`, `/validate`, `/v1/client-events` (harness CLI off/on/uninstall report → log + `router.harness_lifecycle` span, nothing stored), `/admin/v1/*`, and `/v1/sessions/:session_id/cost` (authed by `middleware.WithReadKey`: an `rk_` or `ra_` key resolves its installation; per-installation `WithInstallationRateLimit`; no admission, billing or spend gates)
 - `anthropic/` — Anthropic Messages surface (`/v1/messages`, passthrough, `/v1/route`)
 - `openai/` — OpenAI Chat Completions (`/v1/chat/completions`)
 - `gemini/` — Gemini native (`/v1beta/models/:modelAction`)
