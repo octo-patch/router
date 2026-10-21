@@ -388,16 +388,6 @@ func main() {
 	}
 
 	{
-		minimaxRegion := config.GetOr("MINIMAX_REGION", "global")
-		minimaxBaseURL := config.GetOr("MINIMAX_BASE_URL", openaiCompatProvider.MiniMaxBaseURL(minimaxRegion))
-		registerDeploymentKeyedProvider(providerMap, envKeyedProviders, logger,
-			providers.ProviderMiniMax, "MiniMax", "MINIMAX_API_KEY", minimaxBaseURL, byokOnly,
-			func(key, baseURL string) providers.Client {
-				return openaiCompatProvider.NewClientWithModelIDMap(key, baseURL, upstreamIDsForProvider(providers.ProviderMiniMax))
-			})
-	}
-
-	{
 		xaiBaseURL := config.GetOr("XAI_BASE_URL", openaiCompatProvider.XAIBaseURL)
 		registerDeploymentKeyedProvider(providerMap, envKeyedProviders, logger,
 			providers.ProviderXAI, "XAI", "XAI_API_KEY", xaiBaseURL, byokOnly,
